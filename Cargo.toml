@@ -1,0 +1,28 @@
+[package]
+name = "sshman"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+chrono = "0.4.45"
+clap = { version = "4.6.6", features = ["derive"] }
+dirs = "6.0.0"
+portable-pty = "0.9.0"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ssh2 = "0.9.6"
+tui-term = "0.3.4"
+vt100 = "0.16.2"
+
+[features]
+# Statically link OpenSSL so the binary runs on machines that do not have it.
+# libssh2 itself is always built from source by libssh2-sys.
+vendored = ["ssh2/vendored-openssl"]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
