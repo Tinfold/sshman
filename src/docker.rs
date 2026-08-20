@@ -349,6 +349,12 @@ impl DockerConn {
     }
 
     /// Copy into the container.
+    ///
+    /// `docker cp` stamps the source's mode and ownership onto whatever it
+    /// lands on, existing files included, so saving an edit would rewrite the
+    /// file's permissions to those of the temp copy it came back from. There
+    /// is no flag that turns that off — `-a` only makes it worse — so the
+    /// destination's own attributes are read first and put back afterwards.
     pub fn upload(
         &mut self,
         local: &Path,
@@ -359,6 +365,52 @@ impl DockerConn {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let dest = rjoin(dest_dir, &name);
+        let before = self.attrs(&dest);
+        let result = self.copy_in(local, dest_dir, &name, progress);
+        if result.is_ok() {
+            self.restore_attrs(&dest, before);
+        }
+        result
+    }
+
+    /// Mode and numeric owner of a path in the container, if it is there.
+    ///
+    /// Read as root: `docker cp` writes with the daemon's authority whatever
+    /// the container user could do, so the restore has to reach just as far.
+    fn attrs(&self, path: &str) -> Option<(String, String)> {
+        let cmd = format!("stat -c '%a %u:%g' -- {}", sh_quote(path));
+        let (out, _, 0) = self.exec_in(&cmd, true).ok()? else {
+            return None;
+        };
+        let mut fields = out.split_whitespace();
+        Some((fields.next()?.to_string(), fields.next()?.to_string()))
+    }
+
+    /// Put back what [`Self::attrs`] saw before the copy. Best effort: the
+    /// bytes are already in place, and failing the save over this would be a
+    /// worse answer than a file whose mode needs a second look.
+    fn restore_attrs(&self, path: &str, before: Option<(String, String)>) {
+        let Some((mode, owner)) = before else { return };
+        let _ = self.exec_in(
+            &format!(
+                "chmod {} -- {} && chown {} -- {}",
+                sh_quote(&mode),
+                sh_quote(path),
+                sh_quote(&owner),
+                sh_quote(path)
+            ),
+            true,
+        );
+    }
+
+    fn copy_in(
+        &mut self,
+        local: &Path,
+        dest_dir: &str,
+        name: &str,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<()> {
         match self.ssh.take() {
             None => {
                 let cmd = format!(
@@ -383,7 +435,7 @@ impl DockerConn {
                         &format!(
                             "{} cp -a {} {}:{}",
                             sh_quote(&self.runtime),
-                            sh_quote(&rjoin(&stage, &name)),
+                            sh_quote(&rjoin(&stage, name)),
                             sh_quote(&self.id),
                             sh_quote(dest_dir)
                         ),
@@ -512,5 +564,69 @@ mod runtime_tests {
     fn shell_command_uses_the_chosen_runtime() {
         let cmd = interactive_shell_command("podman", "my-app");
         assert!(cmd.starts_with("'podman' exec -it 'my-app'"), "{cmd}");
+    }
+}
+
+/// Live tests against a real container, driven the same way as the SSH ones:
+/// set `SSHMAN_TEST_CONTAINER` to a running container's name.
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    fn open() -> Option<DockerConn> {
+        let name = std::env::var("SSHMAN_TEST_CONTAINER")
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        let runtime = detect_runtime(None, None).expect("a container runtime");
+        Some(DockerConn::open(None, &name, &runtime).expect("open the test container"))
+    }
+
+    fn no_progress() -> impl FnMut(u64) {
+        |_| {}
+    }
+
+    /// `docker cp` would otherwise write the temp copy's mode and uid over the
+    /// file being saved, so an edit of a 0600 root-owned file would come back
+    /// 0644 owned by whoever happens to share the host uid.
+    #[test]
+    #[ignore = "needs a live container"]
+    fn saves_keep_the_destination_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(mut c) = open() else { return };
+        c.must(
+            "echo original > /etc/sshman-perm.conf \
+             && chmod 600 /etc/sshman-perm.conf \
+             && chown 0:0 /etc/sshman-perm.conf",
+            true,
+        )
+        .expect("set up the fixture");
+
+        let dir = std::env::temp_dir().join(format!("sshman-dperm-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        c.download("/etc/sshman-perm.conf", &dir, &mut no_progress())
+            .expect("download");
+
+        let temp = dir.join("sshman-perm.conf");
+        std::fs::remove_file(&temp).unwrap();
+        std::fs::write(&temp, b"edited\n").unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        c.upload(&temp, "/etc", &mut no_progress()).expect("upload");
+
+        let (meta, _, _) = c
+            .exec_in("stat -c '%a %u:%g' /etc/sshman-perm.conf", true)
+            .unwrap();
+        assert_eq!(
+            meta.trim(),
+            "600 0:0",
+            "a saved edit must leave mode and ownership alone"
+        );
+        let (body, _, _) = c.exec_in("cat /etc/sshman-perm.conf", true).unwrap();
+        assert_eq!(body, "edited\n", "the contents are the part that changes");
+
+        c.must("rm -f /etc/sshman-perm.conf", true)
+            .expect("cleanup");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

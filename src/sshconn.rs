@@ -581,12 +581,20 @@ impl Conn {
         // Land it in a temp dir we own, then let root move it into place. `cp`
         // into a trailing-slash directory behaves identically for files and
         // directories, which keeps this one code path correct for both.
+        //
+        // Plain `cp -Rd` rather than `cp -a`: the staged copy is owned by the
+        // login user and carries whatever mode the staging chmod left on it,
+        // and `-a` would stamp all of that onto the destination. Saving an
+        // edit of a root-owned 0640 config would hand it to the login user at
+        // 0644. Without `-a`, an existing destination keeps its own mode,
+        // owner and group and only its contents change, and a new file is
+        // created owned by root, which is what a copy made as root should be.
         let stage = self.make_stage_dir()?;
         let staged = rjoin(&stage, &name);
         let result = (|| -> Result<()> {
             self.upload_tree(local, &staged, progress)?;
             self.must(
-                &format!("cp -a -- {} {}/", sh_quote(&staged), sh_quote(dest_dir)),
+                &format!("cp -Rd -- {} {}/", sh_quote(&staged), sh_quote(dest_dir)),
                 true,
             )?;
             Ok(())
@@ -1436,6 +1444,71 @@ mod live {
         assert_eq!(leftovers.trim(), "0", "staging dirs are cleaned up");
 
         c.remove("/root/planted.txt", true).expect("sudo remove");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Saving an edit rewrites the contents and nothing else. The staged copy
+    /// a sudo transfer goes through is owned by the login user, so a `cp` that
+    /// preserved its attributes would quietly hand root's files over.
+    #[test]
+    #[ignore = "needs a live SSH server"]
+    fn sudo_saves_keep_the_destination_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(mut c) = connect() else { return };
+        c.sudo_password = env("SSHMAN_TEST_SUDO_PASS");
+        c.check_sudo().expect("sudo should work for the test user");
+
+        let dir = std::env::temp_dir().join(format!("sshman-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 0640 is the interesting mode: root can write it and the login user
+        // cannot read it, so the round trip has to go through staging.
+        c.exec_sudo(
+            "echo original > /etc/sshman-perm.conf \
+             && chmod 640 /etc/sshman-perm.conf \
+             && chown root:root /etc/sshman-perm.conf",
+        )
+        .expect("set up the fixture");
+
+        c.download("/etc/sshman-perm.conf", &dir, true, &mut no_progress())
+            .expect("sudo download");
+        let temp = dir.join("sshman-perm.conf");
+
+        // Stand in for the editor, which writes with the local umask and may
+        // replace the file outright rather than writing through it.
+        std::fs::remove_file(&temp).unwrap();
+        std::fs::write(&temp, b"edited\n").unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        c.upload(&temp, "/etc", true, &mut no_progress())
+            .expect("sudo upload");
+
+        let (meta, _, _) = c
+            .exec_sudo("stat -c '%a %U:%G' /etc/sshman-perm.conf")
+            .unwrap();
+        assert_eq!(
+            meta.trim(),
+            "640 root:root",
+            "a saved edit must leave mode and ownership alone"
+        );
+        let (body, _, _) = c.exec_sudo("cat /etc/sshman-perm.conf").unwrap();
+        assert_eq!(body, "edited\n", "the contents are the part that changes");
+
+        // A file that is not there yet has no attributes to keep, and lands
+        // owned by the user doing the copying rather than the login user.
+        let fresh = dir.join("sshman-perm-new.conf");
+        std::fs::write(&fresh, b"new\n").unwrap();
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o600)).unwrap();
+        c.upload(&fresh, "/etc", true, &mut no_progress())
+            .expect("sudo upload of a new file");
+        let (meta, _, _) = c
+            .exec_sudo("stat -c '%a %U:%G' /etc/sshman-perm-new.conf")
+            .unwrap();
+        assert_eq!(meta.trim(), "600 root:root");
+
+        c.exec_sudo("rm -f /etc/sshman-perm.conf /etc/sshman-perm-new.conf")
+            .expect("cleanup");
         std::fs::remove_dir_all(&dir).ok();
     }
 

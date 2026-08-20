@@ -48,6 +48,7 @@ SSHMAN_TEST_PORT="$PORT" \
 SSHMAN_TEST_USER=tester \
 SSHMAN_TEST_PASS=testpass \
 SSHMAN_TEST_SUDO_PASS=testpass \
+SSHMAN_TEST_CONTAINER="$CONTAINER" \
     "$BIN" --ignored --test-threads=1 "$@"
 
 echo

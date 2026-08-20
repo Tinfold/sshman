@@ -375,7 +375,9 @@ How it works: listing shells out to `find` (falling back to `ls -la` on systems
 without GNU find), and transfers are staged through a temporary directory in
 `/tmp` that your login user owns — root copies the file there and hands over
 ownership, then ordinary SFTP moves the bytes. The staging directory is removed
-afterwards.
+afterwards. Writing back copies the contents only: a file that is already there
+keeps its own mode, owner and group, so saving an edit of a root-owned `0640`
+config leaves it a root-owned `0640` config. New files land owned by root.
 
 The sudo password is held in memory for the session only, is never written to
 disk or passed on a command line, and is fed to `sudo -S` on stdin. File data is
