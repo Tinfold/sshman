@@ -3,7 +3,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
@@ -13,10 +13,8 @@ use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, ConnectFocus, ConnectForm, Level, LinkState, Mode, Pane, Region, Side};
 use crate::config::Setting;
+use crate::theme::Theme;
 use crate::types::{EntryKind, FileEntry, ellipsize, fmt_time, human_size};
-
-const ACCENT: Color = Color::Cyan;
-const DIM: Color = Color::DarkGray;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -88,30 +86,34 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
     let mut spans = vec![
-        Span::styled(" sshman ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+        Span::styled(
+            " sshman ",
+            Style::new().fg(theme.on_accent).bg(theme.accent).bold(),
+        ),
         Span::raw(" "),
     ];
     match app.tab() {
         Some(tab) => {
             let c = &tab.conn;
             let (colour, suffix) = match tab.link {
-                LinkState::Live => (Color::Green, ""),
-                LinkState::Reconnecting => (Color::Yellow, "  ⟳ reconnecting…"),
-                LinkState::Lost => (Color::Red, "  ✗ disconnected"),
+                LinkState::Live => (theme.good, ""),
+                LinkState::Reconnecting => (theme.warn, "  ⟳ reconnecting…"),
+                LinkState::Lost => (theme.bad, "  ✗ disconnected"),
             };
             let _ = c;
             spans.push(Span::styled(tab.title(), Style::new().fg(colour).bold()));
             if tab.is_container() {
                 spans.push(Span::styled(
                     "  container",
-                    Style::new().fg(Color::Blue).bold(),
+                    Style::new().fg(theme.info).bold(),
                 ));
             }
             if tab.is_local() {
                 spans.push(Span::styled(
                     "  this machine",
-                    Style::new().fg(Color::Blue).bold(),
+                    Style::new().fg(theme.info).bold(),
                 ));
             }
             if !suffix.is_empty() {
@@ -120,13 +122,13 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
             if app.tabs.len() > 1 {
                 spans.push(Span::styled(
                     format!("  tab {}/{}", app.active + 1, app.tabs.len()),
-                    Style::new().fg(DIM),
+                    Style::new().fg(theme.dim),
                 ));
             }
         }
         None => spans.push(Span::styled(
             "not connected",
-            Style::new().fg(Color::Red).bold(),
+            Style::new().fg(theme.bad).bold(),
         )),
     }
     if app.sudo() {
@@ -140,14 +142,14 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
         };
         spans.push(Span::styled(
             label,
-            Style::new().fg(Color::Black).bg(Color::Red).bold(),
+            Style::new().fg(theme.on_accent).bg(theme.bad).bold(),
         ));
     }
     if app.zoomed {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             " ZOOM ",
-            Style::new().fg(Color::Black).bg(ACCENT).bold(),
+            Style::new().fg(theme.on_accent).bg(theme.accent).bold(),
         ));
     }
     // What is on the clipboard has to survive the walk to wherever it is going,
@@ -161,7 +163,7 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
                 clip.names.len(),
                 if clip.cut { "cut" } else { "copied" }
             ),
-            Style::new().fg(Color::Black).bg(Color::Magenta).bold(),
+            Style::new().fg(theme.on_accent).bg(theme.info).bold(),
         ));
     }
     // A workspace can leave connections waiting on a password. That must not
@@ -171,7 +173,7 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!(" ⇄ {forwards} "),
-            Style::new().fg(Color::Black).bg(Color::Blue).bold(),
+            Style::new().fg(theme.on_accent).bg(theme.info).bold(),
         ));
     }
     if !app.needs_password.is_empty() {
@@ -183,14 +185,14 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!(" needs a password: {} — press C ", waiting.join(", ")),
-            Style::new().fg(Color::Black).bg(Color::Yellow).bold(),
+            Style::new().fg(theme.on_accent).bg(theme.warn).bold(),
         ));
     }
-    if let Some(task) = app.tasks.iter().rev().find(|t| !t.is_empty()) {
+    if let Some(task) = app.current_task() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("● {task}"),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warn),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -199,6 +201,7 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
 /// The row of open servers. Each chip carries its number, so `Alt-<n>` is
 /// discoverable without reading the help.
 fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = app.theme;
     app.tab_bar_row = Some(area.y);
     let mut spans = Vec::new();
     let mut x = area.x;
@@ -215,11 +218,11 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         let width = text.chars().count() as u16;
 
         let style = if active {
-            Style::new().fg(Color::Black).bg(ACCENT).bold()
+            Style::new().fg(theme.on_accent).bg(theme.accent).bold()
         } else if tab.link != LinkState::Live {
-            Style::new().fg(Color::Red)
+            Style::new().fg(theme.bad)
         } else {
-            Style::new().fg(Color::Gray)
+            Style::new().fg(theme.muted)
         };
         spans.push(Span::styled(text, style));
         spans.push(Span::raw(" "));
@@ -232,7 +235,7 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     }
     spans.push(Span::styled(
         "  C new · W close · Ctrl-←/→ switch",
-        Style::new().fg(DIM),
+        Style::new().fg(theme.dim),
     ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -291,7 +294,7 @@ fn draw_side(f: &mut Frame, app: &mut App, side: Side, area: Rect, zoom: Option<
             app.zoom_buttons
                 .push((zoom_button_area(files_area), side, Region::Files));
         }
-        let (zoomed, offer_zoom) = (app.zoomed, app.zoom_has_anything_to_hide());
+        let (zoomed, offer_zoom, theme) = (app.zoomed, app.zoom_has_anything_to_hide(), app.theme);
         draw_pane(
             f,
             files_area,
@@ -303,6 +306,7 @@ fn draw_side(f: &mut Frame, app: &mut App, side: Side, area: Rect, zoom: Option<
             live,
             zoomed,
             offer_zoom,
+            theme,
         );
     }
 
@@ -318,26 +322,27 @@ fn draw_side(f: &mut Frame, app: &mut App, side: Side, area: Rect, zoom: Option<
 /// The embedded terminal. The vt100 screen borrows its parser, so the widget
 /// has to be built and rendered inside the lock.
 fn draw_shell(f: &mut Frame, app: &mut App, side: Side, area: Rect, focused: bool) {
+    let theme = app.theme;
     let alive = app.shell(side).map(|s| s.is_alive()).unwrap_or(false);
     let label = app.shell(side).map(|s| s.label.clone()).unwrap_or_default();
     let scrolled = app.shell(side).map(|s| s.scrollback()).unwrap_or(0);
 
     let colour = if !alive {
-        Color::DarkGray
+        theme.dim
     } else if side == Side::Remote && app.sudo() {
-        Color::Red
+        theme.bad
     } else if focused {
-        ACCENT
+        theme.accent
     } else {
-        Color::Gray
+        theme.muted
     };
 
     let mut title = vec![
         Span::styled(" SHELL ", Style::new().fg(colour).bold()),
-        Span::styled(label, Style::new().fg(Color::White)),
+        Span::styled(label, Style::new().fg(theme.text)),
     ];
     if !alive {
-        title.push(Span::styled(" [exited]", Style::new().fg(Color::DarkGray)));
+        title.push(Span::styled(" [exited]", Style::new().fg(theme.dim)));
     }
     title.push(Span::raw(" "));
 
@@ -345,7 +350,7 @@ fn draw_shell(f: &mut Frame, app: &mut App, side: Side, area: Rect, focused: boo
     if scrolled > 0 {
         hint.push(Span::styled(
             format!(" ↑{scrolled} lines back "),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warn),
         ));
     }
     hint.push(Span::styled(
@@ -354,7 +359,7 @@ fn draw_shell(f: &mut Frame, app: &mut App, side: Side, area: Rect, focused: boo
         } else {
             " F6 to focus "
         },
-        Style::new().fg(DIM),
+        Style::new().fg(theme.dim),
     ));
 
     let block = Block::bordered()
@@ -366,12 +371,12 @@ fn draw_shell(f: &mut Frame, app: &mut App, side: Side, area: Rect, focused: boo
         .border_style(if focused {
             Style::new().fg(colour).bold()
         } else {
-            Style::new().fg(DIM)
+            Style::new().fg(theme.dim)
         })
         .title_top(Line::from(title))
         .title_bottom(Line::from(hint).right_aligned());
     let block = match area.width >= MIN_WIDTH_FOR_BUTTON {
-        true => block.title_top(zoom_button(focused, app.zoomed)),
+        true => block.title_top(zoom_button(theme, focused, app.zoomed)),
         false => block,
     };
 
@@ -408,11 +413,11 @@ fn draw_shell(f: &mut Frame, app: &mut App, side: Side, area: Rect, focused: boo
 /// It is the same button either way round — it maximises a pane that is
 /// sharing the screen, and restores one that has taken it all — so its glyph
 /// says which of the two it would do next.
-fn zoom_button(focused: bool, zoomed: bool) -> Line<'static> {
+fn zoom_button(theme: Theme, focused: bool, zoomed: bool) -> Line<'static> {
     let style = if focused {
-        Style::new().fg(ACCENT).bold()
+        Style::new().fg(theme.accent).bold()
     } else {
-        Style::new().fg(DIM)
+        Style::new().fg(theme.dim)
     };
     Line::from(Span::styled(if zoomed { "[⤡]" } else { "[⤢]" }, style)).right_aligned()
 }
@@ -446,18 +451,19 @@ fn draw_pane(
     live: bool,
     zoomed: bool,
     offer_zoom: bool,
+    theme: Theme,
 ) {
     let border_style = if focused {
-        Style::new().fg(ACCENT).bold()
+        Style::new().fg(theme.accent).bold()
     } else {
-        Style::new().fg(DIM)
+        Style::new().fg(theme.dim)
     };
     let label_style = if sudo {
-        Style::new().fg(Color::Red).bold()
+        Style::new().fg(theme.bad).bold()
     } else if focused {
-        Style::new().fg(ACCENT).bold()
+        Style::new().fg(theme.accent).bold()
     } else {
-        Style::new().fg(Color::Gray)
+        Style::new().fg(theme.muted)
     };
 
     let has_button = area.width >= MIN_WIDTH_FOR_BUTTON && offer_zoom;
@@ -471,7 +477,7 @@ fn draw_pane(
         Span::styled(format!(" {label} "), label_style),
         Span::styled(
             ellipsize(path, path_room.max(8)),
-            Style::new().fg(Color::White),
+            Style::new().fg(theme.text),
         ),
         Span::raw(" "),
     ]);
@@ -480,18 +486,18 @@ fn draw_pane(
     if !pane.filter.is_empty() {
         bottom.push(Span::styled(
             format!(" /{} ", pane.filter),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warn),
         ));
     }
     if !pane.marked.is_empty() {
         bottom.push(Span::styled(
             format!(" {} marked ", pane.marked.len()),
-            Style::new().fg(Color::Yellow).bold(),
+            Style::new().fg(theme.warn).bold(),
         ));
     }
     bottom.push(Span::styled(
         format!(" {} items ", pane.view.len()),
-        Style::new().fg(DIM),
+        Style::new().fg(theme.dim),
     ));
 
     let block = Block::bordered()
@@ -504,7 +510,7 @@ fn draw_pane(
         .title_top(title)
         .title_bottom(Line::from(bottom).right_aligned());
     let block = match has_button {
-        true => block.title_top(zoom_button(focused, zoomed)),
+        true => block.title_top(zoom_button(theme, focused, zoomed)),
         false => block,
     };
 
@@ -515,14 +521,14 @@ fn draw_pane(
         let p = Paragraph::new(vec![
             Line::from(Span::styled(
                 "cannot read this directory",
-                Style::new().fg(Color::Red).bold(),
+                Style::new().fg(theme.bad).bold(),
             )),
             Line::raw(""),
-            Line::from(Span::styled(err.clone(), Style::new().fg(Color::Red))),
+            Line::from(Span::styled(err.clone(), Style::new().fg(theme.bad))),
             Line::raw(""),
             Line::from(Span::styled(
                 "press s to try again as root",
-                Style::new().fg(DIM),
+                Style::new().fg(theme.dim),
             )),
         ])
         .wrap(Wrap { trim: true });
@@ -532,7 +538,7 @@ fn draw_pane(
 
     if !live {
         let p = Paragraph::new("no connection")
-            .style(Style::new().fg(DIM))
+            .style(Style::new().fg(theme.dim))
             .alignment(Alignment::Center);
         f.render_widget(p, centered_line(inner));
         return;
@@ -540,7 +546,7 @@ fn draw_pane(
 
     if pane.loading {
         let p = Paragraph::new("loading…")
-            .style(Style::new().fg(Color::Yellow))
+            .style(Style::new().fg(theme.warn))
             .alignment(Alignment::Center);
         f.render_widget(p, centered_line(inner));
         return;
@@ -556,7 +562,7 @@ fn draw_pane(
             format!("{} hidden entries — press . to show", pane.all.len())
         };
         let p = Paragraph::new(msg)
-            .style(Style::new().fg(DIM))
+            .style(Style::new().fg(theme.dim))
             .alignment(Alignment::Center);
         f.render_widget(p, centered_line(inner));
         return;
@@ -566,13 +572,13 @@ fn draw_pane(
     let items: Vec<ListItem> = pane
         .view
         .iter()
-        .map(|e| ListItem::new(entry_line(e, pane.marked.contains(&e.name), cols)))
+        .map(|e| ListItem::new(entry_line(e, pane.marked.contains(&e.name), cols, theme)))
         .collect();
 
     let list = List::new(items).highlight_style(
         Style::new()
-            .bg(if focused { ACCENT } else { DIM })
-            .fg(Color::Black)
+            .bg(if focused { theme.accent } else { theme.dim })
+            .fg(theme.on_accent)
             .add_modifier(Modifier::BOLD),
     );
     f.render_stateful_widget(list, inner, &mut pane.state);
@@ -597,10 +603,10 @@ impl Columns {
     }
 }
 
-fn entry_line<'a>(e: &FileEntry, marked: bool, cols: Columns) -> Line<'a> {
+fn entry_line<'a>(e: &FileEntry, marked: bool, cols: Columns, theme: Theme) -> Line<'a> {
     let mut spans = Vec::new();
     spans.push(if marked {
-        Span::styled("*", Style::new().fg(Color::Yellow).bold())
+        Span::styled("*", Style::new().fg(theme.warn).bold())
     } else {
         Span::raw(" ")
     });
@@ -608,7 +614,7 @@ fn entry_line<'a>(e: &FileEntry, marked: bool, cols: Columns) -> Line<'a> {
     if cols.perms {
         spans.push(Span::styled(
             format!("{:<10} ", e.perms),
-            Style::new().fg(DIM),
+            Style::new().fg(theme.dim),
         ));
     }
     if cols.size {
@@ -619,7 +625,7 @@ fn entry_line<'a>(e: &FileEntry, marked: bool, cols: Columns) -> Line<'a> {
         };
         spans.push(Span::styled(
             format!("{text:>8} "),
-            Style::new().fg(Color::Gray),
+            Style::new().fg(theme.muted),
         ));
     }
     if cols.time {
@@ -628,16 +634,16 @@ fn entry_line<'a>(e: &FileEntry, marked: bool, cols: Columns) -> Line<'a> {
         } else {
             fmt_time(e.mtime)
         };
-        spans.push(Span::styled(format!("{text} "), Style::new().fg(DIM)));
+        spans.push(Span::styled(format!("{text} "), Style::new().fg(theme.dim)));
     }
 
     let name_style = match e.kind {
-        EntryKind::Dir => Style::new().fg(Color::Blue).bold(),
-        EntryKind::Symlink => Style::new().fg(Color::Magenta),
-        EntryKind::Other => Style::new().fg(Color::Yellow),
+        EntryKind::Dir => Style::new().fg(theme.dir).bold(),
+        EntryKind::Symlink => Style::new().fg(theme.link),
+        EntryKind::Other => Style::new().fg(theme.warn),
         EntryKind::File => {
             if e.perms.contains('x') {
-                Style::new().fg(Color::Green)
+                Style::new().fg(theme.good)
             } else {
                 Style::new()
             }
@@ -652,13 +658,14 @@ fn entry_line<'a>(e: &FileEntry, marked: bool, cols: Columns) -> Line<'a> {
     if let Some(target) = &e.link_target {
         spans.push(Span::styled(
             format!(" → {target}"),
-            Style::new().fg(DIM).italic(),
+            Style::new().fg(theme.dim).italic(),
         ));
     }
     Line::from(spans)
 }
 
 fn draw_progress(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
     let Some((label, done, total)) = &app.progress else {
         return;
     };
@@ -678,17 +685,18 @@ fn draw_progress(f: &mut Frame, app: &App, area: Rect) {
         )
     };
     let gauge = Gauge::default()
-        .gauge_style(Style::new().fg(ACCENT).bg(Color::Black))
+        .gauge_style(Style::new().fg(theme.accent).bg(theme.on_accent))
         .ratio(ratio)
         .label(text);
     f.render_widget(gauge, area);
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
     let style = match app.status_level {
-        Level::Info => Style::new().fg(Color::White),
-        Level::Good => Style::new().fg(Color::Green),
-        Level::Bad => Style::new().fg(Color::Red).bold(),
+        Level::Info => Style::new().fg(theme.text),
+        Level::Good => Style::new().fg(theme.good),
+        Level::Bad => Style::new().fg(theme.bad).bold(),
     };
     let icon = match app.status_level {
         Level::Info => "  ",
@@ -895,16 +903,17 @@ fn hints_for(app: &App) -> &'static [Hint<'static>] {
 }
 
 fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
     let hints = hints_for(app);
     let mut spans = Vec::new();
     for (k, v) in &fit_hints(hints, area.width) {
         if !k.is_empty() {
             spans.push(Span::styled(
                 format!(" {k} "),
-                Style::new().fg(Color::Black).bg(Color::Gray),
+                Style::new().fg(theme.on_accent).bg(theme.muted),
             ));
         }
-        spans.push(Span::styled(format!(" {v}  "), Style::new().fg(DIM)));
+        spans.push(Span::styled(format!(" {v}  "), Style::new().fg(theme.dim)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -915,6 +924,7 @@ fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
 const RECENT_WINDOW: usize = 7;
 
 fn draw_connect(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
     let shown = app.history.len().min(RECENT_WINDOW);
     // header + rows + blank separator, or nothing at all when there is no
     // history to offer.
@@ -929,15 +939,15 @@ fn draw_connect(f: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_style(Style::new().fg(theme.accent))
         .title_top(Line::from(Span::styled(
             " Connect to a server ",
-            Style::new().fg(ACCENT).bold(),
+            Style::new().fg(theme.accent).bold(),
         )))
         .title_bottom(
             Line::from(Span::styled(
                 " Tab switches section · Enter connects ",
-                Style::new().fg(DIM),
+                Style::new().fg(theme.dim),
             ))
             .right_aligned(),
         );
@@ -952,12 +962,15 @@ fn draw_connect(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 "Recent servers",
                 if on_list {
-                    Style::new().fg(ACCENT).bold()
+                    Style::new().fg(theme.accent).bold()
                 } else {
-                    Style::new().fg(Color::Gray).bold()
+                    Style::new().fg(theme.muted).bold()
                 },
             ),
-            Span::styled("   ↑↓ choose · Del forgets", Style::new().fg(DIM).italic()),
+            Span::styled(
+                "   ↑↓ choose · Del forgets",
+                Style::new().fg(theme.dim).italic(),
+            ),
         ]));
 
         // Scroll the window so the selection is always visible.
@@ -972,9 +985,12 @@ fn draw_connect(f: &mut Frame, app: &App, area: Rect) {
         {
             let selected = offset == app.history_sel;
             let (marker, style) = match (selected, on_list) {
-                (true, true) => ("▸ ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
-                (true, false) => ("▸ ", Style::new().fg(ACCENT)),
-                _ => ("  ", Style::new().fg(Color::White)),
+                (true, true) => (
+                    "▸ ",
+                    Style::new().fg(theme.on_accent).bg(theme.accent).bold(),
+                ),
+                (true, false) => ("▸ ", Style::new().fg(theme.accent)),
+                _ => ("  ", Style::new().fg(theme.text)),
             };
             let key_note = match &entry.key_path {
                 Some(path) => format!("  key: {}", crate::types::rbasename(path)),
@@ -988,14 +1004,14 @@ fn draw_connect(f: &mut Frame, app: &App, area: Rect) {
                 String::new()
             };
             lines.push(Line::from(vec![
-                Span::styled(marker, Style::new().fg(ACCENT)),
+                Span::styled(marker, Style::new().fg(theme.accent)),
                 Span::styled(format!("{:<22}", ellipsize(&entry.label(), 22)), style),
-                Span::styled(format!("{address:<20}"), Style::new().fg(Color::Gray)),
+                Span::styled(format!("{address:<20}"), Style::new().fg(theme.muted)),
                 Span::styled(
                     format!("{:>9}", crate::history::relative_time(entry.last_connected)),
-                    Style::new().fg(DIM),
+                    Style::new().fg(theme.dim),
                 ),
-                Span::styled(key_note, Style::new().fg(DIM).italic()),
+                Span::styled(key_note, Style::new().fg(theme.dim).italic()),
             ]));
         }
         lines.push(Line::raw(""));
@@ -1024,17 +1040,20 @@ fn draw_connect(f: &mut Frame, app: &App, area: Rect) {
         let focused = app.connect_focus == ConnectFocus::Form && app.form.field == i;
         let marker = if focused { "▸ " } else { "  " };
         let label_style = if focused {
-            Style::new().fg(ACCENT).bold()
+            Style::new().fg(theme.accent).bold()
         } else {
-            Style::new().fg(Color::Gray)
+            Style::new().fg(theme.muted)
         };
         let (value, value_style) = if values[i].is_empty() {
-            (placeholders[i].to_string(), Style::new().fg(DIM).italic())
+            (
+                placeholders[i].to_string(),
+                Style::new().fg(theme.dim).italic(),
+            )
         } else {
-            (values[i].clone(), Style::new().fg(Color::White))
+            (values[i].clone(), Style::new().fg(theme.text))
         };
         lines.push(Line::from(vec![
-            Span::styled(marker, Style::new().fg(ACCENT)),
+            Span::styled(marker, Style::new().fg(theme.accent)),
             Span::styled(format!("{:<10}", labels[i]), label_style),
             Span::styled(value, value_style),
         ]));
@@ -1047,26 +1066,26 @@ fn draw_connect(f: &mut Frame, app: &App, area: Rect) {
         let marker = if focused { "▸ " } else { "  " };
         let box_glyph = if app.form.install_key { "[x]" } else { "[ ]" };
         lines.push(Line::from(vec![
-            Span::styled(marker, Style::new().fg(ACCENT)),
+            Span::styled(marker, Style::new().fg(theme.accent)),
             Span::styled(
                 format!("{box_glyph} "),
                 if app.form.install_key {
-                    Style::new().fg(Color::Green).bold()
+                    Style::new().fg(theme.good).bold()
                 } else {
-                    Style::new().fg(Color::Gray)
+                    Style::new().fg(theme.muted)
                 },
             ),
             Span::styled(
                 "Install my public key for passwordless login",
                 if focused {
-                    Style::new().fg(ACCENT).bold()
+                    Style::new().fg(theme.accent).bold()
                 } else {
-                    Style::new().fg(Color::Gray)
+                    Style::new().fg(theme.muted)
                 },
             ),
             Span::styled(
                 if focused { "   (Space toggles)" } else { "" },
-                Style::new().fg(DIM).italic(),
+                Style::new().fg(theme.dim).italic(),
             ),
         ]));
     }
@@ -1074,19 +1093,19 @@ fn draw_connect(f: &mut Frame, app: &App, area: Rect) {
     if app.form.connecting {
         lines.push(Line::from(Span::styled(
             "  connecting…",
-            Style::new().fg(Color::Yellow).bold(),
+            Style::new().fg(theme.warn).bold(),
         )));
     }
     if let Some(err) = &app.form.error {
         lines.push(Line::from(Span::styled(
             format!("  {err}"),
-            Style::new().fg(Color::Red).bold(),
+            Style::new().fg(theme.bad).bold(),
         )));
     }
     if let Some(hint) = &app.form.hint {
         lines.push(Line::from(Span::styled(
             format!("  {hint}"),
-            Style::new().fg(Color::Yellow).bold(),
+            Style::new().fg(theme.warn).bold(),
         )));
     }
 
@@ -1116,6 +1135,7 @@ fn cursor_offset(app: &App) -> usize {
 
 /// The container chooser: one row per running container.
 fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
     let Some(picker) = &app.picker else { return };
 
     let height = (picker.items.len() as u16 + 4).min(area.height.saturating_sub(4));
@@ -1124,15 +1144,15 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_style(Style::new().fg(theme.accent))
         .title_top(Line::from(Span::styled(
             format!(" {} ", picker.title),
-            Style::new().fg(ACCENT).bold(),
+            Style::new().fg(theme.accent).bold(),
         )))
         .title_bottom(
             Line::from(Span::styled(
                 " ↑↓ choose · ↵ opens it in a tab · Esc cancels ",
-                Style::new().fg(DIM),
+                Style::new().fg(theme.dim),
             ))
             .right_aligned(),
         );
@@ -1148,13 +1168,13 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{:<name_width$} ", ellipsize(&c.name, name_width)),
-                    Style::new().fg(Color::White).bold(),
+                    Style::new().fg(theme.text).bold(),
                 ),
                 Span::styled(
                     format!("{:<image_width$} ", ellipsize(&c.image, image_width)),
-                    Style::new().fg(Color::Gray),
+                    Style::new().fg(theme.muted),
                 ),
-                Span::styled(c.status.clone(), Style::new().fg(Color::Green)),
+                Span::styled(c.status.clone(), Style::new().fg(theme.good)),
             ]))
         })
         .collect();
@@ -1163,8 +1183,8 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
     state.select(Some(picker.selected));
     let list = List::new(items).highlight_style(
         Style::new()
-            .bg(ACCENT)
-            .fg(Color::Black)
+            .bg(theme.accent)
+            .fg(theme.on_accent)
             .add_modifier(Modifier::BOLD),
     );
     f.render_stateful_widget(list, inner, &mut state);
@@ -1176,6 +1196,7 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
 /// The options come from [`Setting::ALL`], so a new one appears here with no
 /// changes to this function.
 fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
     let rows = (Setting::ALL.len() * 2) as u16;
     let rect = centered(
         area,
@@ -1186,15 +1207,15 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_style(Style::new().fg(theme.accent))
         .title_top(Line::from(Span::styled(
             " Settings ",
-            Style::new().fg(ACCENT).bold(),
+            Style::new().fg(theme.accent).bold(),
         )))
         .title_bottom(
             Line::from(Span::styled(
                 " ↵ change · Del clears · Esc closes ",
-                Style::new().fg(DIM),
+                Style::new().fg(theme.dim),
             ))
             .right_aligned(),
         );
@@ -1204,14 +1225,17 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     for (index, setting) in Setting::ALL.iter().enumerate() {
         let chosen = index == app.settings_sel;
-        let name = Style::new().fg(if chosen { Color::White } else { Color::Gray });
+        let name = Style::new().fg(if chosen { theme.text } else { theme.muted });
         let value_style = match app.config.is_set(*setting) {
-            true => Style::new().fg(ACCENT).bold(),
+            true => Style::new().fg(theme.accent).bold(),
             // Inherited from somewhere else, so it is shown but not claimed.
-            false => Style::new().fg(Color::Gray),
+            false => Style::new().fg(theme.muted),
         };
         lines.push(Line::from(vec![
-            Span::styled(if chosen { " ▸ " } else { "   " }, Style::new().fg(ACCENT)),
+            Span::styled(
+                if chosen { " ▸ " } else { "   " },
+                Style::new().fg(theme.accent),
+            ),
             Span::styled(
                 format!("{:<10}", setting.label()),
                 if chosen { name.bold() } else { name },
@@ -1219,18 +1243,19 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(ellipsize(&app.config.value(*setting), 34), value_style),
             Span::styled(
                 format!("  ({})", app.config.origin(*setting)),
-                Style::new().fg(DIM),
+                Style::new().fg(theme.dim),
             ),
         ]));
         lines.push(Line::from(Span::styled(
             format!("   {:<10}{}", "", setting.blurb()),
-            Style::new().fg(DIM),
+            Style::new().fg(theme.dim),
         )));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
     let rows = app.workspaces.len().max(1) as u16;
     let rect = centered(
         area,
@@ -1241,15 +1266,15 @@ fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_style(Style::new().fg(theme.accent))
         .title_top(Line::from(Span::styled(
             " Workspaces ",
-            Style::new().fg(ACCENT).bold(),
+            Style::new().fg(theme.accent).bold(),
         )))
         .title_bottom(
             Line::from(Span::styled(
                 " ↵ open · s saves what is open now · Del forgets · Esc closes ",
-                Style::new().fg(DIM),
+                Style::new().fg(theme.dim),
             ))
             .right_aligned(),
         );
@@ -1261,16 +1286,16 @@ fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     "No workspaces saved yet.",
-                    Style::new().fg(Color::White),
+                    Style::new().fg(theme.text),
                 )),
                 Line::raw(""),
                 Line::from(Span::styled(
                     "Open the servers and containers you want, then press s to",
-                    Style::new().fg(DIM),
+                    Style::new().fg(theme.dim),
                 )),
                 Line::from(Span::styled(
                     "save them together under a name.",
-                    Style::new().fg(DIM),
+                    Style::new().fg(theme.dim),
                 )),
             ]),
             inner,
@@ -1288,15 +1313,15 @@ fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{:<18} ", ellipsize(&w.name, 18)),
-                    Style::new().fg(Color::White).bold(),
+                    Style::new().fg(theme.text).bold(),
                 ),
                 Span::styled(
                     format!("{:<15} ", w.summary()),
-                    Style::new().fg(Color::Gray),
+                    Style::new().fg(theme.muted),
                 ),
                 Span::styled(
                     ellipsize(&members.join(", "), 42),
-                    Style::new().fg(DIM).italic(),
+                    Style::new().fg(theme.dim).italic(),
                 ),
             ]))
         })
@@ -1306,8 +1331,8 @@ fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
     state.select(Some(app.workspace_sel));
     let list = List::new(items).highlight_style(
         Style::new()
-            .bg(ACCENT)
-            .fg(Color::Black)
+            .bg(theme.accent)
+            .fg(theme.on_accent)
             .add_modifier(Modifier::BOLD),
     );
     f.render_stateful_widget(list, inner, &mut state);
@@ -1315,6 +1340,7 @@ fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
 
 /// Ports carried from the server on screen to this machine.
 fn draw_forwards(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
     let forwards: &[crate::forward::Forward] = match app.tab() {
         Some(tab) => &tab.forwards,
         None => &[],
@@ -1332,15 +1358,15 @@ fn draw_forwards(f: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_style(Style::new().fg(theme.accent))
         .title_top(Line::from(Span::styled(
             format!(" Forwarded ports — {title} "),
-            Style::new().fg(ACCENT).bold(),
+            Style::new().fg(theme.accent).bold(),
         )))
         .title_bottom(
             Line::from(Span::styled(
                 " a adds · d stops · Esc closes ",
-                Style::new().fg(DIM),
+                Style::new().fg(theme.dim),
             ))
             .right_aligned(),
         );
@@ -1352,20 +1378,20 @@ fn draw_forwards(f: &mut Frame, app: &App, area: Rect) {
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     "Nothing forwarded from this server.",
-                    Style::new().fg(Color::White),
+                    Style::new().fg(theme.text),
                 )),
                 Line::raw(""),
                 Line::from(Span::styled(
                     "Press a and give a port: 3000 forwards it to the same port",
-                    Style::new().fg(DIM),
+                    Style::new().fg(theme.dim),
                 )),
                 Line::from(Span::styled(
                     "here; 8080:3000 changes the local one; 8080:db:5432 reaches",
-                    Style::new().fg(DIM),
+                    Style::new().fg(theme.dim),
                 )),
                 Line::from(Span::styled(
                     "a host the server can see. Saved with the workspace.",
-                    Style::new().fg(DIM),
+                    Style::new().fg(theme.dim),
                 )),
             ]),
             inner,
@@ -1377,15 +1403,15 @@ fn draw_forwards(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|forward| {
             let (state, style) = match (forward.is_running(), forward.error()) {
-                (true, _) => ("listening".to_string(), Style::new().fg(Color::Green)),
-                (false, Some(err)) => (err, Style::new().fg(Color::Red)),
-                (false, None) => ("stopped".into(), Style::new().fg(Color::DarkGray)),
+                (true, _) => ("listening".to_string(), Style::new().fg(theme.good)),
+                (false, Some(err)) => (err, Style::new().fg(theme.bad)),
+                (false, None) => ("stopped".into(), Style::new().fg(theme.dim)),
             };
             let carried = forward.connection_count();
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{:<34}", forward.spec.describe()),
-                    Style::new().fg(Color::White).bold(),
+                    Style::new().fg(theme.text).bold(),
                 ),
                 Span::styled(format!("{:<12}", ellipsize(&state, 12)), style),
                 Span::styled(
@@ -1394,7 +1420,7 @@ fn draw_forwards(f: &mut Frame, app: &App, area: Rect) {
                         1 => "1 connection".to_string(),
                         n => format!("{n} connections"),
                     },
-                    Style::new().fg(DIM),
+                    Style::new().fg(theme.dim),
                 ),
             ]))
         })
@@ -1404,24 +1430,25 @@ fn draw_forwards(f: &mut Frame, app: &App, area: Rect) {
     state.select(Some(app.forward_sel()));
     let list = List::new(items).highlight_style(
         Style::new()
-            .bg(ACCENT)
-            .fg(Color::Black)
+            .bg(theme.accent)
+            .fg(theme.on_accent)
             .add_modifier(Modifier::BOLD),
     );
     f.render_stateful_widget(list, inner, &mut state);
 }
 
 fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
     let Some(prompt) = &app.prompt else { return };
     let rect = centered(area, 78, 5);
     f.render_widget(Clear, rect);
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_style(Style::new().fg(theme.accent))
         .title_top(Line::from(Span::styled(
             format!(" {} ", prompt.title),
-            Style::new().fg(ACCENT).bold(),
+            Style::new().fg(theme.accent).bold(),
         )));
     let inner = block.inner(rect).inner(Margin::new(1, 0));
     f.render_widget(block, rect);
@@ -1434,7 +1461,7 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("› ", Style::new().fg(ACCENT).bold()),
+            Span::styled("› ", Style::new().fg(theme.accent).bold()),
             Span::raw(shown),
         ])),
         Rect {
@@ -1450,17 +1477,14 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
     let Some(state) = &app.confirm else { return };
     let extra = if state.require_phrase.is_some() { 3 } else { 0 };
     let height = (state.body.len() as u16 + 5 + extra).min(area.height.saturating_sub(2));
     let rect = centered(area, 74, height.max(7));
     f.render_widget(Clear, rect);
 
-    let color = if state.danger {
-        Color::Red
-    } else {
-        Color::Yellow
-    };
+    let color = if state.danger { theme.bad } else { theme.warn };
     let block = Block::bordered()
         .border_type(BorderType::Double)
         .border_style(Style::new().fg(color))
@@ -1487,7 +1511,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
                     format!("Type {word} to continue: "),
                     Style::new().fg(color).bold(),
                 ),
-                Span::styled(state.input.display(), Style::new().fg(Color::White)),
+                Span::styled(state.input.display(), Style::new().fg(theme.text)),
                 Span::styled("▏", Style::new().fg(color)),
             ]));
             lines.push(Line::raw(""));
@@ -1496,9 +1520,9 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(
                     " Enter ",
                     if ready {
-                        Style::new().fg(Color::Black).bg(color).bold()
+                        Style::new().fg(theme.on_accent).bg(color).bold()
                     } else {
-                        Style::new().fg(Color::DarkGray).bg(Color::Black)
+                        Style::new().fg(theme.dim).bg(theme.on_accent)
                     },
                 ),
                 Span::styled(
@@ -1507,19 +1531,22 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
                     } else {
                         " (type the word first)    "
                     },
-                    Style::new().fg(DIM),
+                    Style::new().fg(theme.dim),
                 ),
                 Span::styled(
                     " Esc ",
-                    Style::new().fg(Color::Black).bg(Color::Gray).bold(),
+                    Style::new().fg(theme.on_accent).bg(theme.muted).bold(),
                 ),
                 Span::raw(" cancel"),
             ]));
         }
         None => lines.push(Line::from(vec![
-            Span::styled(" y ", Style::new().fg(Color::Black).bg(color).bold()),
+            Span::styled(" y ", Style::new().fg(theme.on_accent).bg(color).bold()),
             Span::raw(" yes    "),
-            Span::styled(" n ", Style::new().fg(Color::Black).bg(Color::Gray).bold()),
+            Span::styled(
+                " n ",
+                Style::new().fg(theme.on_accent).bg(theme.muted).bold(),
+            ),
             Span::raw(" no"),
         ])),
     }
@@ -1527,6 +1554,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_output(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = app.theme;
     let rect = centered(
         area,
         area.width.saturating_sub(8),
@@ -1536,18 +1564,18 @@ fn draw_output(f: &mut Frame, app: &mut App, area: Rect) {
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_style(Style::new().fg(theme.accent))
         .title_top(Line::from(Span::styled(
             format!(
                 " {} ",
                 ellipsize(&app.output_title, rect.width.saturating_sub(4) as usize)
             ),
-            Style::new().fg(ACCENT).bold(),
+            Style::new().fg(theme.accent).bold(),
         )))
         .title_bottom(
             Line::from(Span::styled(
                 " ↑↓/PgUp/PgDn scroll · Esc close ",
-                Style::new().fg(DIM),
+                Style::new().fg(theme.dim),
             ))
             .right_aligned(),
         );
@@ -1564,18 +1592,23 @@ fn draw_output(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = app.theme;
     let rect = centered(area, 76, area.height.saturating_sub(4).min(34));
     f.render_widget(Clear, rect);
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_style(Style::new().fg(theme.accent))
         .title_top(Line::from(Span::styled(
             " Keys ",
-            Style::new().fg(ACCENT).bold(),
+            Style::new().fg(theme.accent).bold(),
         )))
         .title_bottom(
-            Line::from(Span::styled(" any key to close ", Style::new().fg(DIM))).right_aligned(),
+            Line::from(Span::styled(
+                " any key to close ",
+                Style::new().fg(theme.dim),
+            ))
+            .right_aligned(),
         );
     let inner = block.inner(rect).inner(Margin::new(1, 0));
     f.render_widget(block, rect);
@@ -1585,11 +1618,11 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
         if key.is_empty() {
             lines.push(Line::from(Span::styled(
                 desc.to_string(),
-                Style::new().fg(ACCENT).bold(),
+                Style::new().fg(theme.accent).bold(),
             )));
         } else {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<14}"), Style::new().fg(Color::Yellow)),
+                Span::styled(format!("  {key:<14}"), Style::new().fg(theme.warn)),
                 Span::raw(desc.to_string()),
             ]));
         }
@@ -1718,7 +1751,6 @@ pub const HELP: &[(&str, &str)] = &[
         "  While the shell has focus every key goes to it, including",
     ),
     ("", "  Ctrl-C and Esc. F6 is the way back out."),
-    ("Ctrl-↑ / Ctrl-↓", "make the shell pane taller or shorter"),
     ("wheel", "scroll the shell's history"),
     (
         "",
@@ -1744,18 +1776,30 @@ pub const HELP: &[(&str, &str)] = &[
     (",", "settings: what sshman remembers between sessions"),
     (
         "",
-        "  ↵ changes the one under the cursor, Del clears it back to",
+        "  ↵ changes the one under the cursor — for a setting with a",
     ),
     (
         "",
-        "  whatever it would have been. Kept in the config file at",
+        "  list to walk, like the theme, ↵ and ←/→ step through it.",
     ),
-    ("", "  ~/.config/sshman/config.json."),
     (
         "",
-        "  The editor lives here, and is used in place of $VISUAL and",
+        "  Del clears one back to whatever it would have been. Kept in",
     ),
-    ("", "  $EDITOR. --editor overrides it for a single run."),
+    ("", "  the config file, ~/.config/sshman/config.json."),
+    (
+        "",
+        "  The editor lives here, used in place of $VISUAL and $EDITOR;",
+    ),
+    (
+        "",
+        "  --editor overrides it for a single run. The theme lives here",
+    ),
+    (
+        "",
+        "  too: terminal, catppuccin, monokai, gruvbox, mariana,",
+    ),
+    ("", "  afterglow or darcula."),
     (
         "e / F4",
         "open in your editor; remote files come back automatically",
@@ -1937,6 +1981,24 @@ mod tests {
     use crate::sshconn::ConnectOpts;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+
+    /// Draw a whole frame and hand back the screen itself, for tests that
+    /// care about how a cell is painted rather than what it says.
+    fn painted(width: u16, height: u16, setup: impl FnOnce(&mut App)) -> (App, Buffer) {
+        let dir = std::env::temp_dir().join(format!("sshman-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(ConnectOpts::default(), dir.clone(), None, false);
+        app.mode = Mode::Browse;
+        setup(&mut app);
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        std::fs::remove_dir_all(&dir).ok();
+        (app, buffer)
+    }
 
     /// Draw a whole frame and hand back what landed on the screen, along with
     /// the app that recorded where it put things.
@@ -2053,6 +2115,92 @@ mod tests {
                 )),
                 "{tail:?} has no way out in it"
             );
+        }
+    }
+
+    /// The colours actually used to paint the screen.
+    fn palette(buffer: &Buffer) -> Vec<Color> {
+        buffer.content().iter().map(|cell| cell.fg).collect()
+    }
+
+    #[test]
+    fn the_chosen_theme_is_what_reaches_the_screen() {
+        for theme in Theme::ALL {
+            let (_, buffer) = painted(110, 30, |app| app.theme = *theme);
+            let used = palette(&buffer);
+            // The focused pane's border and titles are the accent, and the
+            // hints below are dim: if a role never arrives, something is
+            // still painting a colour of its own.
+            assert!(
+                used.contains(&theme.accent),
+                "{}: nothing is drawn in the accent",
+                theme.name
+            );
+            assert!(
+                used.contains(&theme.dim),
+                "{}: nothing is drawn dim",
+                theme.name
+            );
+            assert!(
+                used.contains(&theme.text),
+                "{}: nothing is drawn as plain text",
+                theme.name
+            );
+        }
+    }
+
+    #[test]
+    fn no_colour_is_painted_that_the_theme_did_not_choose() {
+        // Every colour on screen has to come from the palette. A literal left
+        // behind in the drawing code shows up here as a colour no theme knows
+        // about, whichever theme is on.
+        let screens = [
+            Mode::Browse,
+            Mode::Connect,
+            Mode::Settings,
+            Mode::Workspaces,
+            Mode::Help,
+            Mode::Output,
+            Mode::Picker,
+            Mode::Forwards,
+            Mode::Prompt,
+            Mode::Confirm,
+        ];
+        for (theme, mode) in Theme::ALL
+            .iter()
+            .copied()
+            .flat_map(|t| screens.map(|m| (t, m)))
+        {
+            let (_, buffer) = painted(110, 30, |app| {
+                app.theme = theme;
+                app.mode = mode;
+            });
+            let known = [
+                theme.accent,
+                theme.dim,
+                theme.text,
+                theme.muted,
+                theme.good,
+                theme.warn,
+                theme.bad,
+                theme.dir,
+                theme.link,
+                theme.exec,
+                theme.info,
+                theme.on_accent,
+                // Cells nobody styled keep the terminal's own colour.
+                Color::Reset,
+            ];
+            for colour in palette(&buffer) {
+                assert!(
+                    known.contains(&colour),
+                    "{:?} is painted on the {:?} screen in {}, but is not one \
+                     of its colours",
+                    colour,
+                    mode,
+                    theme.name
+                );
+            }
         }
     }
 

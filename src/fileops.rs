@@ -50,8 +50,14 @@ pub fn paste_command(dir: &str, names: &[String], dest: &str, action: Action) ->
     }
     // The loop variable is expanded inside quotes and appended to the quoted
     // destination, so neither a space nor a `$` in either can escape.
+    //
+    // Both checks run before anything is written, and both say which name is
+    // the problem. A clipboard outlives what it points at — the file can be
+    // deleted, renamed or moved between the copy and the paste — and "cp:
+    // cannot stat" is a poor way to be told so.
     format!(
         "cd {dir} && for n in{items}; do \
+         if [ ! -e \"$n\" ]; then echo \"$n is no longer there\" >&2; exit 1; fi; \
          if [ -e {dest}/\"$n\" ]; then echo \"$n is already there\" >&2; exit 1; fi; \
          done && {tool} --{items} {dest}/",
         dir = sh_quote(dir),
@@ -84,6 +90,14 @@ mod tests {
         let cmd = paste_command("/a", &["one".into()], "/b", Action::Move);
         assert!(cmd.ends_with("mv -- 'one' '/b'/"), "{cmd}");
         assert!(cmd.contains("is already there"), "the guard is still there");
+    }
+
+    #[test]
+    fn a_source_that_has_gone_is_named_before_cp_gets_a_chance_to_mumble() {
+        let cmd = paste_command("/a", &["gone.txt".into()], "/b", Action::Copy);
+        let missing = cmd.find("is no longer there").unwrap();
+        let write = cmd.find("cp -a").unwrap();
+        assert!(missing < write, "checked first: {cmd}");
     }
 
     #[test]

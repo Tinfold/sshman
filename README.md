@@ -91,7 +91,7 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `P` | paste what `c` or `M` picked up into this directory |
 | `e` / `F4` | edit in `$EDITOR` |
 | `E` | edit with a program you name, just this once |
-| `,` | settings: what sshman remembers between sessions |
+| `,` | settings: theme, editor — what sshman remembers between sessions |
 | `v` | view in `$PAGER` |
 | `:` | run a command in the remote pane's directory |
 | `!` | full-screen shell in that directory: `ssh` for a server, `exec` into a container, a login shell on this machine |
@@ -106,7 +106,6 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `Ctrl-←` / `Ctrl-→`, `Alt-1`…`Alt-9` | move between tabs |
 | `S` | open/close a shell under the focused pane |
 | `F6` / `Ctrl-]` | move the keyboard between the file list and the shell |
-| `Ctrl-↑` / `Ctrl-↓` | make the shell pane taller / shorter |
 | `m` / `F3` | give the whole screen to the focused pane, or undo that |
 | `Alt-←` / `Alt-→` | move the divider between the two sides |
 | `Alt-↑` / `Alt-↓` | move the top edge of the shell pane |
@@ -131,7 +130,7 @@ the destination are overwritten. Deleting always asks first.
 
 The two sides start on an even split with the shell, when there is one, taking
 the bottom of its column. Both dividers move: `Alt-←` and `Alt-→` for the one
-down the middle, `Alt-↑` and `Alt-↓` (or `Ctrl-↑` and `Ctrl-↓`) for the top
+down the middle, `Alt-↑` and `Alt-↓` for the top
 edge of the shell, and dragging either border with the mouse does the same. The
 file list keeps three rows whatever the shell asks for, and neither side can be
 squeezed below a fifth of the width.
@@ -377,7 +376,7 @@ the shell has focus **every** key goes to it, including `Ctrl-C`, `Esc` and `q`
 
 - The local shell starts in the local pane's directory, running `$SHELL`.
 - The remote shell starts in the remote pane's directory.
-- `Ctrl-↑` / `Ctrl-↓` resize the pane; the scroll wheel moves through history.
+- `Alt-↑` / `Alt-↓` resize the pane; the scroll wheel moves through history.
 - Full-screen programs work: `vim`, `top`, `btop`. One that asks for the mouse
   is given it — clicks, drags and the wheel all reach it — and `Shift` with the
   wheel scrolls the pane's own history regardless.
@@ -442,6 +441,39 @@ starts a fresh connection.
 
 Shells do not follow: an embedded shell's session is gone for good when the
 link drops, and its pane says `[exited]`. `S` twice starts a new one.
+
+## Themes
+
+Press `,`, pick **Theme**, and `↵` (or `←`/`→`) steps through them. The screen
+redraws as you go, so you are choosing by looking rather than by guessing.
+
+| | |
+|---|---|
+| `terminal` | the default: the terminal's own sixteen colours, so sshman matches whatever the rest of your setup is |
+| `catppuccin` | Catppuccin Mocha |
+| `monokai` | Monokai |
+| `gruvbox` | Gruvbox dark |
+| `mariana` | Mariana, the one Sublime Text ships |
+| `afterglow` | Afterglow |
+| `darcula` | Darcula, as IntelliJ draws it |
+
+Each palette is taken from the theme's own source rather than from memory:
+gruvbox from `morhetz/gruvbox`, Mariana from the scheme in Sublime's own
+packages (its values are HSL there, converted here), Afterglow from
+`YabataDesign/afterglow-theme`, Darcula from the colour scheme in
+`JetBrains/intellij-community`.
+
+Themes set foregrounds only. sshman never paints a background of its own, so
+your terminal's shows through — which is what lets it sit inside a setup you
+have already themed, and the only honest thing to do beside a shell pane, where
+the program running in it paints its own colours anyway.
+
+Every colour in the interface is one of twelve roles — accent, dim, text,
+muted, good, warn, bad, dir, link, exec, info, and the text drawn on a coloured
+chip — so a new theme is a table of twelve values in `src/theme.rs` and a line
+in `Theme::ALL`. Nothing else has to know about it. There is a test that walks
+every screen in every theme and fails if a single cell is painted a colour the
+theme did not choose, so a hard-coded colour cannot creep back in.
 
 ## Editing files
 

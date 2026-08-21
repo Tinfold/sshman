@@ -12,7 +12,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use crate::backend::{BackendKind, Target};
-use crate::config::{Config, Setting};
+use crate::config::{Config, Kind, Setting};
 use crate::forward::{Forward, Spec as ForwardSpec};
 use crate::history::History;
 use crate::input::TextInput;
@@ -20,6 +20,7 @@ use crate::layout::Layout;
 use crate::local;
 use crate::shell::Shell;
 use crate::sshconn::ConnectOpts;
+use crate::theme::Theme;
 use crate::types::{FileEntry, rbasename, rjoin, rparent};
 use crate::worker::{HostKeyIssue, Req, Resp};
 use crate::workspace::{Item as WorkspaceItem, Workspaces};
@@ -461,6 +462,9 @@ pub struct RemoteTab {
     /// is still wide when you come back to it, and a workspace writes these
     /// down along with everything else about the tab.
     pub layout: Layout,
+    /// What this tab's worker is doing, if anything. See
+    /// [`PendingConnect::task`] for why it lives here.
+    pub task: Option<String>,
     /// Ports carried from this server to this machine.
     pub forwards: Vec<Forward>,
     tx: Sender<Req>,
@@ -531,6 +535,11 @@ pub struct PendingConnect {
     /// Sizes for the tab this becomes: a workspace's, or the ones on screen,
     /// so opening a server does not throw away the split you just set up.
     pub layout: Layout,
+    /// What its worker is doing, if anything. Held here rather than in a list
+    /// of its own so that giving up on an attempt takes the label with it: a
+    /// worker whose replies nobody is reading any more cannot leave "…" in
+    /// the title bar for the rest of the session.
+    pub task: Option<String>,
     tx: Sender<Req>,
     pub rx: Receiver<Resp>,
     initial_dir: Option<String>,
@@ -591,7 +600,10 @@ pub struct App {
     pub status: String,
     pub status_level: Level,
     pub progress: Option<(String, u64, u64)>,
-    pub tasks: Vec<String>,
+    /// Work started on this machine rather than by a worker — packing an
+    /// archive, looking for containers. Balanced by construction: the thread
+    /// always reports back.
+    pub local_tasks: Vec<String>,
 
     pub form: ConnectForm,
     pub history: History,
@@ -618,6 +630,9 @@ pub struct App {
     /// clone rather than a lookup.
     pub config: Config,
     pub editor: String,
+    /// The colours in use, from the config. Kept here so drawing is a read
+    /// rather than a lookup and a fallback on every span.
+    pub theme: Theme,
     pub pager: String,
     /// The details the connection screen is working with — the active tab's
     /// once connected, or what the user is typing for a new one.
@@ -641,6 +656,7 @@ impl App {
     ) -> Self {
         let config = Config::load();
         let editor = config.editor();
+        let theme = config.theme();
         let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
         let history = History::load();
         let (local_tx, local_rx) = std::sync::mpsc::channel();
@@ -678,7 +694,7 @@ impl App {
             status: "Connecting…".into(),
             status_level: Level::Info,
             progress: None,
-            tasks: Vec::new(),
+            local_tasks: Vec::new(),
             // Start on the recent list when there is one — that is the whole
             // point of remembering servers.
             connect_focus: if history.is_empty() {
@@ -704,6 +720,7 @@ impl App {
             cmd_history: Vec::new(),
             config,
             editor,
+            theme,
             pager,
             opts,
             host_key_issue: None,
@@ -922,6 +939,7 @@ impl App {
                 .filter(|n| !n.is_empty()),
             forwards: Vec::new(),
             layout: self.layout,
+            task: None,
             tx,
             rx,
             // Copied, not taken: an attempt can be retried — after accepting a
@@ -949,7 +967,7 @@ impl App {
             }
         }
         while let Ok(outcome) = self.local_rx.try_recv() {
-            self.tasks.pop();
+            self.local_tasks.pop();
             if let Some((title, text)) = outcome.output {
                 self.show_output(title, text);
             }
@@ -996,7 +1014,7 @@ impl App {
         success: String,
         show_title: Option<String>,
     ) {
-        self.tasks.push(label);
+        self.local_tasks.push(label);
         let tx = self.local_tx.clone();
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         std::thread::Builder::new()
@@ -1211,6 +1229,43 @@ impl App {
         self.local_shell = None;
     }
 
+    /// Note what a worker has started or finished doing.
+    ///
+    /// The gauge belongs to the tab on screen, so it goes when that tab stops
+    /// working — not when some other tab happens to finish.
+    fn set_task(&mut self, source: RespSource, label: Option<String>) {
+        let active = self.active;
+        match source {
+            RespSource::Pending(id) => {
+                if let Some(pending) = self.pending.iter_mut().find(|p| p.id == id) {
+                    pending.task = label;
+                }
+            }
+            RespSource::Tab(index) => {
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.task = label;
+                    if index == active && tab.task.is_none() {
+                        self.progress = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// What to say is going on, when anything is.
+    ///
+    /// The tab you are looking at comes first — that is the work you are
+    /// waiting on — and anything else still running gets a look in after it,
+    /// so a connection being made in the background still says so.
+    pub fn current_task(&self) -> Option<&str> {
+        self.tab()
+            .and_then(|t| t.task.as_deref())
+            .or_else(|| self.local_tasks.last().map(String::as_str))
+            .or_else(|| self.pending.iter().find_map(|p| p.task.as_deref()))
+            .or_else(|| self.tabs.iter().find_map(|t| t.task.as_deref()))
+            .filter(|label| !label.is_empty())
+    }
+
     /// Fold in one worker message. `source` says which worker it came from,
     /// so a background tab's chatter cannot be mistaken for the active one's.
     pub fn handle_resp(&mut self, source: RespSource, resp: Resp) {
@@ -1218,17 +1273,8 @@ impl App {
         // listings would otherwise wipe out the result of whatever the user
         // just did and then sit there stale.
         match resp {
-            Resp::TaskStart(label) => {
-                self.tasks.push(label);
-                return;
-            }
-            Resp::TaskEnd => {
-                self.tasks.pop();
-                if self.tasks.is_empty() {
-                    self.progress = None;
-                }
-                return;
-            }
+            Resp::TaskStart(label) => return self.set_task(source, Some(label)),
+            Resp::TaskEnd => return self.set_task(source, None),
             _ => {}
         }
 
@@ -1300,6 +1346,7 @@ impl App {
                     shell: None,
                     region: Region::Files,
                     layout: pending.layout,
+                    task: None,
                     forwards: Vec::new(),
                     tx: pending.tx,
                     rx: pending.rx,
@@ -1967,9 +2014,7 @@ impl App {
         // these before the modifier is ever looked at.
         //
         // Alt does the whole layout: sideways moves the divider between the
-        // two sides, up and down moves the top edge of the shell. Ctrl-up and
-        // Ctrl-down do the shell too, since that pair was the resize keys
-        // before there was anything else to resize.
+        // two sides, up and down moves the top edge of the shell.
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
                 KeyCode::Left => return self.resize_split(-2),
@@ -1978,11 +2023,6 @@ impl App {
                 KeyCode::Down => return self.resize_shell_pane(-1),
                 _ => {}
             }
-        }
-        if ctrl && matches!(key.code, KeyCode::Up | KeyCode::Down) {
-            let delta = if key.code == KeyCode::Up { 1 } else { -1 };
-            self.resize_shell_pane(delta);
-            return;
         }
         if ctrl && matches!(key.code, KeyCode::Left | KeyCode::Right) {
             let delta = if key.code == KeyCode::Right { 1 } else { -1 };
@@ -2448,7 +2488,12 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.settings_sel = self.settings_sel.saturating_sub(1);
             }
-            KeyCode::Enter => self.edit_setting(self.selected_setting()),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                self.change_setting(self.selected_setting(), 1);
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.change_setting(self.selected_setting(), -1);
+            }
             // Only a setting of your own can be cleared; the inherited value
             // underneath it is not ours to remove.
             KeyCode::Delete | KeyCode::Backspace => {
@@ -2466,14 +2511,30 @@ impl App {
         }
     }
 
+    /// Change a setting: ask for a value, or step to the next one there is.
+    ///
+    /// `step` only means anything to a setting with a list to walk; typing
+    /// one in has no direction to go.
+    fn change_setting(&mut self, setting: Setting, step: isize) {
+        match setting.kind() {
+            Kind::Text => self.ask_for_setting(setting),
+            Kind::Choice => match setting {
+                Setting::Theme => self.set_theme(self.theme.cycle(step)),
+                Setting::Editor => {}
+            },
+        }
+    }
+
     /// Ask for a new value, coming back to the settings pane afterwards.
-    fn edit_setting(&mut self, setting: Setting) {
+    fn ask_for_setting(&mut self, setting: Setting) {
         let (kind, title, current) = match setting {
             Setting::Editor => (
                 PromptKind::SetEditor,
                 "Editor (empty uses $VISUAL, then $EDITOR)".to_string(),
                 self.config.editor.clone().unwrap_or_default(),
             ),
+            // Nothing to type: it is chosen from a list.
+            Setting::Theme => return,
         };
         self.open_prompt(kind, title, current);
     }
@@ -2481,6 +2542,30 @@ impl App {
     fn clear_setting(&mut self, setting: Setting) {
         match setting {
             Setting::Editor => self.set_editor(String::new()),
+            Setting::Theme => {
+                self.config.theme = None;
+                self.theme = self.config.theme();
+                self.save_config(format!("theme cleared — back to {}", self.theme.name));
+            }
+        }
+    }
+
+    /// Draw in these colours from now on, and next time.
+    fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        self.config.theme = Some(theme.name.to_string());
+        self.save_config(format!("theme: {}", theme.name));
+    }
+
+    /// Write the settings back, saying so either way. A setting that silently
+    /// failed to save is worse than one that never claimed to.
+    fn save_config(&mut self, done: String) {
+        match self.config.save() {
+            Ok(()) => self.set_status(done, Level::Good),
+            Err(e) => self.set_status(
+                format!("{done}, but it could not be saved: {e}"),
+                Level::Bad,
+            ),
         }
     }
 
@@ -2493,21 +2578,11 @@ impl App {
         self.config.editor = (!value.is_empty()).then_some(value);
         self.editor = self.config.editor();
         let editor = self.editor.clone();
-        match self.config.save() {
-            Ok(()) => self.set_status(
-                match self.config.editor.is_some() {
-                    true => format!("editor set to {editor} — remembered for next time"),
-                    false => format!("editor cleared — using {editor}"),
-                },
-                Level::Good,
-            ),
-            // The session still has the new editor; only the remembering
-            // failed, and saying so beats pretending either way.
-            Err(e) => self.set_status(
-                format!("using {editor}, but it could not be saved: {e}"),
-                Level::Bad,
-            ),
-        }
+        let done = match self.config.editor.is_some() {
+            true => format!("editor set to {editor}"),
+            false => format!("editor cleared — using {editor}"),
+        };
+        self.save_config(done);
     }
 
     fn confirm_key(&mut self, key: KeyEvent) {
@@ -3280,7 +3355,8 @@ impl App {
     fn find_containers(&mut self, side: Side) {
         match side {
             Side::Local => {
-                self.tasks.push("looking for local containers…".into());
+                self.local_tasks
+                    .push("looking for local containers…".into());
                 let tx = self.local_tx.clone();
                 std::thread::Builder::new()
                     .name("docker-ps".into())
@@ -4222,6 +4298,7 @@ mod tests {
             shell,
             region: Region::Files,
             layout,
+            task: None,
             forwards: Vec::new(),
             tx,
             rx: resp_rx,
@@ -4331,6 +4408,111 @@ mod tests {
         // Esc is the other way out, once it has nothing else to clear.
         key(&mut app, KeyCode::Esc);
         assert!(!app.zoomed);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A connection attempt in flight, as the connection form makes one.
+    fn fake_pending(app: &mut App) -> u64 {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (_, resp_rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        app.next_pending_id += 1;
+        let id = app.next_pending_id;
+        app.pending.push(PendingConnect {
+            id,
+            from_form: true,
+            target: Target::Ssh(ConnectOpts::default()),
+            name: None,
+            forwards: Vec::new(),
+            layout: Layout::default(),
+            task: None,
+            tx,
+            rx: resp_rx,
+            initial_dir: None,
+            install_key: false,
+        });
+        id
+    }
+
+    #[test]
+    fn giving_up_on_a_connection_takes_its_label_with_it() {
+        let dir = scratch("task-pending");
+        let mut app = app_in(&dir);
+        let id = fake_pending(&mut app);
+        app.handle_resp(
+            RespSource::Pending(id),
+            Resp::TaskStart("connecting to nowhere…".into()),
+        );
+        assert_eq!(app.current_task(), Some("connecting to nowhere…"));
+
+        // The attempt is dropped while its worker is still going, so the
+        // worker's "finished" will never be read. The label has to go with
+        // the attempt, or it sits in the title bar for the rest of the
+        // session.
+        app.dismiss_connect_screen();
+        assert_eq!(app.current_task(), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn closing_a_tab_takes_its_label_with_it() {
+        let dir = scratch("task-tab");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        app.handle_resp(
+            RespSource::Tab(0),
+            Resp::TaskStart("copying 3 items…".into()),
+        );
+        assert_eq!(app.current_task(), Some("copying 3 items…"));
+
+        app.close_tab();
+        assert_eq!(app.current_task(), None, "the worker went with the tab");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_gauge_belongs_to_the_tab_on_screen() {
+        let dir = scratch("task-gauge");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        fake_tab(&mut app, "two", None);
+        app.active = 0;
+
+        // A transfer on the tab being watched.
+        app.handle_resp(RespSource::Tab(0), Resp::TaskStart("↓ big.iso".into()));
+        app.progress = Some(("↓ big.iso".into(), 1, 2));
+
+        // Another tab finishing something of its own must not clear it.
+        app.handle_resp(RespSource::Tab(1), Resp::TaskStart("listing…".into()));
+        app.handle_resp(RespSource::Tab(1), Resp::TaskEnd);
+        assert!(app.progress.is_some(), "that was somebody else's work");
+
+        app.handle_resp(RespSource::Tab(0), Resp::TaskEnd);
+        assert!(app.progress.is_none(), "and this one is finished");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_label_follows_the_tab_you_are_looking_at() {
+        let dir = scratch("task-follow");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        fake_tab(&mut app, "two", None);
+        app.handle_resp(RespSource::Tab(0), Resp::TaskStart("one is busy…".into()));
+        app.handle_resp(RespSource::Tab(1), Resp::TaskStart("two is busy…".into()));
+
+        app.active = 1;
+        assert_eq!(app.current_task(), Some("two is busy…"));
+        app.active = 0;
+        assert_eq!(
+            app.current_task(),
+            Some("one is busy…"),
+            "what the tab on screen is doing comes first"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

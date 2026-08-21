@@ -11,6 +11,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::theme::Theme;
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Config {
     /// The program `e` opens files with. Empty or absent defers to `$VISUAL`,
@@ -18,6 +20,12 @@ pub struct Config {
     /// was anywhere to write it down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
+
+    /// Which set of colours to draw in, by name. An absent or unknown one
+    /// means the terminal's own, which is what sshman looked like before
+    /// there were any others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
 
     /// The file this came from, and where it goes back to. Not part of the
     /// file itself, and `None` when there is nowhere to write — which is also
@@ -42,9 +50,18 @@ impl Config {
     #[cfg(test)]
     pub fn at(path: PathBuf) -> Self {
         Self {
-            editor: None,
             path: Some(path),
+            ..Self::default()
         }
+    }
+
+    /// The colours to draw in. A name we do not recognise — a theme from a
+    /// later version, or a typo — falls back rather than failing.
+    pub fn theme(&self) -> Theme {
+        self.theme
+            .as_deref()
+            .and_then(Theme::by_name)
+            .unwrap_or_default()
     }
 
     /// The editor to use, given what the environment says.
@@ -90,14 +107,24 @@ impl Config {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Setting {
     Editor,
+    Theme,
+}
+
+/// How a setting is changed: by typing a value, or by stepping through the
+/// ones there are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Text,
+    Choice,
 }
 
 impl Setting {
-    pub const ALL: &'static [Setting] = &[Setting::Editor];
+    pub const ALL: &'static [Setting] = &[Setting::Editor, Setting::Theme];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Editor => "Editor",
+            Self::Theme => "Theme",
         }
     }
 
@@ -105,6 +132,14 @@ impl Setting {
     pub fn blurb(self) -> &'static str {
         match self {
             Self::Editor => "the program e opens files with",
+            Self::Theme => "the colours to draw in",
+        }
+    }
+
+    pub fn kind(self) -> Kind {
+        match self {
+            Self::Editor => Kind::Text,
+            Self::Theme => Kind::Choice,
         }
     }
 }
@@ -114,6 +149,7 @@ impl Config {
     pub fn value(&self, setting: Setting) -> String {
         match setting {
             Setting::Editor => self.editor(),
+            Setting::Theme => self.theme().name.to_string(),
         }
     }
 
@@ -121,6 +157,10 @@ impl Config {
     /// here would be changing anything.
     pub fn origin(&self, setting: Setting) -> &'static str {
         match setting {
+            Setting::Theme => match self.is_set(Setting::Theme) {
+                true => "set here",
+                false => "the default",
+            },
             Setting::Editor => {
                 if self.editor.as_deref().is_some_and(|e| !e.trim().is_empty()) {
                     "set here"
@@ -140,6 +180,11 @@ impl Config {
     pub fn is_set(&self, setting: Setting) -> bool {
         match setting {
             Setting::Editor => self.editor.is_some(),
+            // A name we cannot use is not a setting, however it got there.
+            Setting::Theme => self
+                .theme
+                .as_deref()
+                .is_some_and(|n| Theme::by_name(n).is_some()),
         }
     }
 }
@@ -221,6 +266,31 @@ mod tests {
         assert!(
             !text.contains("path"),
             "where it lives is not part of what it says: {text}"
+        );
+    }
+
+    #[test]
+    fn a_theme_is_remembered_by_name() {
+        let mut config = Config::default();
+        assert_eq!(config.theme(), crate::theme::TERMINAL, "the default");
+
+        config.theme = Some("monokai".into());
+        assert_eq!(config.theme(), crate::theme::MONOKAI);
+        assert!(config.is_set(Setting::Theme));
+        assert_eq!(config.value(Setting::Theme), "monokai");
+    }
+
+    #[test]
+    fn a_theme_we_cannot_draw_falls_back_rather_than_failing() {
+        // From a later version, or a typo in a hand-edited file.
+        let config = Config {
+            theme: Some("dracula".into()),
+            ..Config::default()
+        };
+        assert_eq!(config.theme(), crate::theme::TERMINAL);
+        assert!(
+            !config.is_set(Setting::Theme),
+            "and the pane does not claim it as a setting of yours"
         );
     }
 

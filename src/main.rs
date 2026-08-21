@@ -18,6 +18,7 @@ mod local;
 mod shell;
 mod sshcfg;
 mod sshconn;
+mod theme;
 mod types;
 mod ui;
 mod worker;
