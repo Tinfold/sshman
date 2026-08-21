@@ -129,7 +129,7 @@ impl Item {
         match self {
             Self::Ssh { layout, .. }
             | Self::Container { layout, .. }
-            | Self::Local { layout, .. } => layout.map(Layout::sane),
+            | Self::Local { layout, .. } => layout.clone().map(Layout::sane),
         }
     }
 
@@ -346,10 +346,7 @@ mod tests {
         let item = Item::Local {
             path: Some("/var/log".into()),
             name: Some("logs".into()),
-            layout: Some(Layout {
-                split_pct: 35,
-                shell_height: 14,
-            }),
+            layout: Some(Layout::sides(35)),
         };
         let text = serde_json::to_string(&item).unwrap();
         let back: Item = serde_json::from_str(&text).unwrap();
@@ -357,7 +354,7 @@ mod tests {
         assert!(matches!(back.to_target(), Target::Local));
         assert_eq!(back.path(), Some("/var/log"));
         assert_eq!(back.name(), Some("logs"));
-        assert_eq!(back.layout().unwrap().split_pct, 35);
+        assert_eq!(back.layout(), Some(Layout::sides(35)));
         assert_eq!(back.describe(), "logs");
         assert!(
             back.forwards().is_empty(),
@@ -376,7 +373,15 @@ mod tests {
     }
 
     #[test]
-    fn pane_sizes_survive_the_round_trip_through_json() {
+    fn the_panes_a_tab_was_showing_survive_the_round_trip_through_json() {
+        use crate::layout::{Dir, Side, Slot};
+        let mut arranged = Layout::sides(70);
+        arranged.split(
+            Slot::files(Side::Remote),
+            Dir::Down,
+            Slot::term(Side::Remote, 1),
+            60,
+        );
         let item = Item::Ssh {
             user: "me".into(),
             host: "web01".into(),
@@ -385,20 +390,11 @@ mod tests {
             name: None,
             path: Some("/etc".into()),
             forwards: Vec::new(),
-            layout: Some(Layout {
-                split_pct: 70,
-                shell_height: 20,
-            }),
+            layout: Some(arranged.clone()),
         };
         let text = serde_json::to_string(&item).unwrap();
         let back: Item = serde_json::from_str(&text).unwrap();
-        assert_eq!(
-            back.layout(),
-            Some(Layout {
-                split_pct: 70,
-                shell_height: 20,
-            })
-        );
+        assert_eq!(back.layout(), Some(arranged));
     }
 
     #[test]
@@ -419,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn sizes_that_would_hide_a_pane_are_brought_back_into_range() {
+    fn an_arrangement_that_would_hide_a_pane_is_brought_back_into_range() {
         let item = Item::Ssh {
             user: "me".into(),
             host: "web01".into(),
@@ -429,13 +425,13 @@ mod tests {
             path: None,
             forwards: Vec::new(),
             // A hand-edited file, or one from a version that allowed more.
-            layout: Some(Layout {
-                split_pct: 99,
-                shell_height: 1,
-            }),
+            layout: Some(serde_json::from_str(r#"{"split_pct": 99, "shell_height": 1}"#).unwrap()),
         };
         let got = item.layout().unwrap();
-        assert!(got.split_pct <= 80 && got.shell_height >= 3, "{got:?}");
+        let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        for (_, rect) in got.areas(area).panes {
+            assert!(rect.width >= 8, "{rect:?}");
+        }
     }
 
     #[test]

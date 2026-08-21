@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::theme::Theme;
+use crate::theme;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Config {
@@ -21,11 +21,22 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
 
-    /// Which set of colours to draw in, by name. An absent or unknown one
-    /// means the terminal's own, which is what sshman looked like before
-    /// there were any others.
+    /// Which set of colours to draw in, by name — one of the files in
+    /// `themes/`, or one of your own. An absent name means the terminal's
+    /// own, which is what sshman looked like before there were any others.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+
+    /// The keystrokes that make the editor in an editor pane open a file,
+    /// with `{file}` standing in for the path, as it is. Absent means the
+    /// ones sshman knows for the editor you use, and an empty string means it
+    /// knows none: the pane is treated as a shell prompt and the editor run
+    /// as a command, quoted for the shell.
+    ///
+    /// `\\e` is escape, `\\r` a return, and `\\C-x` a control character, so
+    /// `"\\e:e {file}\\r"` is what vim wants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_open: Option<String>,
 
     /// The file this came from, and where it goes back to. Not part of the
     /// file itself, and `None` when there is nowhere to write — which is also
@@ -55,13 +66,15 @@ impl Config {
         }
     }
 
-    /// The colours to draw in. A name we do not recognise — a theme from a
-    /// later version, or a typo — falls back rather than failing.
-    pub fn theme(&self) -> Theme {
+    /// The theme asked for, as written. Whether there is a file of that name
+    /// is [`Themes`](crate::theme::Themes)' business, not the config file's:
+    /// a theme you have set is a theme you have set, even on a machine where
+    /// its file has not been copied yet.
+    pub fn theme_name(&self) -> Option<&str> {
         self.theme
             .as_deref()
-            .and_then(Theme::by_name)
-            .unwrap_or_default()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
     }
 
     /// The editor to use, given what the environment says.
@@ -76,6 +89,17 @@ impl Config {
             .filter(|e| !e.is_empty())
             .map(String::from)
             .unwrap_or_else(default_editor)
+    }
+
+    /// The keystrokes that open a file in `program`, ready to have `{file}`
+    /// put in them. Empty when there is nothing known about that editor, in
+    /// which case the pane is a shell prompt and the editor is run as a
+    /// command instead.
+    pub fn editor_open(&self, program: &str) -> String {
+        match self.editor_open.as_deref() {
+            Some(spec) => unescape(spec),
+            None => unescape(default_open(program)),
+        }
     }
 
     /// Write the settings back. The caller is told what went wrong, since a
@@ -107,6 +131,7 @@ impl Config {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Setting {
     Editor,
+    EditorOpen,
     Theme,
 }
 
@@ -119,11 +144,12 @@ pub enum Kind {
 }
 
 impl Setting {
-    pub const ALL: &'static [Setting] = &[Setting::Editor, Setting::Theme];
+    pub const ALL: &'static [Setting] = &[Setting::Editor, Setting::EditorOpen, Setting::Theme];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Editor => "Editor",
+            Self::EditorOpen => "Opens with",
             Self::Theme => "Theme",
         }
     }
@@ -132,13 +158,14 @@ impl Setting {
     pub fn blurb(self) -> &'static str {
         match self {
             Self::Editor => "the program e opens files with",
+            Self::EditorOpen => "the keys that open {file} in an editor pane",
             Self::Theme => "the colours to draw in",
         }
     }
 
     pub fn kind(self) -> Kind {
         match self {
-            Self::Editor => Kind::Text,
+            Self::Editor | Self::EditorOpen => Kind::Text,
             Self::Theme => Kind::Choice,
         }
     }
@@ -149,7 +176,14 @@ impl Config {
     pub fn value(&self, setting: Setting) -> String {
         match setting {
             Setting::Editor => self.editor(),
-            Setting::Theme => self.theme().name.to_string(),
+            Setting::EditorOpen => match self.editor_open.as_deref() {
+                Some(spec) => spec.to_string(),
+                None => match default_open(&self.editor()) {
+                    "" => "(run at the prompt)".into(),
+                    spec => spec.to_string(),
+                },
+            },
+            Setting::Theme => self.theme_name().unwrap_or(theme::DEFAULT).to_string(),
         }
     }
 
@@ -160,6 +194,10 @@ impl Config {
             Setting::Theme => match self.is_set(Setting::Theme) {
                 true => "set here",
                 false => "the default",
+            },
+            Setting::EditorOpen => match self.editor_open.is_some() {
+                true => "set here",
+                false => "for your editor",
             },
             Setting::Editor => {
                 if self.editor.as_deref().is_some_and(|e| !e.trim().is_empty()) {
@@ -180,13 +218,73 @@ impl Config {
     pub fn is_set(&self, setting: Setting) -> bool {
         match setting {
             Setting::Editor => self.editor.is_some(),
-            // A name we cannot use is not a setting, however it got there.
-            Setting::Theme => self
-                .theme
-                .as_deref()
-                .is_some_and(|n| Theme::by_name(n).is_some()),
+            Setting::EditorOpen => self.editor_open.is_some(),
+            Setting::Theme => self.theme_name().is_some(),
         }
     }
+}
+
+/// The keystrokes sshman knows for the editors people use, by the program's
+/// own name. An editor we know nothing about gets an empty spec, which means
+/// "run it at the prompt" rather than a guess that would type nonsense into
+/// whatever is on screen.
+fn default_open(editor: &str) -> &'static str {
+    // `code -w`, `/usr/bin/nvim`, `emacsclient -nw`: what matters is the
+    // program, not the path it was found at or the flags after it.
+    let program = editor
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default();
+    match program {
+        // Escape first: the editor may well be in insert mode.
+        "vi" | "vim" | "nvim" | "view" | "kak" => "\\e:e {file}\\r",
+        "hx" | "helix" => "\\e:o {file}\\r",
+        "emacs" | "emacsclient" => "\\C-x\\C-f{file}\\r",
+        _ => "",
+    }
+}
+
+/// Turn the escapes a config file can write into the bytes they stand for.
+/// Anything else after a backslash is left as it was typed, so a Windows-ish
+/// path in a spec does not quietly lose characters.
+fn unescape(spec: &str) -> String {
+    let mut out = String::with_capacity(spec.len());
+    let mut chars = spec.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('e') => out.push('\x1b'),
+            Some('r') => out.push('\r'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            // `\C-x` is the control character x, the way a terminal writes it.
+            Some('C') => {
+                let mut rest = chars.clone();
+                if rest.next() == Some('-')
+                    && let Some(key) = rest.next()
+                    && key.is_ascii_alphabetic()
+                {
+                    out.push(((key.to_ascii_uppercase() as u8) & 0x1f) as char);
+                    chars = rest;
+                } else {
+                    out.push('C');
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn env_set(name: &str) -> bool {
@@ -203,12 +301,18 @@ pub fn default_editor() -> String {
         .unwrap_or_else(|| "vi".into())
 }
 
-fn config_path() -> Option<PathBuf> {
+/// Where everything sshman remembers between sessions lives: this file, the
+/// saved servers, the workspaces, and any themes of your own.
+pub fn config_dir() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => dirs::home_dir()?.join(".config"),
     };
-    Some(base.join("sshman").join("config.json"))
+    Some(base.join("sshman"))
+}
+
+fn config_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("config.json"))
 }
 
 #[cfg(test)]
@@ -270,28 +374,82 @@ mod tests {
     }
 
     #[test]
+    fn an_editor_pane_gets_the_keys_its_editor_wants() {
+        let config = Config {
+            editor: Some("nvim".into()),
+            ..Config::default()
+        };
+        assert_eq!(config.editor_open("nvim"), "\x1b:e {file}\r");
+        // The path it was found at and the flags after it are not the editor.
+        assert_eq!(config.editor_open("/usr/bin/vim -p"), "\x1b:e {file}\r");
+        assert_eq!(config.editor_open("hx"), "\x1b:o {file}\r");
+        assert_eq!(config.editor_open("emacs"), "\x18\x06{file}\r");
+    }
+
+    #[test]
+    fn an_editor_we_know_nothing_about_is_not_guessed_at() {
+        // An empty spec means the pane is a shell prompt, and the editor is
+        // run as a command — rather than typing nonsense into whatever is on
+        // screen.
+        let config = Config::default();
+        assert_eq!(config.editor_open("some-editor"), "");
+        assert_eq!(config.editor_open(""), "");
+        assert_eq!(
+            config.value(Setting::EditorOpen),
+            "(run at the prompt)",
+            "and the settings pane says so"
+        );
+    }
+
+    #[test]
+    fn keys_of_your_own_win_over_the_ones_we_know() {
+        let config = Config {
+            editor_open: Some("\\e:edit {file}\\r".into()),
+            ..Config::default()
+        };
+        assert_eq!(config.editor_open("vim"), "\x1b:edit {file}\r");
+        assert!(config.is_set(Setting::EditorOpen));
+    }
+
+    #[test]
+    fn escapes_are_read_the_way_a_terminal_writes_them() {
+        assert_eq!(unescape("plain"), "plain");
+        assert_eq!(unescape("\\e"), "\x1b");
+        assert_eq!(unescape("a\\rb\\nc\\td"), "a\rb\nc\td");
+        assert_eq!(unescape("\\C-x\\C-f"), "\x18\x06");
+        assert_eq!(unescape("\\C-A"), "\x01", "however it is capitalised");
+        assert_eq!(unescape("C:\\\\dir"), "C:\\dir", "a doubled one is one");
+        // An escape we do not know is left as it was typed, rather than
+        // quietly losing the backslash.
+        assert_eq!(unescape("\\q"), "\\q");
+        assert_eq!(unescape("\\Cx"), "Cx", "not a control character");
+        assert_eq!(unescape("ends with one \\"), "ends with one \\");
+    }
+
+    #[test]
     fn a_theme_is_remembered_by_name() {
         let mut config = Config::default();
-        assert_eq!(config.theme(), crate::theme::TERMINAL, "the default");
+        assert_eq!(config.theme_name(), None, "nothing set means the default");
+        assert_eq!(config.value(Setting::Theme), theme::DEFAULT);
+        assert!(!config.is_set(Setting::Theme));
 
         config.theme = Some("monokai".into());
-        assert_eq!(config.theme(), crate::theme::MONOKAI);
+        assert_eq!(config.theme_name(), Some("monokai"));
         assert!(config.is_set(Setting::Theme));
         assert_eq!(config.value(Setting::Theme), "monokai");
     }
 
     #[test]
-    fn a_theme_we_cannot_draw_falls_back_rather_than_failing() {
-        // From a later version, or a typo in a hand-edited file.
+    fn a_theme_whose_file_is_not_here_is_still_the_one_you_asked_for() {
+        // Set on a machine where the file lives, read on one where it does
+        // not. Finding nothing to draw with is handled where the themes are;
+        // the setting itself is yours, and offering to clear it is the point.
         let config = Config {
-            theme: Some("dracula".into()),
+            theme: Some("something-of-my-own".into()),
             ..Config::default()
         };
-        assert_eq!(config.theme(), crate::theme::TERMINAL);
-        assert!(
-            !config.is_set(Setting::Theme),
-            "and the pane does not claim it as a setting of yours"
-        );
+        assert!(config.is_set(Setting::Theme));
+        assert_eq!(config.value(Setting::Theme), "something-of-my-own");
     }
 
     #[test]

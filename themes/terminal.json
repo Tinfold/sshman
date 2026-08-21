@@ -1,0 +1,17 @@
+{
+  "name": "terminal",
+  "about": "The terminal's own sixteen, so sshman matches whatever the rest of your terminal is set to.",
+
+  "accent": "cyan",
+  "dim": "darkgray",
+  "text": "white",
+  "muted": "gray",
+  "good": "green",
+  "warn": "yellow",
+  "bad": "red",
+  "dir": "blue",
+  "link": "magenta",
+  "exec": "green",
+  "info": "blue",
+  "on_accent": "black"
+}

@@ -43,7 +43,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::Position;
 
-use app::{App, Drag, Mode, Region, Side, UiAction};
+use app::{App, Mode, UiAction};
 use backend::Target;
 use sshconn::ConnectOpts;
 use types::sh_quote;
@@ -269,11 +269,11 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
                     program,
                     path,
                     push_back,
-                    refresh_local,
+                    refresh,
                 } => {
                     let outcome = suspended(terminal, || run_editor(&program, &path))?;
                     match outcome {
-                        Ok(()) => app.after_editor(push_back, refresh_local),
+                        Ok(()) => app.after_editor(push_back, refresh),
                         // Nothing is uploaded when the editor fails. If this
                         // was a remote file, its temp copy is still on disk —
                         // say where, rather than dropping the edit silently.
@@ -325,6 +325,12 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
             }
         }
 
+        // Anything copied out of a shell goes to the terminal now, between
+        // frames, so it cannot land in the middle of one.
+        if let Some(text) = app.take_clipboard() {
+            let _ = to_clipboard(terminal, &text);
+        }
+
         if app.should_quit {
             return Ok(());
         }
@@ -351,66 +357,89 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
 
     let at = Position::new(m.column, m.row);
 
+    // A selection being dragged owns the mouse until the button comes back
+    // up, and follows it out of the pane it started in — a drag that stopped
+    // at the border would be a drag you had to be careful with.
+    if let Some(slot) = app.selecting {
+        match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                if let Some((col, row)) = cell_in(app, slot, &m)
+                    && let Some(shell) = app.shell_mut(slot)
+                {
+                    shell.drag_selection(row, col);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                app.selecting = None;
+                if let Some(text) = app.shell_mut(slot).and_then(shell::Shell::end_selection) {
+                    app.copy(text);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     // A drag in progress owns the mouse until the button comes back up, so
     // that leaving the border behind while moving does not drop it.
-    if let Some(drag) = app.drag {
+    if app.drag.is_some() {
         match m.kind {
-            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => match drag {
-                Drag::Columns => app.drag_split_to(m.column),
-                Drag::ShellTop => app.drag_shell_top_to(m.row),
-            },
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                app.drag_to(m.column, m.row);
+            }
             MouseEventKind::Up(MouseButton::Left) => app.drag = None,
             _ => {}
         }
         return;
     }
 
-    // The zoom buttons sit on the border, so they are tested before the
-    // resize zones underneath them.
+    // The new-tab button, on the top bar above everything else. It opens a
+    // tab straight away, on this machine — a new tab is a new tab, and being
+    // made to name a server first is the one thing a `[+]` should never do.
+    // `C` is still there for a tab that starts somewhere else.
     if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
-        && let Some((_, side, region)) = app
-            .zoom_buttons
-            .iter()
-            .find(|(rect, _, _)| rect.contains(at))
-            .copied()
+        && app.new_tab_button.is_some_and(|rect| rect.contains(at))
     {
-        app.click_zoom_button(side, region);
+        app.open_local_tab();
         return;
     }
 
-    // Pressing on a border starts a resize rather than reaching the pane
-    // underneath. Both borders are two columns or rows wide to grab: the two
-    // panes each draw their own edge, and they sit against each other.
+    // The buttons in a pane's corner sit on its border, so they are tested
+    // before the resize zones underneath them.
     if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-        if let Some(x) = app.divider_x
-            && m.column + 1 >= x
-            && m.column <= x
-            && app.panes_area.contains(at)
+        if let Some((_, slot)) = app
+            .close_buttons
+            .iter()
+            .find(|(rect, _)| rect.contains(at))
+            .copied()
         {
-            app.drag = Some(Drag::Columns);
-            app.drag_split_to(m.column);
+            app.click_close_button(slot);
             return;
         }
-        for side in [Side::Local, Side::Remote] {
-            let Some(area) = app.shell_area[side.index()] else {
-                continue;
-            };
-            // A zoomed shell has no border worth dragging: it already has
-            // everything, and the height being changed is the one it will go
-            // back to, which is not on screen to see.
-            if app.zoomed {
-                break;
-            }
-            if m.row + 1 >= area.y
-                && m.row <= area.y
-                && m.column >= area.x
-                && m.column < area.right()
-            {
-                app.drag = Some(Drag::ShellTop);
-                app.drag_shell_top_to(m.row);
-                return;
-            }
+        if let Some((_, slot)) = app
+            .zoom_buttons
+            .iter()
+            .find(|(rect, _)| rect.contains(at))
+            .copied()
+        {
+            app.click_zoom_button(slot);
+            return;
         }
+    }
+
+    // Pressing on a border starts a resize rather than reaching the pane
+    // underneath. Every border is two cells wide to grab: the two panes each
+    // draw their own edge, and they sit against each other.
+    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some(divider) = app
+            .areas
+            .dividers
+            .iter()
+            .find(|d| d.rect.contains(at))
+            .cloned()
+    {
+        app.start_drag(&divider, m.column, m.row);
+        return;
     }
 
     // The tab bar, when there is one.
@@ -427,47 +456,66 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         return;
     }
 
-    // Shell panes sit inside their side's column, so test them first.
-    for side in [Side::Local, Side::Remote] {
-        let Some(area) = app.shell_area[side.index()] else {
-            continue;
-        };
-        if !area.contains(at) {
-            continue;
-        }
-        // Clicking in a shell puts the keyboard there, the same as clicking
+    let Some(slot) = app.areas.at(m.column, m.row) else {
+        return;
+    };
+
+    if slot.is_term() {
+        // Clicking in a terminal puts the keyboard there, the same as clicking
         // in a file list does — whether or not the program inside then gets
         // the click as well.
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            app.focus = side;
-            app.region = Region::Shell;
+            app.focus_pane(slot);
         }
 
         // A program that has asked for the mouse gets it: btop's clicks, a
         // pager's wheel. Shift is the way past that to the pane's own
-        // scrollback, the same escape hatch a terminal gives you.
-        if !m.modifiers.contains(KeyModifiers::SHIFT)
-            && let Some(inner) = app.shell_inner[side.index()]
+        // scrollback and to picking text out, the same escape hatch a terminal
+        // gives you.
+        let shift = m.modifiers.contains(KeyModifiers::SHIFT);
+        if !shift
+            && let Some((_, inner)) = app.term_inner.iter().find(|(s, _)| *s == slot).copied()
             && inner.contains(at)
         {
             let (col, row) = (m.column - inner.x, m.row - inner.y);
             if app
-                .shell_mut(side)
+                .shell_mut(slot)
                 .is_some_and(|shell| shell.send_mouse(&m, col, row))
             {
                 return;
             }
         }
 
+        // Nobody inside wanted it, so the mouse is ours: dragging picks text
+        // out, the way it does in the terminal sshman is running in.
+        if let Some((col, row)) = cell_in(app, slot, &m) {
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    app.selecting = Some(slot);
+                    if let Some(shell) = app.shell_mut(slot) {
+                        shell.begin_selection(row, col);
+                    }
+                    return;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(shell) = app.shell_mut(slot) {
+                        shell.clear_selection();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match m.kind {
             // Positive scrolls back into the shell's history.
             MouseEventKind::ScrollUp => {
-                if let Some(shell) = app.shell_mut(side) {
+                if let Some(shell) = app.shell_mut(slot) {
                     shell.scroll(3);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if let Some(shell) = app.shell_mut(side) {
+                if let Some(shell) = app.shell_mut(slot) {
                     shell.scroll(-3);
                 }
             }
@@ -476,30 +524,59 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         return;
     }
 
-    for side in [Side::Local, Side::Remote] {
-        let area = app.files_area[side.index()];
-        if !area.contains(at) {
-            continue;
-        }
-        match m.kind {
-            MouseEventKind::ScrollDown => app.pane_mut(side).move_by(3),
-            MouseEventKind::ScrollUp => app.pane_mut(side).move_by(-3),
-            MouseEventKind::Down(MouseButton::Left) => {
-                app.focus = side;
-                app.region = Region::Files;
-                // The first row inside the block sits just below its border.
-                if m.row > area.y {
-                    let offset = app.pane(side).state.offset();
-                    let index = offset + (m.row - area.y - 1) as usize;
-                    if index < app.pane(side).view.len() {
-                        app.pane_mut(side).select_index(index);
-                    }
+    let Some(area) = app.areas.of(slot) else {
+        return;
+    };
+    match m.kind {
+        MouseEventKind::ScrollDown => app.pane_mut(slot).move_by(3),
+        MouseEventKind::ScrollUp => app.pane_mut(slot).move_by(-3),
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.focus_pane(slot);
+            // The first row inside the block sits just below its border.
+            if m.row > area.y {
+                let offset = app.pane(slot).state.offset();
+                let index = offset + (m.row - area.y - 1) as usize;
+                if index < app.pane(slot).view.len() {
+                    app.click_row(slot, index);
                 }
             }
-            _ => {}
         }
-        return;
+        _ => {}
     }
+}
+
+/// Where in a terminal pane's own grid the mouse is, clamped to it so a drag
+/// that has left the pane still means the edge it left by.
+fn cell_in(app: &App, slot: layout::Slot, m: &event::MouseEvent) -> Option<(u16, u16)> {
+    let (_, inner) = app.term_inner.iter().find(|(s, _)| *s == slot).copied()?;
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    let col = m.column.clamp(inner.x, inner.right() - 1) - inner.x;
+    let row = m.row.clamp(inner.y, inner.bottom() - 1) - inner.y;
+    Some((col, row))
+}
+
+/// Hand text to the terminal sshman is running in, so it reaches the system
+/// clipboard.
+///
+/// OSC 52 is the only way that works from inside a terminal that may itself be
+/// at the far end of an SSH connection: there is no display to talk to, only
+/// the terminal, and it is the terminal that owns the clipboard.
+fn to_clipboard(terminal: &mut Tui, text: &str) -> Result<()> {
+    use base64::Engine;
+
+    // Terminals cap what they will take — tmux's default is around 74k — so
+    // more than this is sent as much as fits rather than being dropped whole.
+    const LIMIT: usize = 64 * 1024;
+    let end = (0..=LIMIT.min(text.len()))
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&text.as_bytes()[..end]);
+    write!(terminal.backend_mut(), "\x1b]52;c;{encoded}\x07")?;
+    terminal.backend_mut().flush()?;
+    Ok(())
 }
 
 /// Hand the terminal back to the shell, run `f`, then take it over again.
@@ -546,9 +623,16 @@ fn force_full_redraw(terminal: &mut Tui) {
 /// work as written.
 fn run_editor(program: &str, path: &std::path::Path) -> Result<()> {
     let line = format!("{program} {}", sh_quote(&path.to_string_lossy()));
-    let status = Command::new(shell())
-        .arg("-c")
-        .arg(&line)
+    let mut command = Command::new(shell());
+    command.arg("-c").arg(&line);
+    // Start it in the file's own directory rather than wherever sshman was
+    // launched from. Editors work out what project they are in by looking
+    // around where they start, so the difference decides whether tooling
+    // finds the rest of the tree or nothing at all.
+    if let Some(parent) = path.parent() {
+        command.current_dir(parent);
+    }
+    let status = command
         .status()
         .with_context(|| format!("cannot run {program}"))?;
     if !status.success() {

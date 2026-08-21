@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::backend::{Backend, BackendKind, Descriptor, Target, connect};
+use crate::layout::TreeId;
 use crate::sshconn::ConnectError;
 use crate::types::{FileEntry, rbasename, rparent};
 
@@ -21,12 +22,16 @@ pub enum Req {
     List {
         path: String,
         sudo: bool,
+        /// Which of the tab's file lists asked, since a tab can have several
+        /// and each is somewhere different.
+        tree: TreeId,
         seq: u64,
     },
     /// Resolve a user-typed path (`~`, `..`) and then list it.
     GoTo {
         path: String,
         sudo: bool,
+        tree: TreeId,
         seq: u64,
     },
     Exec {
@@ -121,11 +126,13 @@ pub enum Resp {
     Listing {
         path: String,
         entries: Vec<FileEntry>,
+        tree: TreeId,
         seq: u64,
     },
     ListFailed {
         path: String,
         msg: String,
+        tree: TreeId,
     },
     ExecDone {
         cmd: String,
@@ -555,24 +562,41 @@ fn handle_inner(
             },
         },
 
-        Req::List { path, sudo, seq } => match c.list(&path, sudo) {
+        Req::List {
+            path,
+            sudo,
+            tree,
+            seq,
+        } => match c.list(&path, sudo) {
             Ok(entries) => {
-                reply.send(Resp::Listing { path, entries, seq });
+                reply.send(Resp::Listing {
+                    path,
+                    entries,
+                    tree,
+                    seq,
+                });
             }
             Err(e) => {
                 reply.send(Resp::ListFailed {
                     path,
                     msg: e.to_string(),
+                    tree,
                 });
             }
         },
 
-        Req::GoTo { path, sudo, seq } => match c.resolve_dir(&path, sudo) {
+        Req::GoTo {
+            path,
+            sudo,
+            tree,
+            seq,
+        } => match c.resolve_dir(&path, sudo) {
             Ok(resolved) => match c.list(&resolved, sudo) {
                 Ok(entries) => {
                     reply.send(Resp::Listing {
                         path: resolved,
                         entries,
+                        tree,
                         seq,
                     });
                 }
@@ -580,6 +604,7 @@ fn handle_inner(
                     reply.send(Resp::ListFailed {
                         path: resolved,
                         msg: e.to_string(),
+                        tree,
                     });
                 }
             },

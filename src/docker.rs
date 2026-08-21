@@ -466,6 +466,17 @@ impl DockerConn {
 /// `cwd` is where to start: the directory being browsed, for the shell that
 /// takes over the terminal, or `None` for the image's own working directory,
 /// which is where a pane's embedded shell opens.
+/// Run one command inside a container, with a terminal attached — how an
+/// editor pane on a container tab starts the editor.
+pub fn exec_command(runtime: &str, container: &str, cmd: &str) -> String {
+    format!(
+        "{} exec -it {} /bin/sh -c {}",
+        sh_quote(runtime),
+        sh_quote(container),
+        sh_quote(&format!("exec {cmd}"))
+    )
+}
+
 pub fn interactive_shell_command(runtime: &str, container: &str, cwd: Option<&str>) -> String {
     let workdir = match cwd.filter(|p| !p.is_empty()) {
         Some(path) => format!("-w {} ", sh_quote(path)),

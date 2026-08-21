@@ -16,37 +16,15 @@ use crate::config::{Config, Kind, Setting};
 use crate::forward::{Forward, Spec as ForwardSpec};
 use crate::history::History;
 use crate::input::TextInput;
-use crate::layout::Layout;
+pub use crate::layout::Side;
+use crate::layout::{self, Areas, Dir, Divider, Layout, Slot, TermId, TreeId};
 use crate::local;
 use crate::shell::Shell;
 use crate::sshconn::ConnectOpts;
-use crate::theme::Theme;
+use crate::theme::{self, Theme, Themes};
 use crate::types::{FileEntry, rbasename, rjoin, rparent};
 use crate::worker::{HostKeyIssue, Req, Resp};
 use crate::workspace::{Item as WorkspaceItem, Workspaces};
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Side {
-    Local,
-    Remote,
-}
-
-impl Side {
-    pub fn other(self) -> Self {
-        match self {
-            Self::Local => Self::Remote,
-            Self::Remote => Self::Local,
-        }
-    }
-
-    /// Index into the per-side arrays (shells).
-    pub fn index(self) -> usize {
-        match self {
-            Self::Local => 0,
-            Self::Remote => 1,
-        }
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -59,6 +37,8 @@ pub enum Mode {
     Workspaces,
     /// Changing what is kept in the config file.
     Settings,
+    /// Choosing how this tab's panes are arranged.
+    Arrange,
     Browse,
     Prompt,
     Confirm,
@@ -76,13 +56,13 @@ pub enum Level {
 #[derive(Debug, Clone)]
 pub enum PromptKind {
     Command,
-    Mkdir(Side),
-    Rename(Side, String),
-    Filter(Side),
-    GoTo(Side),
+    Mkdir(Slot),
+    Rename(Slot, String),
+    Filter(Slot),
+    GoTo(Slot),
     SudoPassword,
-    /// Ask which program to open `name` with, then run it on that side.
-    OpenWith(Side, String),
+    /// Ask which program to open `name` with, then run it in that pane.
+    OpenWith(Slot, String),
     /// A name for the server on screen.
     NameTab,
     /// A name for the highlighted server in the recent list.
@@ -92,11 +72,68 @@ pub enum PromptKind {
     /// A port to forward from the server on screen.
     AddForward,
     /// Name for a new archive holding the given entries.
-    Archive(Side, Vec<String>),
+    Archive(Slot, Vec<String>),
     /// Directory to unpack the named archive into.
-    Extract(Side, String),
+    Extract(Slot, String),
     /// The editor to open files with from now on, and next time.
     SetEditor,
+    /// The keystrokes that open a file in an editor pane.
+    SetEditorOpen,
+}
+
+/// One of the ready-made ways to arrange a tab's panes.
+///
+/// Anything these build can be built by hand — split a pane, close a pane,
+/// drag the borders — so they are a starting point rather than a set of modes
+/// sshman can be in. A workspace writes down whatever you end up with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Arrangement {
+    Sides,
+    Single,
+    TwoLists,
+    Terminal,
+    Editor,
+}
+
+impl Arrangement {
+    pub const ALL: &'static [Arrangement] = &[
+        Arrangement::Sides,
+        Arrangement::Single,
+        Arrangement::TwoLists,
+        Arrangement::Terminal,
+        Arrangement::Editor,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sides => "Side by side",
+            Self::Single => "One pane",
+            Self::TwoLists => "Two lists here",
+            Self::Terminal => "Files and a terminal",
+            Self::Editor => "Editor",
+        }
+    }
+
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Self::Sides => "this machine and the server, the way sshman opens",
+            Self::Single => "the pane you are on, filling the tab",
+            Self::TwoLists => "two directories of the same machine, to copy between",
+            Self::Terminal => "a narrow file list, and a terminal beside it",
+            Self::Editor => "a file list, your editor beside it, a terminal underneath",
+        }
+    }
+
+    /// What the status line says once it is arranged.
+    fn done(self) -> &'static str {
+        match self {
+            Self::Sides => "side by side again",
+            Self::Single => "one pane",
+            Self::TwoLists => "two lists — f points one somewhere, c copies between them",
+            Self::Terminal => "a terminal beside the files",
+            Self::Editor => "editor pane open — clicking a file opens it there",
+        }
+    }
 }
 
 pub struct PromptState {
@@ -167,13 +204,17 @@ pub struct PendingEdit {
 
 /// A pane border being dragged with the mouse. The drag lives across events:
 /// it starts on the press, follows every move, and ends on the release.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Drag {
-    /// The upright border between the two sides.
-    Columns,
-    /// The top edge of a shell pane, which is the same edge for both sides
-    /// because they share one height.
-    ShellTop,
+///
+/// It holds the split it belongs to rather than the pane beside it: a border
+/// is the one thing two panes have in common, and the same drag moves both.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Drag {
+    /// Which split's border this is, as turns taken from the root.
+    pub path: Vec<u8>,
+    pub dir: Dir,
+    /// The space that split divides, which is what the drag is measured
+    /// against.
+    pub area: Rect,
 }
 
 /// Files waiting to be pasted somewhere else on the side they came from.
@@ -200,12 +241,20 @@ impl Clip {
 }
 
 /// Something the main loop must do with the terminal released.
+/// Which pane to re-read after an editor has been and gone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Refresh {
+    Local,
+    Remote,
+    Neither,
+}
+
 pub enum UiAction {
     Editor {
         program: String,
         path: PathBuf,
         push_back: Option<PendingEdit>,
-        refresh_local: bool,
+        refresh: Refresh,
     },
     Shell,
     Quit,
@@ -304,6 +353,59 @@ impl Pane {
         self.error = None;
         self.loading = true;
         self.state.select(None);
+    }
+}
+
+/// One file list on this machine, and the directory it is showing.
+///
+/// The first — [`layout::MAIN`] — is the one everything that means "this
+/// machine's directory" is about: where a workspace says the local pane was,
+/// where `L` opens a tab. The rest are yours to point wherever you like.
+pub struct LocalTree {
+    pub id: TreeId,
+    pub pane: Pane,
+    pub cwd: PathBuf,
+}
+
+/// The same on the far end of a connection, where a listing is a round trip
+/// rather than a read.
+pub struct RemoteTree {
+    pub id: TreeId,
+    pub pane: Pane,
+    pub cwd: String,
+    /// Guards against a stale listing overwriting a newer one.
+    seq: u64,
+    /// Name to put the cursor on once the next listing arrives.
+    pending_select: Option<String>,
+}
+
+impl RemoteTree {
+    fn new(id: TreeId, cwd: String) -> Self {
+        Self {
+            id,
+            pane: Pane::default(),
+            cwd,
+            seq: 0,
+            pending_select: None,
+        }
+    }
+}
+
+/// One embedded terminal, and what it is there for.
+pub struct Term {
+    pub id: TermId,
+    pub shell: Shell,
+    /// Set on a terminal that opens files rather than one you type in: the
+    /// keystrokes that make the program inside it open a path, with `{file}`
+    /// standing in for the name. An empty one means the pane is at a shell
+    /// prompt, so the editor is run as a command instead.
+    pub opens: Option<String>,
+}
+
+impl Term {
+    /// Is this the pane the file lists send files to?
+    pub fn is_editor(&self) -> bool {
+        self.opens.is_some()
     }
 }
 
@@ -424,13 +526,6 @@ pub enum LinkState {
     Lost,
 }
 
-/// Which half of a side has the keyboard: the file list or its shell.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Region {
-    Files,
-    Shell,
-}
-
 /// What the connection screen's keys act on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConnectFocus {
@@ -451,16 +546,18 @@ pub struct RemoteTab {
     pub conn: ConnInfo,
     pub link: LinkState,
     pub sudo: bool,
-    pub pane: Pane,
-    pub cwd: String,
-    pub shell: Option<Shell>,
-    /// Whether the keyboard was on this tab's files or in its shell when you
-    /// last left it, so coming back puts you where you were. It matters most
-    /// zoomed, where the region decides which of the two you can see at all.
-    pub region: Region,
-    /// The pane sizes this tab was last drawn with. A server you set up wide
-    /// is still wide when you come back to it, and a workspace writes these
-    /// down along with everything else about the tab.
+    /// This tab's file lists, the first of which is [`layout::MAIN`].
+    pub trees: Vec<RemoteTree>,
+    /// This tab's own terminals. They go when it does — a pty on a
+    /// connection that has been closed has nothing on the other end.
+    pub terms: Vec<Term>,
+    /// Which pane had the keyboard when you last left this tab, so coming
+    /// back puts you where you were. It matters most zoomed, where the
+    /// focused pane is the only one you can see at all.
+    pub focus: Slot,
+    /// How this tab's panes were last arranged. A server you set up wide is
+    /// still wide when you come back to it, and a workspace writes this down
+    /// along with everything else about the tab.
     pub layout: Layout,
     /// What this tab's worker is doing, if anything. See
     /// [`PendingConnect::task`] for why it lives here.
@@ -469,13 +566,25 @@ pub struct RemoteTab {
     pub forwards: Vec<Forward>,
     tx: Sender<Req>,
     pub rx: Receiver<Resp>,
-    /// Guards against a stale listing overwriting a newer one.
-    seq: u64,
-    /// Name to put the cursor on once the next listing arrives.
-    pending_select: Option<String>,
 }
 
 impl RemoteTab {
+    /// This tab's directory: the one its first file list is showing, which is
+    /// what a shell opens in and what a workspace writes down.
+    pub fn cwd(&self) -> &str {
+        self.tree(layout::MAIN)
+            .map(|t| t.cwd.as_str())
+            .unwrap_or("")
+    }
+
+    pub fn tree(&self, id: TreeId) -> Option<&RemoteTree> {
+        self.trees.iter().find(|t| t.id == id)
+    }
+
+    pub fn tree_mut(&mut self, id: TreeId) -> Option<&mut RemoteTree> {
+        self.trees.iter_mut().find(|t| t.id == id)
+    }
+
     /// Short label for the tab bar: your name for it when there is one.
     pub fn title(&self) -> String {
         if let Some(name) = &self.name
@@ -549,17 +658,20 @@ pub struct PendingConnect {
 
 pub struct App {
     pub mode: Mode,
-    pub focus: Side,
-    pub region: Region,
-    /// Where each region was last drawn, recorded by the renderer so the mouse
-    /// can be matched to a region exactly instead of by recomputing layout.
-    pub files_area: [Rect; 2],
-    pub shell_area: [Option<Rect>; 2],
-    /// The area inside a shell pane's border: what the program running in it
-    /// thinks the screen is, and so what a mouse event is measured against.
-    pub shell_inner: [Option<Rect>; 2],
-    /// Where each pane's zoom button was drawn, and which pane it belongs to.
-    pub zoom_buttons: Vec<(Rect, Side, Region)>,
+    /// The pane with the keyboard.
+    pub focus: Slot,
+    /// Where every pane and every border between them was last drawn,
+    /// recorded by the renderer so the mouse can be matched to a pane exactly
+    /// instead of by working the arrangement out a second time.
+    pub areas: Areas,
+    /// The area inside a terminal pane's border: what the program running in
+    /// it thinks the screen is, and so what a mouse event is measured against.
+    pub term_inner: Vec<(Slot, Rect)>,
+    /// Where the new-tab button was drawn, when it was.
+    pub new_tab_button: Option<Rect>,
+    /// Where each pane's buttons were drawn, and which pane they belong to.
+    pub zoom_buttons: Vec<(Rect, Slot)>,
+    pub close_buttons: Vec<(Rect, Slot)>,
     /// Screen span of each tab chip, recorded by the renderer so a click can
     /// be matched to a tab.
     pub tab_spans: Vec<(u16, u16, usize)>,
@@ -568,25 +680,35 @@ pub struct App {
     /// stop at the end of the content instead of running into blank space.
     pub output_view_height: u16,
     pub help_view_height: u16,
-    /// Pane sizes for what is on screen. Each tab keeps its own copy, and
-    /// this is the one being drawn — the tab you are looking at hands its
-    /// sizes over here, and takes them back when you leave it.
+    /// The arrangement on screen. Each tab keeps its own copy, and this is
+    /// the one being drawn — the tab you are looking at hands its panes over
+    /// here, and takes them back when you leave it.
     pub layout: Layout,
     /// Only the focused pane is drawn, filling the space both sides usually
     /// share. It follows the focus rather than remembering a pane of its own:
     /// whatever you are looking at is what is zoomed.
     pub zoomed: bool,
-    /// The block the two sides are drawn in, and the column the divider
-    /// landed on, both recorded by the renderer so a drag can be turned back
-    /// into a size without recomputing the layout.
+    /// The block all the panes are drawn in.
     pub panes_area: Rect,
-    pub divider_x: Option<u16>,
     pub drag: Option<Drag>,
     /// What `c` or `M` picked up, waiting for `P`.
     pub clip: Option<Clip>,
-    pub local: Pane,
-    pub local_cwd: PathBuf,
-    pub local_shell: Option<Shell>,
+    /// The file lists on this machine. They outlive any one tab, the same way
+    /// the local terminals do, and the first is [`layout::MAIN`].
+    pub local: Vec<LocalTree>,
+    /// Terminals on this machine. They outlive any one tab, the same way the
+    /// local file list does, so a tab you come back to still has the shell you
+    /// left running in it.
+    pub local_terms: Vec<Term>,
+    /// The number the next terminal gets, on either machine. One counter for
+    /// all of them, so a number never means two different panes.
+    next_term_id: TermId,
+    /// The same for file lists. [`layout::MAIN`] is never handed out: every
+    /// machine has one from the start.
+    next_tree_id: TreeId,
+    /// The file list the keyboard was on before this one, which is what `c`
+    /// copies to and `t` points when there are more than two.
+    previous: Option<Slot>,
     /// One per connected server; `active` selects the one on screen.
     pub tabs: Vec<RemoteTab>,
     pub active: usize,
@@ -615,6 +737,7 @@ pub struct App {
     pub workspaces: Workspaces,
     pub workspace_sel: usize,
     pub settings_sel: usize,
+    pub arrangement_sel: usize,
     pub forward_sel: usize,
     /// Connections from a workspace that could not be made without a
     /// password. Kept so the user is told, and so `C` can offer them.
@@ -623,6 +746,25 @@ pub struct App {
     pub output_title: String,
     pub output_scroll: u16,
     pub help_scroll: u16,
+
+    /// The keyboard is sshman's rather than the focused pane's.
+    ///
+    /// `Ctrl-]` turns it on from anywhere, and `↵` hands the keyboard back to
+    /// whatever pane you have moved to. It is what makes every sshman key
+    /// reachable from inside a shell, where otherwise they all belong to the
+    /// program running in it.
+    pub commanding: bool,
+    /// The pane the keyboard came from, so `Esc` can put it back.
+    command_from: Option<Slot>,
+    /// Text picked out of a terminal pane, kept so it can be put back into
+    /// one even where the system clipboard cannot be reached.
+    pub copied: Option<String>,
+    /// Text to hand the terminal sshman is running in, so it reaches the
+    /// system clipboard. Drained by the main loop, which owns the terminal.
+    pub clipboard_out: Option<String>,
+    /// The pane a selection is being dragged out in. The drag lives across
+    /// events, and follows the mouse out of the pane it started in.
+    pub selecting: Option<Slot>,
 
     pub cmd_history: Vec<String>,
     /// Settings that outlive the session. The editor in use is derived from
@@ -633,6 +775,10 @@ pub struct App {
     /// The colours in use, from the config. Kept here so drawing is a read
     /// rather than a lookup and a fallback on every span.
     pub theme: Theme,
+    /// What those colours are called, which is the part that is written down.
+    pub theme_name: String,
+    /// Every theme there is: the ones sshman ships and any found on disk.
+    pub themes: Themes,
     pub pager: String,
     /// The details the connection screen is working with — the active tab's
     /// once connected, or what the user is typing for a new one.
@@ -656,7 +802,20 @@ impl App {
     ) -> Self {
         let config = Config::load();
         let editor = config.editor();
-        let theme = config.theme();
+        let mut themes = Themes::load();
+        let theme_name = config.theme_name().unwrap_or(theme::DEFAULT).to_string();
+        let theme = themes.by_name(&theme_name).unwrap_or_else(|| {
+            // Asked for by name in the config, but there is no file of that
+            // name here. Say so where the themes are listed rather than
+            // quietly drawing in something else.
+            if config.theme_name().is_some() {
+                themes.problems.push(format!(
+                    "no theme called {theme_name:?} — drawing in {}",
+                    theme::DEFAULT
+                ));
+            }
+            Theme::default()
+        });
         let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
         let history = History::load();
         let (local_tx, local_rx) = std::sync::mpsc::channel();
@@ -667,12 +826,12 @@ impl App {
             } else {
                 Mode::Connect
             },
-            focus: Side::Local,
-            region: Region::Files,
-            files_area: [Rect::ZERO; 2],
-            shell_area: [None, None],
-            shell_inner: [None, None],
+            focus: Slot::files(Side::Local),
+            areas: Areas::default(),
+            term_inner: Vec::new(),
+            new_tab_button: None,
             zoom_buttons: Vec::new(),
+            close_buttons: Vec::new(),
             tab_spans: Vec::new(),
             tab_bar_row: None,
             output_view_height: 1,
@@ -680,12 +839,17 @@ impl App {
             layout: Layout::default(),
             zoomed: false,
             panes_area: Rect::ZERO,
-            divider_x: None,
             drag: None,
             clip: None,
-            local: Pane::default(),
-            local_cwd: local_start,
-            local_shell: None,
+            local: vec![LocalTree {
+                id: layout::MAIN,
+                pane: Pane::default(),
+                cwd: local_start,
+            }],
+            local_terms: Vec::new(),
+            next_term_id: 0,
+            next_tree_id: layout::MAIN,
+            previous: None,
             tabs: Vec::new(),
             active: 0,
             pending: Vec::new(),
@@ -711,16 +875,24 @@ impl App {
             workspaces: Workspaces::load(),
             workspace_sel: 0,
             settings_sel: 0,
+            arrangement_sel: 0,
             forward_sel: 0,
             needs_password: Vec::new(),
             output: Vec::new(),
             output_title: String::new(),
             output_scroll: 0,
             help_scroll: 0,
+            commanding: false,
+            command_from: None,
+            copied: None,
+            clipboard_out: None,
+            selecting: None,
             cmd_history: Vec::new(),
             config,
             editor,
             theme,
+            theme_name,
+            themes,
             pager,
             opts,
             host_key_issue: None,
@@ -746,10 +918,6 @@ impl App {
         self.tabs.get(self.active)
     }
 
-    pub fn tab_mut(&mut self) -> Option<&mut RemoteTab> {
-        self.tabs.get_mut(self.active)
-    }
-
     /// Send a request to the active tab's worker. Silently ignored when
     /// nothing is connected — every caller already reports that case.
     fn send(&self, req: Req) {
@@ -767,28 +935,203 @@ impl App {
         self.tab().is_some_and(|t| t.is_local())
     }
 
-    /// Would zooming change what is on screen?
-    ///
-    /// It would not on a one-pane tab with no shell open: there is only the
-    /// one pane, and it already has everything.
+    /// Which machine the keyboard is on.
+    pub fn host(&self) -> Side {
+        self.focus.host()
+    }
+
+    /// Is the keyboard in a terminal rather than a file list?
+    pub fn in_term(&self) -> bool {
+        self.focus.is_term()
+    }
+
+    /// Would zooming change what is on screen? It would not when there is
+    /// only the one pane, which already has everything.
     pub fn zoom_has_anything_to_hide(&self) -> bool {
-        !self.on_local_tab() || self.has_shell(Side::Remote)
+        self.layout.panes() > 1
     }
 
-    /// Is there only one pane on screen?
+    /// Is the other machine's file list on screen to copy to?
     ///
-    /// Two ways to get there: zoom, or a tab on this machine, which has no
-    /// far side to put beside its own. Either way the keys that act across
-    /// the middle have nothing to act on.
-    pub fn one_pane(&self) -> bool {
-        self.zoomed || self.on_local_tab()
+    /// Three ways for it not to be: zoom, a tab on this machine, which has no
+    /// far side to put beside its own, and an arrangement that simply has no
+    /// room for it. In all three the keys that act across the middle have
+    /// nothing to act on, and `c` picks files up instead.
+    pub fn other_side_on_screen(&self) -> bool {
+        !self.zoomed && self.layout.contains(Slot::files(self.host().other()))
     }
 
-    /// Keep the keyboard on a pane that is actually drawn. A tab on this
-    /// machine shows only its own, so the focus cannot sit on the local half.
-    fn settle_focus(&mut self) {
-        if self.on_local_tab() {
-            self.focus = Side::Remote;
+    /// Keep the keyboard on a pane that is actually there.
+    ///
+    /// Every arrangement is tidied here first: panes with nothing behind them
+    /// any more are dropped, and terminals nothing is showing are shut down.
+    /// Doing it in one place means no operation on the tree has to remember
+    /// to clean up after itself.
+    pub fn settle_focus(&mut self) {
+        self.ensure_trees();
+        if self.prune_layout() {
+            // The tab's copy has to follow, or adopting it again would bring
+            // the pane that has gone back with it.
+            self.stash_layout();
+        }
+        self.drop_unused_panes();
+        if !self.layout.contains(self.focus) {
+            self.focus = self
+                .layout
+                .find(Slot::is_files)
+                .unwrap_or_else(|| self.layout.first());
+        }
+    }
+
+    /// Drop panes whose terminal has gone — shut by hand, or taken down with
+    /// the tab that owned it.
+    /// Give every file list the arrangement names something to show.
+    ///
+    /// A workspace remembers the panes a tab had, and a tab opens with the
+    /// arrangement that was on screen; either can name a list that has not
+    /// been made yet. Making it here means an arrangement is never quietly
+    /// reduced to fit what happens to exist.
+    fn ensure_trees(&mut self) {
+        for slot in self.layout.slots() {
+            let Slot::Files { host, id } = slot else {
+                continue;
+            };
+            // Ids come from one counter, so a restored arrangement must not
+            // hand out a number that is already in use.
+            self.next_tree_id = self.next_tree_id.max(id);
+            match host {
+                Side::Local => {
+                    if !self.local.iter().any(|t| t.id == id) {
+                        let cwd = self.local_cwd();
+                        self.local.push(LocalTree {
+                            id,
+                            pane: Pane::default(),
+                            cwd,
+                        });
+                        self.reload_local();
+                    }
+                }
+                Side::Remote => {
+                    let Some(tab) = self.tabs.get_mut(self.active) else {
+                        continue;
+                    };
+                    if tab.tree(id).is_some() {
+                        continue;
+                    }
+                    let cwd = tab.cwd().to_string();
+                    tab.trees.push(RemoteTree::new(id, cwd.clone()));
+                    if !cwd.is_empty() {
+                        self.goto_remote(slot, cwd);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Says whether it took anything away.
+    fn prune_layout(&mut self) -> bool {
+        let before = self.layout.panes();
+        let terms: Vec<TermId> = self.local_terms.iter().map(|t| t.id).collect();
+        let trees: Vec<TreeId> = self.local.iter().map(|t| t.id).collect();
+        let (tab_terms, tab_trees): (Vec<TermId>, Vec<TreeId>) = match self.tab() {
+            Some(tab) => (
+                tab.terms.iter().map(|t| t.id).collect(),
+                tab.trees.iter().map(|t| t.id).collect(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.layout.retain(|slot| match slot {
+            Slot::Files {
+                host: Side::Local,
+                id,
+            } => trees.contains(&id),
+            // The far side's own list stays even with nothing connected: it
+            // is the pane that says so.
+            Slot::Files {
+                host: Side::Remote,
+                id,
+            } => id == layout::MAIN || tab_trees.contains(&id),
+            Slot::Term {
+                host: Side::Local,
+                id,
+            } => terms.contains(&id),
+            Slot::Term {
+                host: Side::Remote,
+                id,
+            } => tab_terms.contains(&id),
+        });
+        self.layout.panes() != before
+    }
+
+    /// Let go of what no arrangement is showing any more. Dropping a terminal
+    /// tells its thread to end the session; dropping a file list forgets the
+    /// directory it was in.
+    ///
+    /// A pane on this machine can be shown by any tab, so it only goes once
+    /// none of them is showing it. A tab's own panes are its own. The first
+    /// file list on either machine is never let go of: it is what "this
+    /// machine's directory" means, whether or not a pane is showing it.
+    fn drop_unused_panes(&mut self) {
+        let mut shown = self.layout.slots();
+        for tab in &self.tabs {
+            shown.extend(
+                tab.layout
+                    .slots()
+                    .into_iter()
+                    .filter(|s| s.host() == Side::Local),
+            );
+        }
+        self.local_terms
+            .retain(|t| shown.contains(&Slot::term(Side::Local, t.id)));
+        self.local
+            .retain(|t| t.id == layout::MAIN || shown.contains(&Slot::tree(Side::Local, t.id)));
+
+        let mine: Vec<Slot> = self.layout.slots();
+        let active = self.active;
+        if let Some(tab) = self.tabs.get_mut(active) {
+            tab.terms
+                .retain(|t| mine.contains(&Slot::term(Side::Remote, t.id)));
+            tab.trees
+                .retain(|t| t.id == layout::MAIN || mine.contains(&Slot::tree(Side::Remote, t.id)));
+        }
+    }
+
+    /// Which of a machine's file lists this is, counted in the order they are
+    /// drawn. `None` when that machine has only the one, and so nothing to
+    /// tell apart.
+    pub fn tree_number(&self, slot: Slot) -> Option<usize> {
+        if !slot.is_files() {
+            return None;
+        }
+        let among: Vec<Slot> = self
+            .layout
+            .slots()
+            .into_iter()
+            .filter(|s| s.is_files() && s.host() == slot.host())
+            .collect();
+        if among.len() < 2 {
+            return None;
+        }
+        among.iter().position(|s| *s == slot).map(|at| at + 1)
+    }
+
+    /// What a pane is called, for the status line.
+    fn pane_name(&self, slot: Slot) -> String {
+        // A tab on this machine has no far side, so calling its pane "remote"
+        // beside the machine it is running on would be a lie.
+        let whose = match slot.host() {
+            Side::Remote if self.on_local_tab() => "this tab",
+            host => side_name(host),
+        };
+        match slot {
+            Slot::Files { .. } => match self.tree_number(slot) {
+                Some(n) => format!("{whose} files {n}"),
+                None => format!("{whose} files"),
+            },
+            Slot::Term { .. } if self.term(slot).is_some_and(Term::is_editor) => {
+                format!("{whose} editor")
+            }
+            Slot::Term { .. } => format!("{whose} shell"),
         }
     }
 
@@ -797,8 +1140,10 @@ impl App {
         self.tab().is_some_and(|t| t.sudo)
     }
 
+    /// The tab's own directory — its first file list's. What `:` runs a
+    /// command in, and what a shell opens on.
     pub fn remote_cwd(&self) -> String {
-        self.tab().map(|t| t.cwd.clone()).unwrap_or_default()
+        self.tab().map(|t| t.cwd().to_string()).unwrap_or_default()
     }
 
     pub fn set_status(&mut self, msg: impl Into<String>, level: Level) {
@@ -806,49 +1151,161 @@ impl App {
         self.status_level = level;
     }
 
-    pub fn pane(&self, side: Side) -> &Pane {
-        match side {
-            Side::Local => &self.local,
-            Side::Remote => match self.tab() {
-                Some(tab) => &tab.pane,
+    /// The file list a pane is showing.
+    ///
+    /// A pane that is not a file list, or one whose machine is not connected,
+    /// gets the scratch pane: reads find it empty and edits go nowhere, which
+    /// is exactly right when there is nothing to navigate.
+    pub fn pane(&self, slot: Slot) -> &Pane {
+        match slot {
+            Slot::Files {
+                host: Side::Local,
+                id,
+            } => match self.local.iter().find(|t| t.id == id) {
+                Some(tree) => &tree.pane,
                 None => &self.empty_pane,
             },
+            Slot::Files {
+                host: Side::Remote,
+                id,
+            } => match self.tab().and_then(|tab| tab.tree(id)) {
+                Some(tree) => &tree.pane,
+                None => &self.empty_pane,
+            },
+            Slot::Term { .. } => &self.empty_pane,
         }
     }
 
-    pub fn pane_mut(&mut self, side: Side) -> &mut Pane {
-        match side {
-            Side::Local => &mut self.local,
-            // With no tab, edits land in the scratch pane and go nowhere,
-            // which is exactly right: there is nothing to navigate.
-            Side::Remote => match self.tabs.get_mut(self.active) {
-                Some(tab) => &mut tab.pane,
+    pub fn pane_mut(&mut self, slot: Slot) -> &mut Pane {
+        match slot {
+            Slot::Files {
+                host: Side::Local,
+                id,
+            } => match self.local.iter_mut().find(|t| t.id == id) {
+                Some(tree) => &mut tree.pane,
                 None => &mut self.empty_pane,
             },
+            Slot::Files {
+                host: Side::Remote,
+                id,
+            } => match self
+                .tabs
+                .get_mut(self.active)
+                .and_then(|tab| tab.tree_mut(id))
+            {
+                Some(tree) => &mut tree.pane,
+                None => &mut self.empty_pane,
+            },
+            Slot::Term { .. } => &mut self.empty_pane,
         }
     }
 
-    pub fn path_of(&self, side: Side) -> String {
-        match side {
-            Side::Local => self.local_cwd.display().to_string(),
-            Side::Remote => match self.tab() {
-                Some(tab) if !tab.cwd.is_empty() => tab.cwd.clone(),
-                _ => "—".to_string(),
-            },
+    /// The directory a file list is showing, for building paths with. Empty
+    /// when there is nothing behind that pane.
+    pub fn dir_of(&self, slot: Slot) -> String {
+        match slot {
+            Slot::Files {
+                host: Side::Local,
+                id,
+            } => self
+                .local
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.cwd.display().to_string())
+                .unwrap_or_default(),
+            Slot::Files {
+                host: Side::Remote,
+                id,
+            } => self
+                .tab()
+                .and_then(|tab| tab.tree(id))
+                .map(|t| t.cwd.clone())
+                .unwrap_or_default(),
+            Slot::Term { .. } => String::new(),
         }
+    }
+
+    /// The same, as a pane's header shows it.
+    pub fn path_of(&self, slot: Slot) -> String {
+        match self.dir_of(slot) {
+            dir if dir.is_empty() => "—".to_string(),
+            dir => dir,
+        }
+    }
+
+    /// A machine's own directory: the one its first file list is showing.
+    fn main_dir(&self, host: Side) -> String {
+        match host {
+            Side::Local => self.local_cwd().display().to_string(),
+            Side::Remote => self.remote_cwd(),
+        }
+    }
+
+    /// This machine's own directory: the one the first local file list is
+    /// showing. What a shell opens in, and what a workspace writes down.
+    pub fn local_cwd(&self) -> PathBuf {
+        self.local
+            .iter()
+            .find(|t| t.id == layout::MAIN)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_default()
+    }
+
+    /// The file list `c` copies to and `t` points: the other one when there
+    /// are two, and otherwise the one you were on before this.
+    ///
+    /// Zoomed there is no other pane on screen, so there is nothing to copy
+    /// across to and `c` picks files up instead.
+    pub fn target(&self) -> Option<Slot> {
+        if self.zoomed {
+            return None;
+        }
+        let here = self.focus;
+        let others: Vec<Slot> = self
+            .layout
+            .slots()
+            .into_iter()
+            .filter(|s| s.is_files() && *s != here)
+            .collect();
+        match others.len() {
+            0 => None,
+            1 => Some(others[0]),
+            _ => self
+                .previous
+                .filter(|p| others.contains(p))
+                .or_else(|| others.first().copied()),
+        }
+    }
+
+    /// Move the keyboard to a pane, remembering where it came from.
+    pub fn focus_pane(&mut self, slot: Slot) {
+        if slot == self.focus {
+            return;
+        }
+        if self.focus.is_files() {
+            self.previous = Some(self.focus);
+        }
+        self.focus = slot;
     }
 
     // ---- loading -----------------------------------------------------------
 
+    /// Re-read every file list on this machine. Two of them may well be
+    /// looking at the same directory, and a copy that lands in one has to
+    /// show up in the other.
     pub fn reload_local(&mut self) {
-        match local::list_dir(&self.local_cwd) {
-            Ok(entries) => self.local.set_entries(entries),
-            Err(e) => {
-                self.local.all.clear();
-                self.local.view.clear();
-                self.local.state.select(None);
-                self.local.loading = false;
-                self.local.error = Some(e.to_string());
+        for index in 0..self.local.len() {
+            let cwd = self.local[index].cwd.clone();
+            match local::list_dir(&cwd) {
+                Ok(entries) => self.local[index].pane.set_entries(entries),
+                Err(e) => {
+                    let pane = &mut self.local[index].pane;
+                    pane.all.clear();
+                    pane.view.clear();
+                    pane.state.select(None);
+                    pane.loading = false;
+                    pane.error = Some(e.to_string());
+                }
             }
         }
     }
@@ -857,29 +1314,51 @@ impl App {
         self.reload_tab(self.active);
     }
 
-    fn goto_local(&mut self, path: PathBuf) {
+    fn goto_local(&mut self, slot: Slot, path: PathBuf) {
         if !path.is_dir() {
             self.set_status(format!("not a directory: {}", path.display()), Level::Bad);
             return;
         }
+        let Slot::Files {
+            host: Side::Local,
+            id,
+        } = slot
+        else {
+            return;
+        };
         // Canonicalise so `..` chains stay tidy, but keep the original if the
         // path cannot be resolved (a dangling symlink, say).
-        self.local_cwd = std::fs::canonicalize(&path).unwrap_or(path);
-        self.local.on_dir_change();
+        let cwd = std::fs::canonicalize(&path).unwrap_or(path);
+        if let Some(tree) = self.local.iter_mut().find(|t| t.id == id) {
+            tree.cwd = cwd;
+            tree.pane.on_dir_change();
+        }
         self.reload_local();
     }
 
-    fn goto_remote(&mut self, path: String) {
+    fn goto_remote(&mut self, slot: Slot, path: String) {
+        let Slot::Files {
+            host: Side::Remote,
+            id,
+        } = slot
+        else {
+            return;
+        };
         let Some(tab) = self.tabs.get_mut(self.active) else {
             self.set_status("not connected", Level::Bad);
             return;
         };
-        tab.pane.on_dir_change();
-        tab.seq += 1;
+        let sudo = tab.sudo;
+        let Some(tree) = tab.tree_mut(id) else {
+            return;
+        };
+        tree.pane.on_dir_change();
+        tree.seq += 1;
         let req = Req::GoTo {
             path,
-            sudo: tab.sudo,
-            seq: tab.seq,
+            sudo,
+            tree: id,
+            seq: tree.seq,
         };
         let _ = tab.tx.send(req);
     }
@@ -938,7 +1417,19 @@ impl App {
                 .then(|| self.form.name.value.trim().to_string())
                 .filter(|n| !n.is_empty()),
             forwards: Vec::new(),
-            layout: self.layout,
+            // The arrangement on screen, so opening a server does not throw
+            // away the split you just set up — minus the panes belonging to
+            // the tab you were on, whose terminals are not this one's to show.
+            layout: {
+                let mut layout = self.layout.clone();
+                layout.retain(|slot| !(slot.is_term() && slot.host() == Side::Remote));
+                // A tab with nowhere to show the server it just reached would
+                // be no tab at all.
+                match layout.find(|s| s.is_files() && s.host() == Side::Remote) {
+                    Some(_) => layout,
+                    None => Layout::default(),
+                }
+            },
             task: None,
             tx,
             rx,
@@ -1087,17 +1578,17 @@ impl App {
     }
 
     /// Show what an archive holds, without unpacking it.
-    fn list_archive(&mut self, side: Side) {
-        let Some(entry) = self.pane(side).selected().cloned() else {
+    fn list_archive(&mut self, at: Slot) {
+        let Some(entry) = self.pane(at).selected().cloned() else {
             return;
         };
         if !crate::archive::is_archive(&entry.name) {
             self.set_status(format!("{} is not a tar archive", entry.name), Level::Bad);
             return;
         }
-        let dir = self.path_of(side);
+        let dir = self.path_of(at);
         let cmd = crate::archive::list_command(&dir, &entry.name);
-        match side {
+        match at.host() {
             Side::Local => self.spawn_local_output(
                 format!("reading {}…", entry.name),
                 cmd,
@@ -1114,32 +1605,31 @@ impl App {
     // ---- archives -----------------------------------------------------------
 
     /// Ask for a name, then pack whatever is marked (or under the cursor).
-    fn start_archive(&mut self, side: Side) {
-        let names = self.pane(side).targets();
+    fn start_archive(&mut self, at: Slot) {
+        let names = self.pane(at).targets();
         if names.is_empty() {
             self.set_status("nothing selected to pack", Level::Info);
             return;
         }
-        let dir = self.path_of(side);
-        let dir_name = match side {
-            Side::Local => self
-                .local_cwd
+        let dir = self.path_of(at);
+        let dir_name = match at.host() {
+            Side::Local => PathBuf::from(&dir)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default(),
-            Side::Remote => rbasename(&self.remote_cwd()),
+            Side::Remote => rbasename(&dir),
         };
         let suggestion = crate::archive::suggested_name(&names, &dir_name);
         self.open_prompt(
-            PromptKind::Archive(side, names.clone()),
+            PromptKind::Archive(at, names.clone()),
             format!("Pack {} item(s) from {dir} into", names.len()),
             suggestion,
         );
     }
 
     /// Ask where to unpack the archive under the cursor.
-    fn start_extract(&mut self, side: Side) {
-        let Some(entry) = self.pane(side).selected().cloned() else {
+    fn start_extract(&mut self, at: Slot) {
+        let Some(entry) = self.pane(at).selected().cloned() else {
             return;
         };
         if entry.is_dir_like() {
@@ -1158,15 +1648,15 @@ impl App {
         }
         let dest = crate::archive::stem_of(&entry.name);
         self.open_prompt(
-            PromptKind::Extract(side, entry.name.clone()),
+            PromptKind::Extract(at, entry.name.clone()),
             format!("Unpack {} into directory", entry.name),
             dest,
         );
     }
 
-    fn run_archive(&mut self, side: Side, names: Vec<String>, archive: String) {
-        let dir = self.path_of(side);
-        match side {
+    fn run_archive(&mut self, at: Slot, names: Vec<String>, archive: String) {
+        let dir = self.path_of(at);
+        match at.host() {
             Side::Local => {
                 let cmd = crate::archive::create_command(
                     &dir,
@@ -1195,9 +1685,9 @@ impl App {
         }
     }
 
-    fn run_extract(&mut self, side: Side, archive: String, dest: String) {
-        let dir = self.path_of(side);
-        match side {
+    fn run_extract(&mut self, at: Slot, archive: String, dest: String) {
+        let dir = self.path_of(at);
+        match at.host() {
             Side::Local => {
                 let cmd = crate::archive::extract_command(&dir, &archive, &dest);
                 self.spawn_local_command(
@@ -1224,9 +1714,9 @@ impl App {
         for tab in &self.tabs {
             let _ = tab.tx.send(Req::Quit);
         }
-        // Dropping the tabs stops their shells too.
+        // Dropping the tabs stops their terminals too.
         self.tabs.clear();
-        self.local_shell = None;
+        self.local_terms.clear();
     }
 
     /// Note what a worker has started or finished doing.
@@ -1341,17 +1831,31 @@ impl App {
                     },
                     link: LinkState::Live,
                     sudo: false,
-                    pane: Pane::default(),
-                    cwd: String::new(),
-                    shell: None,
-                    region: Region::Files,
-                    layout: pending.layout,
+                    trees: {
+                        let mut trees: Vec<RemoteTree> = pending
+                            .layout
+                            .slots()
+                            .into_iter()
+                            .filter_map(|slot| match slot {
+                                Slot::Files {
+                                    host: Side::Remote,
+                                    id,
+                                } => Some(RemoteTree::new(id, String::new())),
+                                _ => None,
+                            })
+                            .collect();
+                        if !trees.iter().any(|t| t.id == layout::MAIN) {
+                            trees.insert(0, RemoteTree::new(layout::MAIN, String::new()));
+                        }
+                        trees
+                    },
+                    terms: Vec::new(),
+                    focus: Slot::files(Side::Remote),
+                    layout: pending.layout.clone(),
                     task: None,
                     forwards: Vec::new(),
                     tx: pending.tx,
                     rx: pending.rx,
-                    seq: 0,
-                    pending_select: None,
                 });
 
                 self.form.connecting = false;
@@ -1364,8 +1868,7 @@ impl App {
                     });
                 }
                 self.mode = Mode::Browse;
-                self.focus = Side::Local;
-                self.region = Region::Files;
+                self.focus = Slot::files(Side::Local);
                 // Unless the tab that just opened has no local half to focus.
                 self.settle_focus();
                 let title = self.tab().map(|t| t.title()).unwrap_or_default();
@@ -1376,7 +1879,13 @@ impl App {
                     false => format!("Connected to {title}{note}"),
                 };
                 self.set_status(msg, Level::Good);
-                self.goto_remote(start);
+                // Every list this tab opened with starts in the same place;
+                // the arrangement decides how many there are.
+                for slot in self.layout.slots() {
+                    if slot.is_files() && slot.host() == Side::Remote {
+                        self.goto_remote(slot, start.clone());
+                    }
+                }
 
                 // Ports a workspace recorded for this connection.
                 if !pending.forwards.is_empty() {
@@ -1552,33 +2061,38 @@ impl App {
         };
 
         match resp {
-            Resp::Listing { path, entries, seq } => {
-                let Some(tab) = self.tabs.get_mut(index) else {
+            Resp::Listing {
+                path,
+                entries,
+                tree,
+                seq,
+            } => {
+                let Some(tree) = self.tabs.get_mut(index).and_then(|t| t.tree_mut(tree)) else {
                     return;
                 };
-                if seq != tab.seq {
+                if seq != tree.seq {
                     return; // a newer request has already been sent
                 }
-                tab.cwd = path;
-                tab.pane.set_entries(entries);
-                if let Some(name) = tab.pending_select.take()
-                    && let Some(i) = tab.pane.view.iter().position(|e| e.name == name)
+                tree.cwd = path;
+                tree.pane.set_entries(entries);
+                if let Some(name) = tree.pending_select.take()
+                    && let Some(i) = tree.pane.view.iter().position(|e| e.name == name)
                 {
-                    tab.pane.select_index(i);
+                    tree.pane.select_index(i);
                 }
             }
 
-            Resp::ListFailed { path, msg } => {
-                if let Some(tab) = self.tabs.get_mut(index) {
+            Resp::ListFailed { path, msg, tree } => {
+                if let Some(tree) = self.tabs.get_mut(index).and_then(|t| t.tree_mut(tree)) {
                     // Move the pane to the directory that failed, so the header
                     // and the error agree — and so enabling sudo retries *this*
                     // path rather than silently reloading the previous one.
-                    tab.cwd = path;
-                    tab.pane.all.clear();
-                    tab.pane.view.clear();
-                    tab.pane.state.select(None);
-                    tab.pane.loading = false;
-                    tab.pane.error = Some(msg.clone());
+                    tree.cwd = path;
+                    tree.pane.all.clear();
+                    tree.pane.view.clear();
+                    tree.pane.state.select(None);
+                    tree.pane.loading = false;
+                    tree.pane.error = Some(msg.clone());
                 }
                 self.set_status(tag(msg), Level::Bad);
             }
@@ -1648,7 +2162,8 @@ impl App {
                         sig,
                         tab: index,
                     }),
-                    refresh_local: false,
+                    // The push-back reloads the pane when it lands.
+                    refresh: Refresh::Neither,
                 });
             }
 
@@ -1666,7 +2181,9 @@ impl App {
                     // Sudo does not survive on its own; the worker re-checks it
                     // once the connection is back and tells us either way.
                     tab.sudo = false;
-                    tab.pane.loading = true;
+                    for tree in &mut tab.trees {
+                        tree.pane.loading = true;
+                    }
                 }
                 self.set_status(tag(format!("{reason} — reconnecting…")), Level::Bad);
             }
@@ -1697,8 +2214,10 @@ impl App {
             Resp::ReconnectFailed { msg } => {
                 if let Some(tab) = self.tabs.get_mut(index) {
                     tab.link = LinkState::Lost;
-                    tab.pane.loading = false;
-                    tab.pane.error = Some(msg.clone());
+                    for tree in &mut tab.trees {
+                        tree.pane.loading = false;
+                        tree.pane.error = Some(msg.clone());
+                    }
                 }
                 self.set_status(tag(format!("{msg} — press C to connect again")), Level::Bad);
             }
@@ -1712,27 +2231,38 @@ impl App {
     }
 
     /// Reload a specific tab's listing, whether or not it is on screen.
+    /// Re-read every file list on a tab, for the same reason the local ones
+    /// are re-read together.
     fn reload_tab(&mut self, index: usize) {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        if tab.cwd.is_empty() {
-            return;
+        let sudo = tab.sudo;
+        let mut reqs = Vec::new();
+        for tree in &mut tab.trees {
+            if tree.cwd.is_empty() {
+                continue;
+            }
+            tree.seq += 1;
+            tree.pane.loading = true;
+            reqs.push(Req::List {
+                path: tree.cwd.clone(),
+                sudo,
+                tree: tree.id,
+                seq: tree.seq,
+            });
         }
-        tab.seq += 1;
-        tab.pane.loading = true;
-        let req = Req::List {
-            path: tab.cwd.clone(),
-            sudo: tab.sudo,
-            seq: tab.seq,
-        };
-        let _ = tab.tx.send(req);
+        for req in reqs {
+            let _ = tab.tx.send(req);
+        }
     }
 
     /// Called by the main loop once an external editor has exited.
-    pub fn after_editor(&mut self, push_back: Option<PendingEdit>, refresh_local: bool) {
-        if refresh_local {
-            self.reload_local();
+    pub fn after_editor(&mut self, push_back: Option<PendingEdit>, refresh: Refresh) {
+        match refresh {
+            Refresh::Local => self.reload_local(),
+            Refresh::Remote => self.reload_remote(),
+            Refresh::Neither => {}
         }
         let Some(edit) = push_back else { return };
         let now = file_signature(&edit.temp);
@@ -1779,6 +2309,13 @@ impl App {
             return;
         }
 
+        // With the keyboard handed over, every key is sshman's — including
+        // the ones a shell would otherwise swallow.
+        if self.mode == Mode::Browse && self.commanding {
+            self.command_key(key);
+            return;
+        }
+
         // Zooming is window management rather than input, so it keeps working
         // while a shell has the keyboard — otherwise a zoomed shell could
         // only be shrunk by leaving it first.
@@ -1786,19 +2323,28 @@ impl App {
             self.toggle_zoom();
             return;
         }
+        // So is closing one, and for the same reason: a shell you are typing
+        // in is exactly the pane you are most likely to want rid of.
+        if self.mode == Mode::Browse && key.code == KeyCode::F(9) {
+            self.close_pane(self.focus);
+            return;
+        }
 
         // A focused shell owns the keyboard. Every key goes to it — Ctrl-C has
         // to interrupt the running command, not quit sshman — so the escape
         // key is checked first and is the only way back out.
-        if self.mode == Mode::Browse && self.region == Region::Shell {
+        if self.mode == Mode::Browse && self.in_term() {
             if is_shell_escape(&key) {
-                self.region = Region::Files;
+                self.focus = self.files_pane(self.host());
+                self.settle_focus();
                 self.set_status("file list — F6 goes back to the shell", Level::Info);
+            } else if is_command_key(&key) {
+                self.enter_command();
             } else if let Some(shell) = self.shell_mut(self.focus) {
                 shell.send_key(key);
             } else {
-                // The shell went away underneath us.
-                self.region = Region::Files;
+                // The terminal went away underneath us.
+                self.settle_focus();
             }
             return;
         }
@@ -1813,6 +2359,7 @@ impl App {
             Mode::Picker => self.picker_key(key),
             Mode::Workspaces => self.workspace_key(key),
             Mode::Settings => self.settings_key(key),
+            Mode::Arrange => self.arrange_key(key),
             Mode::Forwards => self.forward_key(key),
             Mode::Browse => self.browse_key(key),
             Mode::Prompt => self.prompt_key(key),
@@ -2006,21 +2553,175 @@ impl App {
         self.start_connect();
     }
 
+    /// The key after `Ctrl-]`: the pane commands, for when the keyboard is in
+    /// a shell and every ordinary key belongs to it.
+    ///
+    /// They are the browsing keys in lower case — `s` for the shell `S` opens,
+    /// `x` for the close `F9` does — so there is one set to remember rather
+    /// than two.
+    fn command_key(&mut self, key: KeyEvent) {
+        // Moving between panes is what the arrows are for while sshman has
+        // the keyboard, and h j k l alongside them for the same reason they
+        // move the cursor in a file list.
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') if !shift => {
+                return self.move_focus(Dir::Across, false);
+            }
+            KeyCode::Right | KeyCode::Char('l') if !shift => {
+                return self.move_focus(Dir::Across, true);
+            }
+            KeyCode::Up | KeyCode::Char('k') if !shift => {
+                return self.move_focus(Dir::Down, false);
+            }
+            KeyCode::Down | KeyCode::Char('j') if !shift => {
+                return self.move_focus(Dir::Down, true);
+            }
+            // Shift moves the border rather than the keyboard: the same pair
+            // of ideas the file list spells Alt and Alt-Shift.
+            KeyCode::Left => return self.resize_pane(Dir::Across, -2),
+            KeyCode::Right => return self.resize_pane(Dir::Across, 2),
+            KeyCode::Up => return self.resize_pane(Dir::Down, -3),
+            KeyCode::Down => return self.resize_pane(Dir::Down, 3),
+
+            // The keyboard goes back to a pane only when you say so, which is
+            // what lets the arrows walk past a shell without falling into it.
+            KeyCode::Enter => return self.leave_command(false),
+            KeyCode::Esc => return self.leave_command(true),
+            _ if is_command_key(&key) => return self.leave_command(true),
+            // F6 means the shell, wherever it is said.
+            KeyCode::F(6) => {
+                self.enter_shell();
+                return self.leave_command(false);
+            }
+            _ => {}
+        }
+
+        // Everything else is an ordinary sshman key, and does here exactly
+        // what it does with a file list focused: there is one set of keys,
+        // not one set per place you happen to be standing.
+        self.browse_key(key);
+
+        // A key that opened something, or that is taking the terminal away,
+        // has moved on from arranging panes.
+        if self.mode != Mode::Browse || self.pending_action.is_some() {
+            self.commanding = false;
+            self.command_from = None;
+        }
+    }
+
+    /// Take the keyboard for sshman.
+    fn enter_command(&mut self) {
+        self.commanding = true;
+        self.command_from = Some(self.focus);
+        self.set_status(
+            "sshman has the keyboard — arrows move, ↵ hands it to the pane, Esc puts it back",
+            Level::Info,
+        );
+    }
+
+    /// Give the keyboard back: to the pane you have moved to, or — `back` —
+    /// to the one you took it from.
+    fn leave_command(&mut self, back: bool) {
+        self.commanding = false;
+        if back
+            && let Some(slot) = self.command_from.take()
+            && self.layout.contains(slot)
+        {
+            self.focus = slot;
+        }
+        self.command_from = None;
+        self.settle_focus();
+        let name = self.pane_name(self.focus);
+        self.set_status(
+            format!("{name} — Ctrl-] takes the keyboard back"),
+            Level::Info,
+        );
+    }
+
+    // ---- picking text out of a terminal --------------------------------------
+
+    /// Copy what is picked out in the focused terminal.
+    fn copy_selection(&mut self) {
+        match self.shell(self.focus).and_then(Shell::selected_text) {
+            Some(text) => self.copy(text),
+            None => self.set_status(
+                "nothing picked out — drag across the text first",
+                Level::Info,
+            ),
+        }
+    }
+
+    /// Hold on to some text, and hand it to the terminal sshman is running in
+    /// so it reaches the system clipboard.
+    pub fn copy(&mut self, text: String) {
+        let lines = text.lines().count();
+        let chars = text.chars().count();
+        self.clipboard_out = Some(text.clone());
+        self.copied = Some(text);
+        self.set_status(
+            match lines {
+                0 | 1 => format!("copied {chars} character(s)"),
+                n => format!("copied {n} lines"),
+            },
+            Level::Good,
+        );
+    }
+
+    /// What the main loop has to hand the terminal, if anything.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard_out.take()
+    }
+
+    /// Type what was copied into the focused terminal. The system clipboard
+    /// is the terminal's own business; this is the way that works when it
+    /// cannot be reached at all.
+    fn paste_copied(&mut self) {
+        let Some(text) = self.copied.clone() else {
+            self.set_status(
+                "nothing copied yet — drag over a shell, then y",
+                Level::Info,
+            );
+            return;
+        };
+        match self.shell_mut(self.focus) {
+            Some(shell) => {
+                shell.paste(&text);
+                self.set_status("pasted", Level::Good);
+            }
+            None => self.set_status("not a terminal", Level::Info),
+        }
+    }
+
     fn browse_key(&mut self, key: KeyEvent) {
-        let side = self.focus;
+        let at = self.focus;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         // Checked ahead of plain navigation, which would otherwise swallow
         // these before the modifier is ever looked at.
         //
-        // Alt does the whole layout: sideways moves the divider between the
-        // two sides, up and down moves the top edge of the shell.
+        // Alt says "the panes" where the arrows themselves are spoken for by
+        // the file list. The pair is the same one Ctrl-] uses without it:
+        // arrows move the keyboard, Shift-arrows move the border.
         if key.modifiers.contains(KeyModifiers::ALT) {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             match key.code {
-                KeyCode::Left => return self.resize_split(-2),
-                KeyCode::Right => return self.resize_split(2),
-                KeyCode::Up => return self.resize_shell_pane(1),
-                KeyCode::Down => return self.resize_shell_pane(-1),
+                KeyCode::Left | KeyCode::Char('h') if !shift => {
+                    return self.move_focus(Dir::Across, false);
+                }
+                KeyCode::Right | KeyCode::Char('l') if !shift => {
+                    return self.move_focus(Dir::Across, true);
+                }
+                KeyCode::Up | KeyCode::Char('k') if !shift => {
+                    return self.move_focus(Dir::Down, false);
+                }
+                KeyCode::Down | KeyCode::Char('j') if !shift => {
+                    return self.move_focus(Dir::Down, true);
+                }
+                KeyCode::Left => return self.resize_pane(Dir::Across, -2),
+                KeyCode::Right => return self.resize_pane(Dir::Across, 2),
+                KeyCode::Up => return self.resize_pane(Dir::Down, -3),
+                KeyCode::Down => return self.resize_pane(Dir::Down, 3),
                 _ => {}
             }
         }
@@ -2044,7 +2745,7 @@ impl App {
             // Esc backs out of whatever narrowing is in effect. It deliberately
             // does not quit: losing a session to a stray Esc is infuriating.
             KeyCode::Esc => {
-                let pane = self.pane_mut(side);
+                let pane = self.pane_mut(at);
                 if !pane.filter.is_empty() {
                     let keep = pane.selected_name();
                     pane.filter.clear();
@@ -2062,36 +2763,40 @@ impl App {
                     self.set_status("press q to quit", Level::Info);
                 }
             }
+            // Tab steps through the file lists in the order they are drawn,
+            // so with the two sshman opens with it crosses the middle, and
+            // with more it reaches every one of them. Alt-h j k l is the way
+            // to a particular pane, terminals included.
             KeyCode::Tab | KeyCode::BackTab => {
-                if self.on_local_tab() {
-                    self.set_status(
-                        "this tab is only this machine — T or C adds a server",
+                let back = key.code == KeyCode::BackTab;
+                match self.next_files_pane(at, back) {
+                    Some(next) => self.focus_pane(next),
+                    None => self.set_status(
+                        "this tab has one file list — T opens another, C adds a server",
                         Level::Info,
-                    );
-                } else {
-                    self.focus = self.focus.other();
+                    ),
                 }
             }
 
-            KeyCode::Down | KeyCode::Char('j') => self.pane_mut(side).move_by(1),
-            KeyCode::Up | KeyCode::Char('k') => self.pane_mut(side).move_by(-1),
-            KeyCode::PageDown => self.pane_mut(side).move_by(15),
-            KeyCode::PageUp => self.pane_mut(side).move_by(-15),
-            KeyCode::Home | KeyCode::Char('g') => self.pane_mut(side).select_index(0),
+            KeyCode::Down | KeyCode::Char('j') => self.pane_mut(at).move_by(1),
+            KeyCode::Up | KeyCode::Char('k') => self.pane_mut(at).move_by(-1),
+            KeyCode::PageDown => self.pane_mut(at).move_by(15),
+            KeyCode::PageUp => self.pane_mut(at).move_by(-15),
+            KeyCode::Home | KeyCode::Char('g') => self.pane_mut(at).select_index(0),
             KeyCode::End | KeyCode::Char('G') => {
-                let last = self.pane(side).view.len().saturating_sub(1);
-                self.pane_mut(side).select_index(last);
+                let last = self.pane(at).view.len().saturating_sub(1);
+                self.pane_mut(at).select_index(last);
             }
 
-            KeyCode::Left | KeyCode::Char('h') => self.go_up(side),
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => self.activate(side),
+            KeyCode::Left | KeyCode::Char('h') => self.go_up(at),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => self.activate(at),
 
             KeyCode::Char(' ') => {
-                self.pane_mut(side).toggle_mark();
-                self.pane_mut(side).move_by(1);
+                self.pane_mut(at).toggle_mark();
+                self.pane_mut(at).move_by(1);
             }
             KeyCode::Char('a') => {
-                let pane = self.pane_mut(side);
+                let pane = self.pane_mut(at);
                 if pane.marked.is_empty() {
                     pane.marked = pane.view.iter().map(|e| e.name.clone()).collect();
                 } else {
@@ -2100,27 +2805,25 @@ impl App {
             }
 
             // With both sides on screen this is the copy across the middle.
-            // With one filling the screen there is no across, so it picks the
-            // selection up for a paste elsewhere on the same filesystem.
+            // With no other at to copy to — zoomed, or arranged without one
+            // — there is no across, so it picks the selection up for a paste
+            // elsewhere on the same filesystem.
             KeyCode::Char('c') | KeyCode::F(5) => {
-                if self.one_pane() {
-                    self.yank(false);
+                if self.other_side_on_screen() {
+                    self.copy_to_target();
                 } else {
-                    self.copy_to_other_side();
+                    self.yank(false);
                 }
             }
             KeyCode::Char('M') => self.yank(true),
             KeyCode::Char('P') => self.paste_clip(),
-            KeyCode::Char('e') | KeyCode::F(4) => {
-                let program = self.editor.clone();
-                self.open_with(side, program);
-            }
+            KeyCode::Char('e') | KeyCode::F(4) => self.edit_selected(at),
             KeyCode::Char('E') => {
-                if let Some(name) = self.pane(side).selected_name() {
+                if let Some(name) = self.pane(at).selected_name() {
                     let mut input = TextInput::new(self.editor.clone());
                     input.cursor = input.value.chars().count();
                     self.prompt = Some(PromptState {
-                        kind: PromptKind::OpenWith(side, name.clone()),
+                        kind: PromptKind::OpenWith(at, name.clone()),
                         title: format!("Open {name} with"),
                         input,
                         hist_idx: None,
@@ -2131,24 +2834,24 @@ impl App {
             }
             KeyCode::Char('v') => {
                 let pager = self.pager.clone();
-                self.open_with(side, pager);
+                self.open_with(at, pager);
             }
 
             KeyCode::Char('n') | KeyCode::F(7) => self.open_prompt(
-                PromptKind::Mkdir(side),
-                format!("New directory in {}", self.path_of(side)),
+                PromptKind::Mkdir(at),
+                format!("New directory in {}", self.path_of(at)),
                 String::new(),
             ),
             KeyCode::Char('r') | KeyCode::F(2) => {
-                if let Some(name) = self.pane(side).selected_name() {
+                if let Some(name) = self.pane(at).selected_name() {
                     self.open_prompt(
-                        PromptKind::Rename(side, name.clone()),
+                        PromptKind::Rename(at, name.clone()),
                         format!("Rename {name} to"),
                         name,
                     );
                 }
             }
-            KeyCode::Char('d') | KeyCode::Delete | KeyCode::F(8) => self.request_delete(side),
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::F(8) => self.request_delete(at),
 
             KeyCode::Char('R') => {
                 self.reload_local();
@@ -2156,20 +2859,20 @@ impl App {
                 self.set_status("refreshed", Level::Info);
             }
             KeyCode::Char('.') => {
-                let keep = self.pane(side).selected_name();
-                let pane = self.pane_mut(side);
+                let keep = self.pane(at).selected_name();
+                let pane = self.pane_mut(at);
                 pane.show_hidden = !pane.show_hidden;
                 pane.refresh_view(keep.as_deref());
             }
             KeyCode::Char('/') => self.open_prompt(
-                PromptKind::Filter(side),
+                PromptKind::Filter(at),
                 "Filter".into(),
-                self.pane(side).filter.clone(),
+                self.pane(at).filter.clone(),
             ),
             KeyCode::Char('f') => self.open_prompt(
-                PromptKind::GoTo(side),
-                format!("Go to directory ({})", side_name(side)),
-                self.path_of(side),
+                PromptKind::GoTo(at),
+                format!("Go to directory ({})", self.pane_name(at)),
+                self.path_of(at),
             ),
 
             KeyCode::Char(':') => {
@@ -2191,24 +2894,36 @@ impl App {
                 }
             }
             KeyCode::Char(',') => self.open_settings(),
-            KeyCode::Char('~') => self.go_home(side),
-            KeyCode::Char('D') => self.find_containers(side),
+            KeyCode::Char('~') => self.go_home(at),
+            KeyCode::Char('D') => self.find_containers(at),
             KeyCode::Char('N') => self.start_rename_tab(),
             KeyCode::Char('w') => self.open_workspaces(),
             KeyCode::Char('p') => self.open_forwards(),
-            KeyCode::Char('z') => self.start_archive(side),
-            KeyCode::Char('x') => self.start_extract(side),
-            KeyCode::Char('X') => self.list_archive(side),
+            KeyCode::Char('z') => self.start_archive(at),
+            KeyCode::Char('x') => self.start_extract(at),
+            KeyCode::Char('X') => self.list_archive(at),
 
-            // ---- layout ----
+            // ---- panes ----
             KeyCode::Char('m') => self.toggle_zoom(),
             KeyCode::Char('=') => self.reset_layout(),
+            KeyCode::Char('A') => self.open_arrangements(),
+            // The pane you are on, cut in half sideways, with a terminal in
+            // the half that opens up. S does the same downwards.
+            KeyCode::Char('|') => self.split_with_term(Dir::Across, 50),
+            // And T puts another file list there instead, on the same machine
+            // and in the same directory, ready to be pointed somewhere else.
+            KeyCode::Char('T') => self.split_with_tree(Dir::Across, 50),
 
             // ---- embedded shells ----
-            KeyCode::Char('S') => self.toggle_shell(side),
+            // What a drag in a shell picked out, and putting it back into
+            // one. The same two keys wherever they are pressed.
+            KeyCode::Char('y') => self.copy_selection(),
+            KeyCode::Char('Y') => self.paste_copied(),
+
+            KeyCode::Char('S') => self.toggle_shell(),
             // One key to get into the shell, whether or not it is open yet.
-            KeyCode::F(6) => self.enter_shell(side),
-            KeyCode::Char(']') if ctrl => self.enter_shell(side),
+            KeyCode::F(6) => self.enter_shell(),
+            _ if is_command_key(&key) => self.enter_command(),
             KeyCode::Char('s') => self.toggle_sudo(),
             KeyCode::Char('t') => self.mirror_path(),
             KeyCode::Char('o') => {
@@ -2336,13 +3051,14 @@ impl App {
                     sudo: self.sudo(),
                 });
             }
-            PromptKind::Mkdir(side) => {
+            PromptKind::Mkdir(at) => {
                 if value.is_empty() {
                     return;
                 }
-                match side {
+                let dir = self.dir_of(at);
+                match at.host() {
                     Side::Local => {
-                        let path = self.local_cwd.join(&value);
+                        let path = PathBuf::from(dir).join(&value);
                         match local::mkdir(&path) {
                             Ok(()) => {
                                 self.set_status(format!("created {value}"), Level::Good);
@@ -2352,19 +3068,20 @@ impl App {
                         }
                     }
                     Side::Remote => self.send(Req::Mkdir {
-                        path: rjoin(&self.remote_cwd(), &value),
+                        path: rjoin(&dir, &value),
                         sudo: self.sudo(),
                     }),
                 }
             }
-            PromptKind::Rename(side, old) => {
+            PromptKind::Rename(at, old) => {
                 if value.is_empty() || value == old {
                     return;
                 }
-                match side {
+                let dir = self.dir_of(at);
+                match at.host() {
                     Side::Local => {
-                        let from = self.local_cwd.join(&old);
-                        let to = self.local_cwd.join(&value);
+                        let from = PathBuf::from(&dir).join(&old);
+                        let to = PathBuf::from(&dir).join(&value);
                         match local::rename(&from, &to) {
                             Ok(()) => {
                                 self.set_status(format!("renamed to {value}"), Level::Good);
@@ -2374,25 +3091,25 @@ impl App {
                         }
                     }
                     Side::Remote => self.send(Req::Rename {
-                        from: rjoin(&self.remote_cwd(), &old),
-                        to: rjoin(&self.remote_cwd(), &value),
+                        from: rjoin(&dir, &old),
+                        to: rjoin(&dir, &value),
                         sudo: self.sudo(),
                     }),
                 }
             }
-            PromptKind::Filter(side) => {
-                let keep = self.pane(side).selected_name();
-                let pane = self.pane_mut(side);
+            PromptKind::Filter(at) => {
+                let keep = self.pane(at).selected_name();
+                let pane = self.pane_mut(at);
                 pane.filter = value;
                 pane.refresh_view(keep.as_deref());
             }
-            PromptKind::GoTo(side) => {
+            PromptKind::GoTo(at) => {
                 if value.is_empty() {
                     return;
                 }
-                match side {
-                    Side::Local => self.goto_local(local::expand(&value)),
-                    Side::Remote => self.goto_remote(value),
+                match at.host() {
+                    Side::Local => self.goto_local(at, local::expand(&value)),
+                    Side::Remote => self.goto_remote(at, value),
                 }
             }
             PromptKind::SudoPassword => {
@@ -2466,6 +3183,7 @@ impl App {
                 self.run_extract(side, archive, value);
             }
             PromptKind::SetEditor => self.set_editor(value),
+            PromptKind::SetEditorOpen => self.set_editor_open(value),
         }
     }
 
@@ -2519,8 +3237,8 @@ impl App {
         match setting.kind() {
             Kind::Text => self.ask_for_setting(setting),
             Kind::Choice => match setting {
-                Setting::Theme => self.set_theme(self.theme.cycle(step)),
-                Setting::Editor => {}
+                Setting::Theme => self.set_theme(self.themes.cycle(&self.theme_name, step)),
+                Setting::Editor | Setting::EditorOpen => {}
             },
         }
     }
@@ -2533,6 +3251,11 @@ impl App {
                 "Editor (empty uses $VISUAL, then $EDITOR)".to_string(),
                 self.config.editor.clone().unwrap_or_default(),
             ),
+            Setting::EditorOpen => (
+                PromptKind::SetEditorOpen,
+                "Keys that open {file} — empty asks your editor's own".to_string(),
+                self.config.editor_open.clone().unwrap_or_default(),
+            ),
             // Nothing to type: it is chosen from a list.
             Setting::Theme => return,
         };
@@ -2542,19 +3265,25 @@ impl App {
     fn clear_setting(&mut self, setting: Setting) {
         match setting {
             Setting::Editor => self.set_editor(String::new()),
+            Setting::EditorOpen => self.set_editor_open(String::new()),
             Setting::Theme => {
                 self.config.theme = None;
-                self.theme = self.config.theme();
-                self.save_config(format!("theme cleared — back to {}", self.theme.name));
+                self.theme_name = theme::DEFAULT.to_string();
+                self.theme = self.themes.by_name(&self.theme_name).unwrap_or_default();
+                self.save_config(format!("theme cleared — back to {}", self.theme_name));
             }
         }
     }
 
     /// Draw in these colours from now on, and next time.
-    fn set_theme(&mut self, theme: Theme) {
-        self.theme = theme;
-        self.config.theme = Some(theme.name.to_string());
-        self.save_config(format!("theme: {}", theme.name));
+    fn set_theme(&mut self, named: theme::Named) {
+        self.theme = named.theme;
+        self.theme_name = named.name.clone();
+        self.config.theme = Some(named.name.clone());
+        match named.about {
+            Some(about) => self.save_config(format!("theme: {} — {about}", named.name)),
+            None => self.save_config(format!("theme: {}", named.name)),
+        }
     }
 
     /// Write the settings back, saying so either way. A setting that silently
@@ -2567,6 +3296,24 @@ impl App {
                 Level::Bad,
             ),
         }
+    }
+
+    /// Remember the keystrokes that open a file in an editor pane. An empty
+    /// answer goes back to the ones sshman knows for your editor.
+    fn set_editor_open(&mut self, value: String) {
+        let value = value.trim().to_string();
+        self.config.editor_open = (!value.is_empty()).then_some(value);
+        let done = match self.config.editor_open.is_some() {
+            true => "an editor pane opens files with the keys you gave".to_string(),
+            false => {
+                let editor = self.editor.clone();
+                match self.config.editor_open(&editor).is_empty() {
+                    true => format!("cleared — an editor pane will run {editor} at its prompt"),
+                    false => format!("cleared — back to the keys sshman knows for {editor}"),
+                }
+            }
+        };
+        self.save_config(done);
     }
 
     /// Remember which editor to open files with.
@@ -2627,7 +3374,9 @@ impl App {
                                 failed.push(e.to_string());
                             }
                         }
-                        self.local.marked.clear();
+                        for tree in &mut self.local {
+                            tree.pane.marked.clear();
+                        }
                         self.reload_local();
                         if failed.is_empty() {
                             self.set_status(format!("{total} item(s) deleted"), Level::Good);
@@ -2636,7 +3385,11 @@ impl App {
                         }
                     }
                     ConfirmAction::DeleteRemote(paths) => {
-                        self.pane_mut(Side::Remote).marked.clear();
+                        if let Some(tab) = self.tabs.get_mut(self.active) {
+                            for tree in &mut tab.trees {
+                                tree.pane.marked.clear();
+                            }
+                        }
                         self.send(Req::Delete {
                             paths,
                             sudo: self.sudo(),
@@ -2711,123 +3464,205 @@ impl App {
 
     // ---- actions -----------------------------------------------------------
 
-    fn go_up(&mut self, side: Side) {
-        match side {
+    fn go_up(&mut self, at: Slot) {
+        let cwd = self.dir_of(at);
+        if cwd.is_empty() {
+            return;
+        }
+        match at.host() {
             Side::Local => {
-                if let Some(parent) = self.local_cwd.parent() {
-                    let leaving = self
-                        .local_cwd
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string());
-                    let parent = parent.to_path_buf();
-                    self.goto_local(parent);
-                    // Put the cursor back on the directory we just left.
-                    if let Some(name) = leaving
-                        && let Some(i) = self.local.view.iter().position(|e| e.name == name)
-                    {
-                        self.local.select_index(i);
-                    }
+                let here = PathBuf::from(&cwd);
+                let Some(parent) = here.parent().map(Path::to_path_buf) else {
+                    return;
+                };
+                let leaving = here.file_name().map(|n| n.to_string_lossy().to_string());
+                self.goto_local(at, parent);
+                // Put the cursor back on the directory we just left.
+                if let Some(name) = leaving
+                    && let Some(i) = self.pane(at).view.iter().position(|e| e.name == name)
+                {
+                    self.pane_mut(at).select_index(i);
                 }
             }
             Side::Remote => {
-                let cwd = self.remote_cwd();
-                if cwd.is_empty() || cwd == "/" {
+                if cwd == "/" {
                     return;
                 }
                 let leaving = rbasename(&cwd);
-                self.goto_remote(rparent(&cwd));
-                if let Some(tab) = self.tab_mut() {
-                    tab.pending_select = Some(leaving);
+                self.goto_remote(at, rparent(&cwd));
+                if let Some(tree) = self
+                    .tabs
+                    .get_mut(self.active)
+                    .and_then(|tab| tab.tree_mut(at.id()))
+                {
+                    tree.pending_select = Some(leaving);
                 }
             }
         }
     }
 
-    fn activate(&mut self, side: Side) {
-        let Some(entry) = self.pane(side).selected().cloned() else {
+    fn activate(&mut self, at: Slot) {
+        let Some(entry) = self.pane(at).selected().cloned() else {
             return;
         };
         if entry.is_dir_like() {
-            match side {
-                Side::Local => self.goto_local(self.local_cwd.join(&entry.name)),
-                Side::Remote => self.goto_remote(rjoin(&self.remote_cwd(), &entry.name)),
+            let dir = self.dir_of(at);
+            match at.host() {
+                Side::Local => self.goto_local(at, PathBuf::from(dir).join(&entry.name)),
+                Side::Remote => self.goto_remote(at, rjoin(&dir, &entry.name)),
             }
         } else {
-            let program = self.editor.clone();
-            self.launch_on(side, &entry.name, program);
+            self.edit_selected(at);
         }
     }
 
-    fn open_with(&mut self, side: Side, program: String) {
-        let Some(entry) = self.pane(side).selected().cloned() else {
+    /// Open the file under the cursor in your editor: in the editor pane when
+    /// this machine has one, and otherwise by standing aside for it.
+    fn edit_selected(&mut self, at: Slot) {
+        let Some(entry) = self.pane(at).selected().cloned() else {
             return;
         };
         if entry.is_dir_like() {
             self.set_status("that is a directory — press Enter to open it", Level::Info);
             return;
         }
-        self.launch_on(side, &entry.name, program);
+        if self.send_to_editor(at, &entry.name) {
+            return;
+        }
+        let program = self.editor.clone();
+        self.launch_on(at, &entry.name, program);
     }
 
-    /// Open `name` on `side` with `program`. Local files go straight to the
-    /// editor; remote files are fetched first and pushed back on exit.
-    fn launch_on(&mut self, side: Side, name: &str, program: String) {
-        match side {
-            Side::Local => {
-                let path = self.local_cwd.join(name);
-                if path.is_dir() {
-                    self.set_status("that is a directory", Level::Info);
-                    return;
-                }
-                self.pending_action = Some(UiAction::Editor {
-                    program,
-                    path,
-                    push_back: None,
-                    refresh_local: true,
-                });
+    fn open_with(&mut self, at: Slot, program: String) {
+        let Some(entry) = self.pane(at).selected().cloned() else {
+            return;
+        };
+        if entry.is_dir_like() {
+            self.set_status("that is a directory — press Enter to open it", Level::Info);
+            return;
+        }
+        self.launch_on(at, &entry.name, program);
+    }
+
+    /// Where `name` really is, when it is on this machine.
+    ///
+    /// The left pane's files are here by definition, and so are a "this
+    /// machine" tab's: that tab reaches the same filesystem through the same
+    /// code a server uses, but nothing has to travel to get at it. Which side
+    /// of the screen a pane is on says nothing about that.
+    ///
+    /// Sudo mode is the exception. A root-owned file is not ours to open, so
+    /// it goes the long way round — fetched as root, edited, pushed back as
+    /// root — which is the only way to edit it at all.
+    fn on_this_machine(&self, at: Slot, name: &str) -> Option<PathBuf> {
+        let dir = self.dir_of(at);
+        if dir.is_empty() {
+            return None;
+        }
+        match at.host() {
+            Side::Local => Some(PathBuf::from(dir).join(name)),
+            Side::Remote if self.on_local_tab() && !self.sudo() => {
+                Some(PathBuf::from(rjoin(&dir, name)))
             }
-            Side::Remote => {
-                if !self.connected() {
-                    self.set_status("not connected", Level::Bad);
-                    return;
-                }
-                self.send(Req::FetchForEdit {
-                    path: rjoin(&self.remote_cwd(), name),
-                    sudo: self.sudo(),
-                    editor: program,
-                });
-            }
+            Side::Remote => None,
         }
     }
 
-    fn copy_to_other_side(&mut self) {
+    /// Open `name` on `side` with `program`.
+    ///
+    /// A file on this machine goes straight to the editor, at its own path —
+    /// so an editor that looks around itself for a project finds the real
+    /// tree, and a save is a save rather than a copy back. Anything else is
+    /// fetched first and pushed back when the editor exits.
+    fn launch_on(&mut self, at: Slot, name: &str, program: String) {
+        if let Some(path) = self.on_this_machine(at, name) {
+            if path.is_dir() {
+                self.set_status("that is a directory", Level::Info);
+                return;
+            }
+            self.pending_action = Some(UiAction::Editor {
+                program,
+                path,
+                push_back: None,
+                refresh: match at.host() {
+                    Side::Local => Refresh::Local,
+                    Side::Remote => Refresh::Remote,
+                },
+            });
+            return;
+        }
         if !self.connected() {
             self.set_status("not connected", Level::Bad);
             return;
         }
+        self.send(Req::FetchForEdit {
+            path: rjoin(&self.dir_of(at), name),
+            sudo: self.sudo(),
+            editor: program,
+        });
+    }
+
+    /// Copy what is marked into the other file list on screen.
+    ///
+    /// Across the middle that is an upload or a download. Between two lists on
+    /// the same machine it is one command run there, with nothing travelling
+    /// in either direction — the same thing `P` does, and for the same reason.
+    fn copy_to_target(&mut self) {
         let from = self.focus;
+        let Some(to) = self.target() else {
+            self.set_status("no other file list on screen to copy to", Level::Info);
+            return;
+        };
+        if (from.host() == Side::Remote || to.host() == Side::Remote) && !self.connected() {
+            self.set_status("not connected", Level::Bad);
+            return;
+        }
         let names = self.pane(from).targets();
         if names.is_empty() {
             self.set_status("nothing selected", Level::Info);
             return;
         }
-        match from {
-            Side::Local => {
-                let items: Vec<PathBuf> = names.iter().map(|n| self.local_cwd.join(n)).collect();
-                self.send(Req::Upload {
-                    items,
-                    dest: self.remote_cwd(),
-                    sudo: self.sudo(),
-                });
-            }
-            Side::Remote => {
-                let items: Vec<String> =
-                    names.iter().map(|n| rjoin(&self.remote_cwd(), n)).collect();
-                self.send(Req::Download {
-                    items,
-                    dest: self.local_cwd.clone(),
-                    sudo: self.sudo(),
-                });
+        let (src, dest) = (self.dir_of(from), self.dir_of(to));
+        if src.is_empty() || dest.is_empty() {
+            self.set_status("that pane has no directory yet", Level::Info);
+            return;
+        }
+        if from.host() == to.host() && src == dest {
+            self.set_status("both lists are in the same directory", Level::Info);
+            return;
+        }
+        let count = names.len();
+        let sudo = self.sudo();
+        match (from.host(), to.host()) {
+            (Side::Local, Side::Remote) => self.send(Req::Upload {
+                items: names.iter().map(|n| PathBuf::from(&src).join(n)).collect(),
+                dest,
+                sudo,
+            }),
+            (Side::Remote, Side::Local) => self.send(Req::Download {
+                items: names.iter().map(|n| rjoin(&src, n)).collect(),
+                dest: PathBuf::from(dest),
+                sudo,
+            }),
+            (Side::Remote, Side::Remote) => self.send(Req::Paste {
+                dir: src,
+                names: names.clone(),
+                dest,
+                cut: false,
+                sudo,
+            }),
+            (Side::Local, Side::Local) => {
+                let cmd = crate::fileops::paste_command(
+                    &src,
+                    &names,
+                    &dest,
+                    crate::fileops::Action::Copy,
+                );
+                self.spawn_local_command(
+                    format!("copying {count} item(s)"),
+                    cmd,
+                    format!("{count} item(s) copied into {dest}"),
+                );
             }
         }
         self.pane_mut(from).marked.clear();
@@ -2839,24 +3674,24 @@ impl App {
     /// side on show to copy to, and the useful thing to do with a selection is
     /// carry it to another directory of the same filesystem.
     fn yank(&mut self, cut: bool) {
-        let side = self.focus;
-        if side == Side::Remote && !self.connected() {
+        let at = self.focus;
+        if at.host() == Side::Remote && !self.connected() {
             self.set_status("not connected", Level::Bad);
             return;
         }
-        let names = self.pane(side).targets();
+        let names = self.pane(at).targets();
         if names.is_empty() {
             self.set_status("nothing selected", Level::Info);
             return;
         }
         let count = names.len();
         self.clip = Some(Clip {
-            side,
-            dir: self.path_of(side),
+            side: at.host(),
+            dir: self.dir_of(at),
             names,
             cut,
         });
-        self.pane_mut(side).marked.clear();
+        self.pane_mut(at).marked.clear();
         let verb = if cut { "cut" } else { "copied" };
         self.set_status(
             format!("{count} item(s) {verb} — go to a directory and press P"),
@@ -2870,10 +3705,11 @@ impl App {
             self.set_status("nothing to paste — c copies, M cuts", Level::Info);
             return;
         };
-        let side = self.focus;
+        let at = self.focus;
+        let side = at.host();
         // Both halves of a paste run as one command on one machine, so the
-        // clipboard cannot cross the middle. `c` on an unzoomed pane is the
-        // key that copies between the two.
+        // clipboard cannot cross the middle. `c` with another list on screen
+        // is the key that copies between the two.
         if clip.side != side {
             self.set_status(
                 format!(
@@ -2888,7 +3724,7 @@ impl App {
             self.set_status("not connected", Level::Bad);
             return;
         }
-        let dest = self.path_of(side);
+        let dest = self.dir_of(at);
         let action = clip.action();
         let count = clip.names.len();
         let verb = action.past_tense();
@@ -2916,8 +3752,8 @@ impl App {
         }
     }
 
-    fn request_delete(&mut self, side: Side) {
-        let names = self.pane(side).targets();
+    fn request_delete(&mut self, at: Slot) {
+        let names = self.pane(at).targets();
         if names.is_empty() {
             self.set_status("nothing selected", Level::Info);
             return;
@@ -2925,7 +3761,7 @@ impl App {
         let mut body = vec![format!(
             "Permanently delete {} item(s) from {}:",
             names.len(),
-            self.path_of(side)
+            self.path_of(at)
         )];
         for n in names.iter().take(10) {
             body.push(format!("  {n}"));
@@ -2933,18 +3769,19 @@ impl App {
         if names.len() > 10 {
             body.push(format!("  … and {} more", names.len() - 10));
         }
-        if side == Side::Remote && self.sudo() {
+        if at.host() == Side::Remote && self.sudo() {
             body.push(String::new());
             body.push("SUDO MODE IS ON — this deletes as root.".into());
         }
 
-        let action = match side {
-            Side::Local => {
-                ConfirmAction::DeleteLocal(names.iter().map(|n| self.local_cwd.join(n)).collect())
-            }
-            Side::Remote => ConfirmAction::DeleteRemote(
-                names.iter().map(|n| rjoin(&self.remote_cwd(), n)).collect(),
+        let dir = self.dir_of(at);
+        let action = match at.host() {
+            Side::Local => ConfirmAction::DeleteLocal(
+                names.iter().map(|n| PathBuf::from(&dir).join(n)).collect(),
             ),
+            Side::Remote => {
+                ConfirmAction::DeleteRemote(names.iter().map(|n| rjoin(&dir, n)).collect())
+            }
         };
         self.confirm = Some(ConfirmState::simple("Confirm delete", body, action, true));
         self.mode = Mode::Confirm;
@@ -2952,16 +3789,16 @@ impl App {
 
     /// Jump a pane to its home directory. On the remote side that is the
     /// directory the server put us in at login.
-    fn go_home(&mut self, side: Side) {
-        match side {
+    fn go_home(&mut self, at: Slot) {
+        match at.host() {
             Side::Local => {
                 if let Some(home) = dirs::home_dir() {
-                    self.goto_local(home);
+                    self.goto_local(at, home);
                 }
             }
             Side::Remote => {
                 if let Some(home) = self.tab().map(|t| t.conn.home.clone()) {
-                    self.goto_remote(home);
+                    self.goto_remote(at, home);
                 }
             }
         }
@@ -2988,7 +3825,7 @@ impl App {
         match self.mode {
             // A shell is a real terminal: hand it the text exactly as it came,
             // newlines and all.
-            Mode::Browse if self.region == Region::Shell => {
+            Mode::Browse if self.in_term() => {
                 if let Some(shell) = self.shell_mut(self.focus) {
                     shell.paste(text);
                 }
@@ -3256,7 +4093,7 @@ impl App {
         }
         let items = self.workspace_items();
         let skipped = self.tabs.len() - items.len();
-        let local = Some(self.local_cwd.display().to_string());
+        let local = Some(self.local_cwd().display().to_string());
 
         match self.workspaces.save(name, local, items) {
             Ok(replaced) => {
@@ -3286,7 +4123,7 @@ impl App {
         if let Some(path) = &workspace.local_path {
             let path = crate::local::expand(path);
             if path.is_dir() {
-                self.goto_local(path);
+                self.goto_local(Slot::files(Side::Local), path);
             }
         }
         if workspace.items.is_empty() {
@@ -3335,7 +4172,7 @@ impl App {
         self.mode = Mode::Browse;
         // Your filetree as it is on screen, rather than a home directory you
         // have already navigated away from.
-        self.initial_remote = Some(self.local_cwd.display().to_string());
+        self.initial_remote = Some(self.local_cwd().display().to_string());
         self.connect_to(Target::Local, String::new());
         self.initial_remote = None;
     }
@@ -3349,11 +4186,11 @@ impl App {
     /// in the picture — what `--docker` does.
     pub fn browse_local_containers(&mut self) {
         self.mode = Mode::Browse;
-        self.find_containers(Side::Local);
+        self.find_containers(Slot::files(Side::Local));
     }
 
-    fn find_containers(&mut self, side: Side) {
-        match side {
+    fn find_containers(&mut self, at: Slot) {
+        match at.host() {
             Side::Local => {
                 self.local_tasks
                     .push("looking for local containers…".into());
@@ -3537,37 +4374,13 @@ impl App {
         if self.clip.as_ref().is_some_and(|c| c.side == Side::Remote) {
             self.clip = None;
         }
-        // Tabs are the remote side, so none of this applies while the
-        // keyboard is on the local one.
-        if self.focus == Side::Remote {
-            let leaving = self.region;
-            if let Some(tab) = self.tabs.get_mut(self.active) {
-                tab.region = leaving;
-            }
-            self.active = index;
-            self.region = if !self.has_shell(Side::Remote) {
-                // Nothing to point at: the new tab has no shell open. What
-                // this tab remembers is left alone, so a shell that is still
-                // running is waiting where it was when we come back.
-                Region::Files
-            } else if leaving == Region::Shell {
-                // A shell carries over to a tab that has one — otherwise
-                // switching tabs zoomed into a shell would show a file list.
-                Region::Shell
-            } else if self.zoomed {
-                // Zoomed, the region is the only thing deciding what can be
-                // seen, so a tab left in its shell has to come back to it.
-                self.tab().map(|t| t.region).unwrap_or(Region::Files)
-            } else {
-                // Unzoomed the shell is on screen either way, so the keyboard
-                // stays on the files. Landing in a shell here would be a trap:
-                // it swallows the Ctrl-arrows that were cycling the tabs.
-                Region::Files
-            };
-        } else {
-            self.active = index;
+        let leaving = self.focus;
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.focus = leaving;
         }
+        self.active = index;
         self.adopt_layout();
+        self.focus = self.focus_for_tab(leaving);
         self.settle_focus();
         // Keep the connection form in step with what is on screen.
         if let Some(opts) = self.tab().and_then(|t| t.ssh_opts()) {
@@ -3589,20 +4402,21 @@ impl App {
         let tab = self.tabs.remove(self.active);
         let title = tab.title();
         let _ = tab.tx.send(Req::Quit);
-        drop(tab); // takes the shell's session down with it
+        drop(tab); // takes its terminals' sessions down with it
 
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         }
         if self.tabs.is_empty() {
-            self.focus = Side::Local;
-            self.region = Region::Files;
+            self.layout = Layout::default();
+            self.focus = Slot::files(Side::Local);
+            self.zoomed = false;
+            self.settle_focus();
             self.set_status(format!("closed {title} — no servers left"), Level::Info);
         } else {
-            if self.focus == Side::Remote && !self.has_shell(Side::Remote) {
-                self.region = Region::Files;
-            }
             self.adopt_layout();
+            let leaving = self.focus;
+            self.focus = self.focus_for_tab(leaving);
             self.settle_focus();
             if let Some(opts) = self.tab().and_then(|t| t.ssh_opts()) {
                 self.opts = opts.clone();
@@ -3611,54 +4425,98 @@ impl App {
         }
     }
 
-    // ---- embedded shells ---------------------------------------------------
+    // ---- terminals ---------------------------------------------------------
 
-    /// Open or close the shell under a pane.
-    fn toggle_shell(&mut self, side: Side) {
-        if self.has_shell(side) {
-            // Dropping the shell tells its thread to shut the session down.
-            self.close_shell(side);
-            if self.focus == side {
-                self.region = Region::Files;
-            }
-            self.set_status(format!("{} shell closed", side_name(side)), Level::Info);
-        } else {
-            self.open_shell(side);
+    /// Every terminal on a machine: this one's, or the tab on screen.
+    pub fn terms(&self, host: Side) -> &[Term] {
+        match host {
+            Side::Local => &self.local_terms,
+            Side::Remote => self.tab().map(|t| t.terms.as_slice()).unwrap_or(&[]),
         }
     }
 
-    /// Put the keyboard in a shell, starting one first if need be.
-    fn enter_shell(&mut self, side: Side) {
-        if !self.has_shell(side) {
-            self.open_shell(side);
-            return;
+    fn terms_mut(&mut self, host: Side) -> Option<&mut Vec<Term>> {
+        match host {
+            Side::Local => Some(&mut self.local_terms),
+            Side::Remote => self.tabs.get_mut(self.active).map(|t| &mut t.terms),
         }
-        self.focus = side;
-        self.region = Region::Shell;
-        self.set_status("shell — F6 or Ctrl-] returns to the files", Level::Info);
     }
 
-    fn open_shell(&mut self, side: Side) {
-        // A placeholder size: the first draw calls `ensure_size` with the space
-        // the pane actually got, which resizes both emulator and pty.
+    /// The terminal a pane is showing, if that pane is a terminal at all.
+    pub fn term(&self, slot: Slot) -> Option<&Term> {
+        let Slot::Term { host, id } = slot else {
+            return None;
+        };
+        self.terms(host).iter().find(|t| t.id == id)
+    }
+
+    pub fn term_mut(&mut self, slot: Slot) -> Option<&mut Term> {
+        let Slot::Term { host, id } = slot else {
+            return None;
+        };
+        self.terms_mut(host)?.iter_mut().find(|t| t.id == id)
+    }
+
+    pub fn shell(&self, slot: Slot) -> Option<&Shell> {
+        self.term(slot).map(|t| &t.shell)
+    }
+
+    pub fn shell_mut(&mut self, slot: Slot) -> Option<&mut Shell> {
+        self.term_mut(slot).map(|t| &mut t.shell)
+    }
+
+    /// Start a terminal on `host` and give it a number, without putting it on
+    /// screen — the caller decides where it goes.
+    ///
+    /// `run` is a command line to run instead of a login shell, and `opens`
+    /// marks the result as the pane that files are sent to.
+    fn new_term(
+        &mut self,
+        beside: Slot,
+        run: Option<String>,
+        opens: Option<String>,
+    ) -> Option<Slot> {
+        // A placeholder size: the first draw calls `ensure_size` with the
+        // space the pane actually got, which resizes both emulator and pty.
         const ROWS: u16 = 24;
         const COLS: u16 = 80;
 
-        let shell = match side {
-            Side::Local => Shell::spawn_local(&self.local_cwd, ROWS, COLS),
+        let host = beside.host();
+        // A terminal opens where the pane it came from is looking, which with
+        // several file lists on one machine is the only sensible answer to
+        // "which directory".
+        let here = match self.dir_of(beside) {
+            dir if dir.is_empty() => None,
+            dir => Some(dir),
+        };
+        let shell = match host {
+            Side::Local => {
+                let cwd = here.map(PathBuf::from).unwrap_or_else(|| self.local_cwd());
+                match &run {
+                    None => Shell::spawn_local(&cwd, ROWS, COLS),
+                    Some(cmd) => {
+                        Shell::spawn_local_in("local".into(), &cwd, cmd.clone(), ROWS, COLS)
+                    }
+                }
+            }
             Side::Remote => {
                 let Some(tab) = self.tab() else {
                     self.set_status("not connected", Level::Bad);
-                    return;
+                    return None;
                 };
+                let cwd = here.unwrap_or_else(|| tab.cwd().to_string());
+                let label = tab.title();
                 // This tab's own credentials, and its own connection, so a
                 // busy shell never stalls transfers — on this tab or any other.
                 match (&tab.target, tab.ssh_opts()) {
                     // Already here: the same shell the local pane opens, in
                     // this tab's directory.
-                    (Target::Local, _) => {
-                        Shell::spawn_local(Path::new(&tab.cwd.clone()), ROWS, COLS)
-                    }
+                    (Target::Local, _) => match &run {
+                        None => Shell::spawn_local(Path::new(&cwd), ROWS, COLS),
+                        Some(cmd) => {
+                            Shell::spawn_local_in(label, Path::new(&cwd), cmd.clone(), ROWS, COLS)
+                        }
+                    },
                     // A container is entered with `docker exec -it`, run
                     // either here or on the server that hosts it.
                     (
@@ -3667,9 +4525,12 @@ impl App {
                         },
                         ssh,
                     ) => {
-                        let cmdline =
-                            crate::docker::interactive_shell_command(runtime, container, None);
-                        let label = tab.title();
+                        let cmdline = match &run {
+                            None => {
+                                crate::docker::interactive_shell_command(runtime, container, None)
+                            }
+                            Some(cmd) => crate::docker::exec_command(runtime, container, cmd),
+                        };
                         match ssh {
                             None => Shell::spawn_local_command(label, cmdline, ROWS, COLS),
                             Some(opts) => {
@@ -3677,132 +4538,528 @@ impl App {
                             }
                         }
                     }
-                    (Target::Ssh(opts), _) => {
-                        Shell::spawn_remote(opts, &tab.cwd.clone(), ROWS, COLS)
-                    }
+                    (Target::Ssh(opts), _) => match &run {
+                        None => Shell::spawn_remote(opts, &cwd, ROWS, COLS),
+                        Some(cmd) => Shell::spawn_remote_command(
+                            label,
+                            opts,
+                            format!(
+                                "cd {} 2>/dev/null; exec {cmd}",
+                                crate::types::sh_quote(&cwd)
+                            ),
+                            ROWS,
+                            COLS,
+                        ),
+                    },
                 }
             }
         };
-        self.set_shell(side, Some(shell));
-        self.focus = side;
-        self.region = Region::Shell;
-        let whose = match side {
-            Side::Remote if self.tab().is_some_and(|t| t.is_local()) => "tab",
-            _ => side_name(side),
+
+        self.next_term_id += 1;
+        let id = self.next_term_id;
+        self.terms_mut(host)?.push(Term { id, shell, opens });
+        Some(Slot::term(host, id))
+    }
+
+    /// Divide the focused pane and put a new terminal in the half that opens
+    /// up. `ratio` is the share the pane that was already there keeps.
+    fn split_with_term(&mut self, dir: Dir, ratio: u16) {
+        let at = self.focus;
+        let Some(slot) = self.new_term(at, None, None) else {
+            return;
         };
+        if !self.layout.split(at, dir, slot, ratio) {
+            return;
+        }
+        self.focus = slot;
+        self.zoomed = false;
+        self.stash_layout();
+        let name = self.pane_name(slot);
         self.set_status(
-            format!(
-                "{whose} shell open in {} — F6 or Ctrl-] returns to the files",
-                self.path_of(side)
-            ),
+            format!("{name} open — F6 or Ctrl-] returns to the files"),
             Level::Good,
         );
     }
 
-    /// Change the sizes on screen, keeping the tab that owns them in step.
+    /// Divide the focused pane and put another file list in the half that
+    /// opens up, on the same machine and looking at the same directory.
     ///
-    /// Every resize goes through here, so the tab's copy is never behind what
-    /// is drawn — a workspace saved without switching tabs first would
-    /// otherwise write down the sizes from before you dragged anything.
-    fn edit_layout(&mut self, edit: impl FnOnce(&mut Layout)) {
-        edit(&mut self.layout);
+    /// Somewhere to point at a second directory: `c` copies between two lists
+    /// on one machine as readily as across the middle, and both of them run
+    /// the copy where the files are.
+    fn split_with_tree(&mut self, dir: Dir, ratio: u16) {
+        let at = self.focus;
+        let Some(slot) = self.add_tree(at) else {
+            return;
+        };
+        if !self.layout.split(at, dir, slot, ratio) {
+            return;
+        }
+        self.focus_pane(slot);
+        self.zoomed = false;
         self.stash_layout();
+        self.set_status(
+            "another file list — f points it somewhere, c copies between them",
+            Level::Good,
+        );
     }
 
-    /// Grow (positive) or shrink the shell pane on the focused side.
-    fn resize_shell_pane(&mut self, delta: i16) {
-        if !self.has_shell(self.focus) {
-            self.set_status("no shell on this side — S opens one", Level::Info);
+    /// Another file list on the same machine as `like`, looking at the same
+    /// directory, without putting it on screen — the caller decides where it
+    /// goes.
+    fn add_tree(&mut self, like: Slot) -> Option<Slot> {
+        let host = like.host();
+        if host == Side::Remote && !self.connected() {
+            self.set_status("not connected", Level::Bad);
+            return None;
+        }
+        self.next_tree_id += 1;
+        let id = self.next_tree_id;
+        let slot = Slot::tree(host, id);
+        // Beside a terminal there is no directory to take: a pty's own is not
+        // something anything here can know. That machine's first list says
+        // where it is instead.
+        let cwd = match self.dir_of(like) {
+            dir if dir.is_empty() => self.main_dir(host),
+            dir => dir,
+        };
+        match host {
+            Side::Local => self.local.push(LocalTree {
+                id,
+                pane: Pane::default(),
+                cwd: PathBuf::from(&cwd),
+            }),
+            Side::Remote => self
+                .tabs
+                .get_mut(self.active)?
+                .trees
+                .push(RemoteTree::new(id, cwd.clone())),
+        }
+        match host {
+            Side::Local => self.reload_local(),
+            Side::Remote => self.goto_remote(slot, cwd),
+        }
+        Some(slot)
+    }
+
+    /// Open a terminal below the focused pane, or shut the last one opened on
+    /// this machine.
+    ///
+    /// One key either way, the way `S` has always worked. An editor pane is
+    /// left alone: it is not the shell this key means, and closing the thing
+    /// you are editing in by accident would be its own kind of rude.
+    fn toggle_shell(&mut self) {
+        let host = self.host();
+        let open: Vec<Slot> = self
+            .layout
+            .slots()
+            .into_iter()
+            .filter(|s| s.host() == host && self.term(*s).is_some_and(|t| !t.is_editor()))
+            .collect();
+        match open.last() {
+            Some(slot) => self.close_pane(*slot),
+            None => self.split_with_term(Dir::Down, 70),
+        }
+    }
+
+    /// Move the keyboard to the pane across the nearest border running that
+    /// way. Nothing over there leaves you where you are, rather than wrapping
+    /// round to the far end of the screen.
+    fn move_focus(&mut self, dir: Dir, forward: bool) {
+        let Some(next) = self.layout.neighbour(self.focus, dir, forward) else {
+            self.set_status("no pane that way", Level::Info);
+            return;
+        };
+        self.focus = next;
+        let name = self.pane_name(next);
+        self.set_status(name, Level::Info);
+    }
+
+    /// Which pane should have the keyboard on the tab just moved to.
+    ///
+    /// The local file list is the same pane on every tab, so being on it when
+    /// you switch means staying on it. Otherwise the tab gets its own pane
+    /// back — except unzoomed, where landing in a terminal would be a trap:
+    /// it swallows the Ctrl-arrows that were cycling the tabs.
+    fn focus_for_tab(&self, leaving: Slot) -> Slot {
+        if leaving.host() == Side::Local && self.layout.contains(leaving) {
+            return leaving;
+        }
+        // A terminal carries over to a tab that has one, so switching tabs
+        // zoomed into a shell does not drop you into a file list.
+        if leaving.is_term()
+            && let Some(term) = self
+                .layout
+                .find(|s| s.is_term() && s.host() == Side::Remote)
+        {
+            return term;
+        }
+        // Zoomed, the focused pane is the only one that can be seen at all,
+        // so a tab left in its terminal has to come back to it. Unzoomed the
+        // terminal is on screen either way, and landing in it would be a trap:
+        // it swallows the Ctrl-arrows that were cycling the tabs.
+        if self.zoomed
+            && let Some(slot) = self.tab().map(|t| t.focus)
+            && slot.host() == Side::Remote
+            && self.layout.contains(slot)
+        {
+            return slot;
+        }
+        self.files_pane(Side::Remote)
+    }
+
+    /// The file list after this one in the order they are drawn, wrapping.
+    /// `None` when this is the only one there is.
+    fn next_files_pane(&self, from: Slot, back: bool) -> Option<Slot> {
+        let lists: Vec<Slot> = self
+            .layout
+            .slots()
+            .into_iter()
+            .filter(|s| s.is_files())
+            .collect();
+        if lists.len() < 2 {
+            return None;
+        }
+        let at = lists.iter().position(|s| *s == from).unwrap_or(0) as isize;
+        let step = if back { -1 } else { 1 };
+        let next = (at + step).rem_euclid(lists.len() as isize) as usize;
+        Some(lists[next])
+    }
+
+    /// The file list on a machine, or the nearest thing this arrangement has.
+    fn files_pane(&self, host: Side) -> Slot {
+        self.layout
+            .find(|s| s.is_files() && s.host() == host)
+            .or_else(|| self.layout.find(Slot::is_files))
+            .unwrap_or_else(|| self.layout.first())
+    }
+
+    /// Put the keyboard in a terminal on this machine, starting one first if
+    /// there is none.
+    fn enter_shell(&mut self) {
+        let host = self.host();
+        if let Some(slot) = self.layout.find(|s| s.is_term() && s.host() == host) {
+            self.focus = slot;
+            self.set_status("shell — F6 or Ctrl-] returns to the files", Level::Info);
             return;
         }
-        self.edit_layout(|l| l.nudge_shell(delta));
+        self.split_with_term(Dir::Down, 70);
     }
 
-    /// Move the divider between the two sides. Positive widens the local side.
-    fn resize_split(&mut self, delta: i16) {
-        if self.one_pane() {
-            let why = match self.zoomed {
-                true => "one pane fills the screen — m brings the other back",
-                false => "this tab is only this machine, so there is no divider",
-            };
-            self.set_status(why, Level::Info);
+    /// Close a pane; its neighbour takes the space back.
+    fn close_pane(&mut self, slot: Slot) {
+        let name = self.pane_name(slot);
+        if !self.layout.remove(slot) {
+            self.set_status(
+                "the last pane cannot be closed — W closes the tab",
+                Level::Info,
+            );
             return;
         }
-        self.edit_layout(|l| l.nudge_split(delta));
+        self.zoomed = false;
+        self.settle_focus();
+        self.stash_layout();
+        self.set_status(format!("{name} closed"), Level::Info);
     }
 
-    /// Put the divider under the mouse, from a drag.
-    pub fn drag_split_to(&mut self, x: u16) {
-        let area = self.panes_area;
-        self.edit_layout(|l| l.split_at(area, x));
-    }
-
-    /// Put the top edge of the shell pane under the mouse, from a drag.
-    pub fn drag_shell_top_to(&mut self, row: u16) {
-        let area = self.panes_area;
-        self.edit_layout(|l| l.shell_top_at(area, row));
-    }
-
-    /// Hand the sizes on screen back to the tab that owns them. Anything
+    /// Hand the arrangement on screen back to the tab that owns it. Anything
     /// that changes which tab is active does this first, or the tab being
     /// left behind would forget whatever you had just done to it.
+    ///
+    /// Every resize and every split goes through here, so the tab's copy is
+    /// never behind what is drawn — a workspace saved without switching tabs
+    /// first would otherwise write down the panes from before you moved them.
     fn stash_layout(&mut self) {
-        let live = self.layout;
+        let live = self.layout.clone();
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.layout = live;
         }
     }
 
+    /// Move the border nearest the focused pane. Positive gives the first
+    /// pane of that split — the one on the left, or on top — more room.
+    fn resize_pane(&mut self, dir: Dir, delta: i16) {
+        let from = self.focus;
+        if self.layout.resize_near(from, dir, delta) {
+            self.stash_layout();
+            return;
+        }
+        let why = match (self.zoomed, dir) {
+            (true, _) => "one pane fills the screen — m brings the others back",
+            (false, Dir::Across) => "nothing beside this pane to take room from",
+            (false, Dir::Down) => "nothing above or below this pane — S opens a shell",
+        };
+        self.set_status(why, Level::Info);
+    }
+
+    /// Take hold of a border, and follow it until the button comes up.
+    pub fn start_drag(&mut self, divider: &Divider, x: u16, y: u16) {
+        self.drag = Some(Drag {
+            path: divider.path.clone(),
+            dir: divider.dir,
+            area: divider.area,
+        });
+        self.drag_to(x, y);
+    }
+
+    /// Put the border being dragged where the mouse is.
+    pub fn drag_to(&mut self, x: u16, y: u16) {
+        let Some(drag) = self.drag.clone() else {
+            return;
+        };
+        self.layout.drag(&drag.path, drag.dir, drag.area, x, y);
+        self.stash_layout();
+    }
+
     /// Put a tab that has just been made on screen.
     ///
-    /// The sizes it was built with are its own — a workspace's, or the ones
-    /// that were on screen — so the tab being left behind has to be handed
+    /// The arrangement it was built with is its own — a workspace's, or the
+    /// one that was on screen — so the tab being left behind has to be handed
     /// its own back first, while `active` still points at it. Stashing after
-    /// the push would write them over the new tab instead, since with no tabs
+    /// the push would write it over the new tab instead, since with no tabs
     /// yet open `active` is already the index the new one lands on.
-    fn show_new_tab(&mut self, tab: RemoteTab) {
+    fn show_new_tab(&mut self, mut tab: RemoteTab) {
         self.stash_layout();
+        // A tab on this machine has no far side: the local pane beside it
+        // would be the same filesystem drawn twice.
+        if tab.is_local() {
+            tab.layout.retain(|slot| slot.host() != Side::Local);
+            // Unless that leaves it with no file list at all.
+            if !tab.layout.contains(Slot::files(Side::Remote)) {
+                tab.layout = Layout::only(Slot::files(Side::Remote));
+            }
+        }
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.adopt_layout();
     }
 
-    /// Draw with the active tab's sizes from here on.
+    /// Draw the active tab's arrangement from here on.
     fn adopt_layout(&mut self) {
         if let Some(tab) = self.tab() {
-            self.layout = tab.layout;
+            self.layout = tab.layout.clone();
         }
     }
 
-    /// Back to an even split with a shell of the height we started with.
+    /// Share every border evenly again.
     ///
-    /// Only for the tab on screen: the others keep the sizes you gave them.
+    /// Only the sizes: the panes you have opened stay open, and only the tab
+    /// on screen is touched — the others keep the shape you gave them.
     fn reset_layout(&mut self) {
-        self.edit_layout(|l| *l = Layout::default());
+        self.layout.even();
         self.zoomed = false;
-        self.set_status("layout reset", Level::Info);
+        self.stash_layout();
+        self.set_status("panes evened up", Level::Info);
+    }
+
+    // ---- arrangements ------------------------------------------------------
+
+    pub fn open_arrangements(&mut self) {
+        self.arrangement_sel = self
+            .arrangement_sel
+            .min(Arrangement::ALL.len().saturating_sub(1));
+        self.mode = Mode::Arrange;
+    }
+
+    fn arrange_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('A') => self.mode = Mode::Browse,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.arrangement_sel = (self.arrangement_sel + 1).min(Arrangement::ALL.len() - 1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.arrangement_sel = self.arrangement_sel.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                let which = Arrangement::ALL[self.arrangement_sel.min(Arrangement::ALL.len() - 1)];
+                self.mode = Mode::Browse;
+                self.arrange(which);
+            }
+            _ => {}
+        }
+    }
+
+    /// Rearrange the tab on screen.
+    ///
+    /// Terminals the new arrangement has no room for are shut, the same as if
+    /// you had closed their panes one at a time — an arrangement is what is on
+    /// screen, and nothing is kept running out of sight.
+    fn arrange(&mut self, which: Arrangement) {
+        let host = self.host();
+        let files = Slot::files(host);
+        match which {
+            Arrangement::Sides => {
+                self.layout = match self.on_local_tab() {
+                    // Putting the local half beside a tab on this machine
+                    // would be the same filesystem drawn twice.
+                    true => Layout::only(Slot::files(Side::Remote)),
+                    false => Layout::default(),
+                };
+            }
+            Arrangement::Single => self.layout = Layout::only(files),
+            Arrangement::TwoLists => {
+                self.layout = Layout::only(files);
+                self.focus = files;
+                if let Some(second) = self.add_tree(files) {
+                    self.layout.split(files, Dir::Across, second, 50);
+                }
+            }
+            Arrangement::Terminal => {
+                self.layout = Layout::only(files);
+                if let Some(term) = self.new_term(files, None, None) {
+                    self.layout.split(files, Dir::Across, term, 40);
+                    self.focus = term;
+                }
+            }
+            Arrangement::Editor => {
+                self.layout = Layout::only(files);
+                let Some(editor) = self.new_editor_term(files) else {
+                    // Nothing was started, so nothing is arranged around it.
+                    self.settle_focus();
+                    self.stash_layout();
+                    return;
+                };
+                self.layout.split(files, Dir::Across, editor, 30);
+                if let Some(shell) = self.new_term(files, None, None) {
+                    self.layout.split(editor, Dir::Down, shell, 70);
+                }
+                // The keyboard stays in the file list: the point of this one
+                // is picking files and watching them open beside you.
+                self.focus = files;
+            }
+        }
+        self.zoomed = false;
+        self.settle_focus();
+        self.stash_layout();
+        self.set_status(which.done(), Level::Good);
+    }
+
+    // ---- the editor pane ---------------------------------------------------
+
+    /// Start a terminal with your editor already running in it.
+    fn new_editor_term(&mut self, beside: Slot) -> Option<Slot> {
+        let program = self.editor.clone();
+        let opens = self.config.editor_open(&program);
+        self.new_term(beside, Some(program), Some(opens))
+    }
+
+    /// The pane files are sent to on this machine, if there is one on screen.
+    pub fn editor_pane(&self, host: Side) -> Option<Slot> {
+        self.layout
+            .find(|slot| slot.host() == host && self.term(slot).is_some_and(Term::is_editor))
+    }
+
+    /// Open a file in the editor pane rather than by standing aside for an
+    /// editor of our own. Says whether it went.
+    ///
+    /// Only files on the machine the pane is talking to: the pane is a
+    /// terminal *there*, so a path from the other side would mean nothing in
+    /// it. Everything else still goes the long way round, fetched and pushed
+    /// back.
+    fn send_to_editor(&mut self, at: Slot, name: &str) -> bool {
+        let side = at.host();
+        let Some(slot) = self.editor_pane(side) else {
+            return false;
+        };
+        // A remote pane on a tab in sudo mode is reading root's files through
+        // the worker, which the shell in the pane cannot do.
+        if side == Side::Remote && self.sudo() && !self.on_local_tab() {
+            return false;
+        }
+        let dir = self.dir_of(at);
+        if dir.is_empty() {
+            return false;
+        }
+        let path = match side {
+            Side::Local => PathBuf::from(dir).join(name).display().to_string(),
+            Side::Remote => rjoin(&dir, name),
+        };
+        let program = self.editor.clone();
+
+        // An editor that has been quit took its pty with it. A fresh one
+        // opens in the same pane, on the file directly.
+        if !self.shell(slot).is_some_and(Shell::is_alive) {
+            let opens = self.config.editor_open(&program);
+            let run = format!("{program} {}", crate::types::sh_quote(&path));
+            let Some(fresh) = self.new_term(slot, Some(run), Some(opens)) else {
+                return false;
+            };
+            self.layout.replace(slot, fresh);
+            if self.focus == slot {
+                self.focus = fresh;
+            }
+            self.settle_focus();
+            self.stash_layout();
+            self.set_status(
+                format!("{name} — the editor pane was restarted"),
+                Level::Good,
+            );
+            return true;
+        }
+
+        let keys = match self.term(slot).and_then(|t| t.opens.clone()) {
+            // The path goes in as it is: what the keys around it are typed
+            // into is the editor's own command line, not a shell, and every
+            // editor escapes differently. A path with spaces in it wants keys
+            // of your own.
+            Some(open) if !open.is_empty() => open.replace("{file}", &path),
+            // Nothing is known about this editor, so the pane is treated as
+            // the shell prompt it is and the editor run as a command — where
+            // shell quoting is exactly what is wanted.
+            _ => format!("{program} {}\r", crate::types::sh_quote(&path)),
+        };
+        if let Some(shell) = self.shell_mut(slot) {
+            shell.type_in(&keys);
+        }
+        self.set_status(format!("{name} → editor pane"), Level::Good);
+        true
+    }
+
+    /// A click on a row of a file list.
+    ///
+    /// With an editor pane open, clicking a file opens it there — the way
+    /// clicking in a file tree works everywhere else. With no editor pane it
+    /// only moves the cursor, since opening a file would be a surprise.
+    pub fn click_row(&mut self, slot: Slot, index: usize) {
+        self.focus_pane(slot);
+        self.pane_mut(slot).select_index(index);
+        if self.editor_pane(slot.host()).is_none() {
+            return;
+        }
+        let Some(entry) = self.pane(slot).selected().cloned() else {
+            return;
+        };
+        if !entry.is_dir_like() {
+            self.send_to_editor(slot, &entry.name);
+        }
     }
 
     /// A click on a pane's zoom button.
     ///
     /// The zoom follows the focus, so the focus goes to the pane whose button
-    /// was clicked before anything is zoomed — clicking the far pane's button
+    /// was clicked before anything is zoomed — clicking another pane's button
     /// blows up that pane, which is the only thing the click could mean.
-    pub fn click_zoom_button(&mut self, side: Side, region: Region) {
-        self.focus = side;
-        self.region = region;
+    pub fn click_zoom_button(&mut self, slot: Slot) {
+        self.focus = slot;
         self.toggle_zoom();
+    }
+
+    /// A click on a pane's close button. It shuts the pane it is drawn in,
+    /// whether or not that is the pane with the keyboard — which is the whole
+    /// point of there being one in every corner.
+    pub fn click_close_button(&mut self, slot: Slot) {
+        self.close_pane(slot);
     }
 
     /// Give the whole area to the focused pane, or hand it back.
     ///
-    /// The zoom follows the focus afterwards, so Tab and F6 keep working the
-    /// way they do at any other size — you stay zoomed, on whatever you moved
-    /// to — and there is nothing to remember about which pane was blown up.
+    /// The zoom follows the focus afterwards, so moving between panes keeps
+    /// working the way it does at any other size — you stay zoomed, on
+    /// whatever you moved to — and there is nothing to remember about which
+    /// pane was blown up.
     fn toggle_zoom(&mut self) {
-        // On a tab that is one pane already, with no shell under it, there is
-        // nothing for a zoom to hide. Un-zooming is always allowed, so a shell
-        // closed while zoomed cannot strand anyone.
+        // With one pane there is nothing for a zoom to hide. Un-zooming is
+        // always allowed, so a pane closed while zoomed cannot strand anyone.
         if !self.zoomed && !self.zoom_has_anything_to_hide() {
             self.set_status(
                 "this tab is a single pane — S opens a shell to zoom past",
@@ -3812,60 +5069,14 @@ impl App {
         }
         self.zoomed = !self.zoomed;
         if self.zoomed {
-            let side = match self.on_local_tab() {
-                true => "this tab".to_string(),
-                false => side_name(self.focus).to_string(),
-            };
-            let what = match self.region {
-                Region::Files => side,
-                Region::Shell => format!("{side} shell"),
-            };
+            let what = self.pane_name(self.focus);
             self.set_status(
                 format!("{what} fills the screen — m or F3 brings the other panes back"),
                 Level::Info,
             );
         } else {
-            self.set_status("both sides again", Level::Info);
+            self.set_status("every pane again", Level::Info);
         }
-    }
-
-    /// The local pane's shell, or the active tab's.
-    pub fn shell(&self, side: Side) -> Option<&Shell> {
-        match side {
-            Side::Local => self.local_shell.as_ref(),
-            Side::Remote => self.tab().and_then(|t| t.shell.as_ref()),
-        }
-    }
-
-    pub fn shell_mut(&mut self, side: Side) -> Option<&mut Shell> {
-        match side {
-            Side::Local => self.local_shell.as_mut(),
-            Side::Remote => self
-                .tabs
-                .get_mut(self.active)
-                .and_then(|t| t.shell.as_mut()),
-        }
-    }
-
-    fn set_shell(&mut self, side: Side, shell: Option<Shell>) {
-        match side {
-            Side::Local => self.local_shell = shell,
-            Side::Remote => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.shell = shell;
-                }
-            }
-        }
-    }
-
-    /// Dropping the shell tells its thread to shut the session down.
-    fn close_shell(&mut self, side: Side) {
-        self.set_shell(side, None);
-    }
-
-    /// True when `side` has a shell taking up part of the pane.
-    pub fn has_shell(&self, side: Side) -> bool {
-        self.shell(side).is_some()
     }
 
     fn toggle_sudo(&mut self) {
@@ -3890,40 +5101,107 @@ impl App {
         );
     }
 
-    /// Point the other pane at the same path as the focused one.
+    /// Point the other machine's file list at the same path as this one.
     fn mirror_path(&mut self) {
-        if self.on_local_tab() {
-            self.set_status("this tab has no other pane to point", Level::Info);
+        let Some(to) = self.target() else {
+            self.set_status("no other file list on screen to point", Level::Info);
+            return;
+        };
+        let path = self.dir_of(self.focus);
+        if path.is_empty() {
             return;
         }
-        match self.focus {
+        match to.host() {
+            Side::Remote => self.goto_remote(to, path),
             Side::Local => {
-                let path = self.local_cwd.display().to_string();
-                self.goto_remote(path);
-            }
-            Side::Remote => {
-                let path = PathBuf::from(&self.remote_cwd());
-                if path.is_dir() {
-                    self.goto_local(path);
+                let here = PathBuf::from(&path);
+                if here.is_dir() {
+                    self.goto_local(to, here);
                 } else {
-                    self.set_status(
-                        format!("no local directory {}", self.remote_cwd()),
-                        Level::Bad,
-                    );
+                    self.set_status(format!("no local directory {path}"), Level::Bad);
                 }
             }
         }
     }
 }
 
-/// The one chord that gets the keyboard back out of a focused shell.
-/// Everything else has to reach the shell, including Esc and Ctrl-C.
-fn is_shell_escape(key: &KeyEvent) -> bool {
-    match key.code {
-        KeyCode::F(6) => true,
-        KeyCode::Char(']') => key.modifiers.contains(KeyModifiers::CONTROL),
-        _ => false,
+/// A terminal pane for the drawing tests, which cannot reach the helpers in
+/// this file's own test module.
+#[cfg(test)]
+impl App {
+    pub fn open_test_term(&mut self, cwd: &std::path::Path) -> Slot {
+        self.next_term_id += 1;
+        let id = self.next_term_id;
+        self.local_terms.push(Term {
+            id,
+            shell: Shell::spawn_local(cwd, 24, 80),
+            opens: None,
+        });
+        let slot = Slot::term(Side::Local, id);
+        self.layout
+            .split(Slot::files(Side::Local), Dir::Down, slot, 50);
+        self.stash_layout();
+        slot
     }
+}
+
+/// Tabs for the tests to draw and switch between. The worker at the other end
+/// of the channel is nobody, which is all they need: nothing here sends it a
+/// request.
+#[cfg(test)]
+impl App {
+    pub fn fake_tab(&mut self, host: &str) {
+        self.fake_tab_with(host, Layout::default());
+    }
+
+    pub fn fake_tab_with(&mut self, host: &str, layout: Layout) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (_, resp_rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        self.show_new_tab(RemoteTab {
+            target: Target::Ssh(ConnectOpts::default()),
+            kind: BackendKind::Ssh,
+            name: None,
+            conn: ConnInfo {
+                user: "me".into(),
+                host: host.into(),
+                port: 22,
+                home: "/home/me".into(),
+            },
+            link: LinkState::Live,
+            sudo: false,
+            trees: vec![RemoteTree::new(layout::MAIN, "/home/me".into())],
+            terms: Vec::new(),
+            focus: Slot::files(Side::Remote),
+            layout,
+            task: None,
+            forwards: Vec::new(),
+            tx,
+            rx: resp_rx,
+        });
+    }
+}
+
+/// The one key that gets the keyboard back out of a focused shell in a single
+/// press. Everything else has to reach the shell, including Esc and Ctrl-C.
+fn is_shell_escape(key: &KeyEvent) -> bool {
+    key.code == KeyCode::F(6)
+}
+
+/// The chord that hands the keyboard to sshman rather than to the pane.
+///
+/// `Ctrl-]` is the telnet escape and readline's character-search, so it is
+/// both the least missed key on a shell's keyboard and the one people already
+/// expect to mean "out of here".
+///
+/// It is the byte `0x1d`, which a terminal reports as `Ctrl-5` unless it is
+/// speaking the newer keyboard protocol and can say which key was really
+/// pressed. They are the same keystroke, so both spellings are taken —
+/// otherwise the chord works on some terminals and silently does nothing on
+/// the rest.
+fn is_command_key(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
 }
 
 /// Find the public key to install: the companion of an explicitly chosen
@@ -3971,12 +5249,12 @@ fn scroll_limit(lines: usize, view_height: u16) -> u16 {
 /// Describe a tab well enough to rebuild it later, or `None` when it cannot
 /// be rebuilt — a container reached through another container.
 fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
-    let path = Some(tab.cwd.clone()).filter(|p| !p.is_empty());
+    let path = Some(tab.cwd().to_string()).filter(|p| !p.is_empty());
     match &tab.target {
         Target::Local => Some(WorkspaceItem::Local {
             path,
             name: tab.name.clone(),
-            layout: Some(tab.layout),
+            layout: Some(tab.layout.clone()),
         }),
         Target::Ssh(opts) => Some(WorkspaceItem::Ssh {
             user: opts.user.clone(),
@@ -3986,7 +5264,7 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
             name: tab.name.clone(),
             path,
             forwards: saved_forwards(tab),
-            layout: Some(tab.layout),
+            layout: Some(tab.layout.clone()),
         }),
         Target::Docker {
             via,
@@ -4013,7 +5291,7 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
             }),
             path,
             forwards: saved_forwards(tab),
-            layout: Some(tab.layout),
+            layout: Some(tab.layout.clone()),
         }),
     }
 }
@@ -4105,14 +5383,19 @@ mod tests {
         });
     }
 
+    /// The pane on this machine that everything starts on.
+    fn here() -> Slot {
+        Slot::files(Side::Local)
+    }
+
     fn select(app: &mut App, name: &str) {
         let index = app
-            .local
+            .pane(here())
             .view
             .iter()
             .position(|e| e.name == name)
             .unwrap_or_else(|| panic!("{name} is not in the pane"));
-        app.local.select_index(index);
+        app.pane_mut(here()).select_index(index);
     }
 
     #[test]
@@ -4147,7 +5430,7 @@ mod tests {
         press(&mut app, 'm');
         press(&mut app, 'c');
 
-        app.goto_local(dir.join("dst"));
+        app.goto_local(here(), dir.join("dst"));
         press(&mut app, 'P');
 
         // The copy runs off the UI thread, as every local command does.
@@ -4177,7 +5460,7 @@ mod tests {
         press(&mut app, 'm');
         press(&mut app, 'c');
 
-        app.goto_local(dir.join("dst"));
+        app.goto_local(here(), dir.join("dst"));
         press(&mut app, 'P');
         for _ in 0..200 {
             app.drain_workers();
@@ -4208,7 +5491,7 @@ mod tests {
         press(&mut app, 'M');
         assert!(app.clip.as_ref().unwrap().cut);
 
-        app.goto_local(dir.join("dst"));
+        app.goto_local(here(), dir.join("dst"));
         press(&mut app, 'P');
         assert!(app.clip.is_none(), "a move only happens once");
 
@@ -4244,7 +5527,7 @@ mod tests {
     fn nothing_is_picked_up_from_an_empty_selection() {
         let dir = scratch("empty");
         let mut app = app_in(&dir);
-        app.local.state.select(None);
+        app.pane_mut(here()).state.select(None);
         press(&mut app, 'M');
         assert!(app.clip.is_none());
         assert_eq!(app.status, "nothing selected");
@@ -4264,8 +5547,11 @@ mod tests {
         let tab = app.tabs.last_mut().unwrap();
         tab.kind = BackendKind::Local;
         tab.target = Target::Local;
-        tab.cwd = cwd.to_string();
-        tab.pane.set_entries(vec![FileEntry {
+        tab.trees[0].cwd = cwd.to_string();
+        // What `show_new_tab` does for a tab that says it is local from the
+        // start: there is no far side to put beside it.
+        tab.layout.retain(|slot| slot.host() != Side::Local);
+        tab.trees[0].pane.set_entries(vec![FileEntry {
             name: "one.txt".into(),
             kind: EntryKind::File,
             size: 4,
@@ -4274,37 +5560,33 @@ mod tests {
             link_target: None,
             points_to_dir: false,
         }]);
+        app.adopt_layout();
         app.settle_focus();
     }
 
+    /// Put a terminal on a machine and open a pane for it, the way `S` does.
+    fn add_term(app: &mut App, host: Side, shell: Shell) -> Slot {
+        app.next_term_id += 1;
+        let id = app.next_term_id;
+        app.terms_mut(host)
+            .expect("somewhere to put it")
+            .push(Term {
+                id,
+                shell,
+                opens: None,
+            });
+        let slot = Slot::term(host, id);
+        let at = app.files_pane(host);
+        app.layout.split(at, Dir::Down, slot, 70);
+        app.stash_layout();
+        slot
+    }
+
     fn fake_tab_with(app: &mut App, host: &str, shell: Option<Shell>, layout: Layout) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (_, resp_rx) = std::sync::mpsc::channel();
-        std::mem::forget(rx);
-        app.show_new_tab(RemoteTab {
-            target: Target::Ssh(ConnectOpts::default()),
-            kind: BackendKind::Ssh,
-            name: None,
-            conn: ConnInfo {
-                user: "me".into(),
-                host: host.into(),
-                port: 22,
-                home: "/home/me".into(),
-            },
-            link: LinkState::Live,
-            sudo: false,
-            pane: Pane::default(),
-            cwd: "/home/me".into(),
-            shell,
-            region: Region::Files,
-            layout,
-            task: None,
-            forwards: Vec::new(),
-            tx,
-            rx: resp_rx,
-            seq: 0,
-            pending_select: None,
-        });
+        app.fake_tab_with(host, layout);
+        if let Some(shell) = shell {
+            add_term(app, Side::Remote, shell);
+        }
     }
 
     #[test]
@@ -4313,23 +5595,19 @@ mod tests {
         let mut app = app_in(&dir);
         fake_tab(&mut app, "one", Some(Shell::spawn_local(&dir, 24, 80)));
         fake_tab(&mut app, "two", None);
-        app.active = 0;
-        app.focus = Side::Remote;
-        app.region = Region::Shell;
+        app.goto_tab(0);
+        let shell = app.layout.find(Slot::is_term).expect("the first tab's");
+        app.focus = shell;
         app.zoomed = true;
 
         // The second tab has no shell, so there is none to show.
         app.goto_tab(1);
-        assert_eq!(app.region, Region::Files);
+        assert!(!app.in_term());
         assert!(app.zoomed, "the zoom itself stays put");
 
         // Going back must land where we left off, not on the file list.
         app.goto_tab(0);
-        assert_eq!(
-            app.region,
-            Region::Shell,
-            "the shell we were in has to come back"
-        );
+        assert_eq!(app.focus, shell, "the shell we were in has to come back");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4340,15 +5618,15 @@ mod tests {
         let mut app = app_in(&dir);
         fake_tab(&mut app, "one", None);
         fake_tab(&mut app, "two", Some(Shell::spawn_local(&dir, 24, 80)));
-        app.tabs[1].region = Region::Shell;
-        app.active = 0;
-        app.focus = Side::Remote;
-        app.region = Region::Files;
+        // The second tab was left in its shell.
+        app.tabs[1].focus = app.layout.find(Slot::is_term).expect("the second tab's");
+        app.goto_tab(0);
+        app.focus = Slot::files(Side::Remote);
 
         app.goto_tab(1);
         assert_eq!(
-            app.region,
-            Region::Files,
+            app.focus,
+            Slot::files(Side::Remote),
             "the shell is on screen anyway, and it would swallow the \
              Ctrl-arrows that got us here"
         );
@@ -4362,15 +5640,13 @@ mod tests {
         let mut app = app_in(&dir);
         fake_tab(&mut app, "one", Some(Shell::spawn_local(&dir, 24, 80)));
         fake_tab(&mut app, "two", Some(Shell::spawn_local(&dir, 24, 80)));
-        app.active = 0;
-        app.focus = Side::Remote;
-        app.region = Region::Shell;
+        app.goto_tab(0);
+        app.focus = app.layout.find(Slot::is_term).expect("the first tab's");
         app.zoomed = true;
 
         app.goto_tab(1);
-        assert_eq!(
-            app.region,
-            Region::Shell,
+        assert!(
+            app.in_term(),
             "the other tab has a shell, so a zoomed shell must show it"
         );
 
@@ -4381,19 +5657,389 @@ mod tests {
     fn switching_tabs_leaves_the_local_side_alone() {
         let dir = scratch("tab-local");
         let mut app = app_in(&dir);
-        app.local_shell = Some(Shell::spawn_local(&dir, 24, 80));
         fake_tab(&mut app, "one", None);
         fake_tab(&mut app, "two", None);
-        app.active = 0;
-        app.focus = Side::Local;
-        app.region = Region::Shell;
+        app.goto_tab(0);
+        app.focus = Slot::files(Side::Local);
 
         app.goto_tab(1);
         assert_eq!(
-            app.region,
-            Region::Shell,
-            "the keyboard is in the local shell; tabs are the other side"
+            app.focus,
+            Slot::files(Side::Local),
+            "the keyboard is on this machine; tabs are the other side"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_terminal_is_still_running_when_you_come_back_to_its_tab() {
+        // Its pane belongs to the tab that opened it, so switching away hides
+        // it — but nothing is shut down, and the session is waiting.
+        let dir = scratch("tab-keep");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", Some(Shell::spawn_local(&dir, 24, 80)));
+        fake_tab(&mut app, "two", None);
+
+        assert!(app.layout.find(Slot::is_term).is_none(), "not on this tab");
+        assert_eq!(app.tabs[0].terms.len(), 1, "still running on the other");
+
+        app.goto_tab(0);
+        assert!(
+            app.layout.find(Slot::is_term).is_some(),
+            "and back it comes"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_shell_opens_in_a_pane_of_its_own_and_s_closes_it_again() {
+        let dir = scratch("split-shell");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        app.focus = Slot::files(Side::Remote);
+
+        press(&mut app, 'S');
+        assert_eq!(app.layout.panes(), 3, "the remote pane was cut in two");
+        assert!(app.in_term(), "and the keyboard went into it");
+        assert_eq!(app.tabs[0].terms.len(), 1);
+
+        // A focused terminal owns the keyboard, so S only means "close it"
+        // once you have stepped back out to the files.
+        key(&mut app, KeyCode::F(6));
+        assert!(!app.in_term());
+        press(&mut app, 'S');
+        assert_eq!(app.layout.panes(), 2);
+        assert_eq!(app.focus, Slot::files(Side::Remote));
+        assert!(app.tabs[0].terms.is_empty(), "and the session is over");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_terminal_no_pane_is_showing_is_not_left_running() {
+        let dir = scratch("orphan");
+        let mut app = app_in(&dir);
+        let slot = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        assert_eq!(app.local_terms.len(), 1);
+
+        // Taken out of the arrangement by hand, as an arrangement change does.
+        app.layout.retain(|s| s != slot);
+        app.settle_focus();
+        assert!(app.local_terms.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_last_pane_is_not_closable() {
+        let dir = scratch("last-pane");
+        let mut app = app_in(&dir);
+        fake_local_tab(&mut app, dir.to_str().unwrap());
+        assert_eq!(app.layout.panes(), 1, "a tab on this machine is one pane");
+
+        app.close_pane(app.focus);
+        assert_eq!(app.layout.panes(), 1);
+        assert!(app.status.contains("W closes the tab"), "{}", app.status);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_keyboard_moves_from_pane_to_pane() {
+        let dir = scratch("move-focus");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", Some(Shell::spawn_local(&dir, 24, 80)));
+        let shell = app.layout.find(Slot::is_term).expect("the tab's");
+        app.focus = Slot::files(Side::Local);
+
+        app.move_focus(Dir::Across, true);
+        assert_eq!(app.focus, Slot::files(Side::Remote));
+        app.move_focus(Dir::Down, true);
+        assert_eq!(app.focus, shell);
+        app.move_focus(Dir::Across, false);
+        assert_eq!(app.focus, Slot::files(Side::Local));
+        // Nothing that way leaves the keyboard where it was.
+        app.move_focus(Dir::Across, false);
+        assert_eq!(app.focus, Slot::files(Side::Local));
+        assert_eq!(app.status, "no pane that way");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t_opens_another_list_on_the_same_machine_where_this_one_is() {
+        let dir = scratch("two-lists");
+        let mut app = app_in(&dir);
+        press(&mut app, 'T');
+
+        assert_eq!(app.layout.panes(), 3, "the local pane was cut in two");
+        assert_eq!(app.local.len(), 2, "and there is a list behind the new one");
+        let second = app.focus;
+        assert!(second.is_files() && second.host() == Side::Local);
+        assert_eq!(
+            app.dir_of(second),
+            app.dir_of(here()),
+            "it opens where the one it came from is looking"
+        );
+
+        // Closing it again lets go of the directory it was in.
+        app.close_pane(second);
+        assert_eq!(app.local.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_copies_between_two_lists_on_the_same_machine() {
+        let dir = scratch("same-machine-copy");
+        let mut app = app_in(&dir);
+        press(&mut app, 'T');
+        let second = app.focus;
+        app.goto_local(second, dir.join("dst"));
+
+        app.focus_pane(here());
+        select(&mut app, "one.txt");
+        assert_eq!(
+            app.target(),
+            Some(second),
+            "the other list is where it goes"
+        );
+        press(&mut app, 'c');
+
+        // The copy runs off the UI thread, as every local command does.
+        let landed = dir.join("dst/one.txt");
+        for _ in 0..200 {
+            if landed.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(landed.exists(), "nothing arrived in the other list");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copying_into_the_directory_you_are_already_in_is_refused() {
+        let dir = scratch("same-dir");
+        let mut app = app_in(&dir);
+        press(&mut app, 'T');
+        app.focus_pane(here());
+        select(&mut app, "one.txt");
+
+        press(&mut app, 'c');
+        assert!(app.status.contains("same directory"), "{}", app.status);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn with_more_than_two_lists_c_copies_to_the_one_you_were_just_in() {
+        let dir = scratch("three-lists");
+        let mut app = app_in(&dir);
+        press(&mut app, 'T');
+        let second = app.focus;
+        press(&mut app, 'T');
+        let third = app.focus;
+        assert_eq!(app.layout.panes(), 4);
+
+        // Coming to the third from the second, the second is "the other one".
+        assert_eq!(app.target(), Some(second));
+
+        app.focus_pane(here());
+        assert_eq!(app.target(), Some(third), "and now the one just left");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_zoomed_list_has_nothing_to_copy_across_to() {
+        let dir = scratch("zoom-target");
+        let mut app = app_in(&dir);
+        press(&mut app, 'T');
+        app.zoomed = true;
+        assert_eq!(app.target(), None);
+        assert!(!app.other_side_on_screen());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn each_list_keeps_its_own_directory_and_its_own_cursor() {
+        let dir = scratch("own-dir");
+        let mut app = app_in(&dir);
+        press(&mut app, 'T');
+        let second = app.focus;
+        app.goto_local(second, dir.join("dst"));
+
+        assert_eq!(app.dir_of(here()), dir.display().to_string());
+        assert_eq!(app.dir_of(second), dir.join("dst").display().to_string());
+        assert_eq!(
+            app.local_cwd(),
+            dir,
+            "and this machine's own directory is still the first one's"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_arrangement_that_names_a_list_gets_one_made_for_it() {
+        // What reopening a workspace does: the panes were written down, the
+        // lists behind them were not.
+        let dir = scratch("restore-lists");
+        let mut app = app_in(&dir);
+        let second = Slot::tree(Side::Local, 7);
+        app.layout.split(here(), Dir::Across, second, 50);
+
+        app.settle_focus();
+        assert_eq!(app.layout.panes(), 3, "the pane was kept, not pruned away");
+        assert_eq!(app.dir_of(second), dir.display().to_string());
+        assert!(
+            app.next_tree_id >= 7,
+            "and its number is not handed out again"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_goes_to_the_editor_pane_when_there_is_one() {
+        let dir = scratch("editor-pane");
+        let mut app = app_in(&dir);
+        // A terminal marked as the one that opens files, as the Editor
+        // arrangement makes.
+        let slot = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.term_mut(slot).expect("just made").opens = Some("\x1b:e {file}\r".into());
+        assert_eq!(app.editor_pane(Side::Local), Some(slot));
+
+        app.focus = Slot::files(Side::Local);
+        select(&mut app, "one.txt");
+        press(&mut app, 'e');
+
+        assert!(
+            app.pending_action.is_none(),
+            "sshman does not stand aside when the editor is already on screen"
+        );
+        assert!(app.status.contains("editor pane"), "{}", app.status);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn with_no_editor_pane_a_file_still_opens_the_old_way() {
+        let dir = scratch("editor-none");
+        let mut app = app_in(&dir);
+        app.focus = Slot::files(Side::Local);
+        select(&mut app, "one.txt");
+        press(&mut app, 'e');
+        assert!(
+            matches!(app.pending_action, Some(UiAction::Editor { .. })),
+            "the terminal is handed over, the way it always was"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clicking_a_file_only_opens_it_where_there_is_somewhere_to_open_it() {
+        let dir = scratch("click-open");
+        let mut app = app_in(&dir);
+        let files = Slot::files(Side::Local);
+
+        let at = app
+            .pane(here())
+            .view
+            .iter()
+            .position(|e| e.name == "one.txt")
+            .expect("the scratch file");
+
+        // No editor pane: a click moves the cursor and nothing else, since
+        // opening a file would be a surprise.
+        app.click_row(files, at);
+        assert_eq!(app.pane(here()).selected_name().as_deref(), Some("one.txt"));
+        assert!(app.pending_action.is_none());
+        assert!(app.status.is_empty(), "{}", app.status);
+
+        let slot = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.term_mut(slot).expect("just made").opens = Some(String::new());
+        app.click_row(files, at);
+        assert!(app.status.contains("editor pane"), "{}", app.status);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_directory_clicked_in_the_tree_is_not_sent_to_the_editor() {
+        let dir = scratch("click-dir");
+        let mut app = app_in(&dir);
+        let files = Slot::files(Side::Local);
+        let slot = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.term_mut(slot).expect("just made").opens = Some(String::new());
+
+        let at = app
+            .pane(here())
+            .view
+            .iter()
+            .position(|e| e.name == "dst")
+            .expect("the scratch directory");
+        app.click_row(files, at);
+        assert!(!app.status.contains("editor pane"), "{}", app.status);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_editor_arrangement_is_a_tree_an_editor_and_a_terminal() {
+        let dir = scratch("arrange-editor");
+        let mut app = app_in(&dir);
+        app.focus = Slot::files(Side::Local);
+        app.arrange(Arrangement::Editor);
+
+        assert_eq!(app.layout.panes(), 3);
+        assert_eq!(
+            app.focus,
+            Slot::files(Side::Local),
+            "picking files is the point"
+        );
+        assert!(app.editor_pane(Side::Local).is_some());
+        assert_eq!(app.local_terms.len(), 2, "the editor, and a shell under it");
+
+        // The file list is on the left, the editor to its right, the terminal
+        // under the editor.
+        let areas = app.layout.areas(Rect::new(0, 0, 100, 30));
+        let files = areas.of(Slot::files(Side::Local)).unwrap();
+        let editor = areas.of(app.editor_pane(Side::Local).unwrap()).unwrap();
+        assert!(files.x < editor.x && files.width < editor.width);
+        let shell = areas
+            .panes
+            .iter()
+            .find(|(s, _)| s.is_term() && *s != app.editor_pane(Side::Local).unwrap())
+            .map(|(_, r)| *r)
+            .expect("the terminal");
+        assert_eq!(shell.x, editor.x, "underneath it, not beside it");
+        assert!(shell.y > editor.y);
+
+        // And going back closes what it opened rather than leaving terminals
+        // running out of sight.
+        app.arrange(Arrangement::Sides);
+        assert_eq!(app.layout, Layout::default());
+        assert!(app.local_terms.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_new_tab_does_not_inherit_the_terminals_of_the_one_before_it() {
+        let dir = scratch("no-inherit");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", Some(Shell::spawn_local(&dir, 24, 80)));
+        // The panes a second connection would open with.
+        let mut carried = app.layout.clone();
+        carried.retain(|slot| !(slot.is_term() && slot.host() == Side::Remote));
+        assert!(carried.find(Slot::is_term).is_none());
+        assert_eq!(carried.panes(), 2);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4412,6 +6058,169 @@ mod tests {
     }
 
     /// A connection attempt in flight, as the connection form makes one.
+    /// Ctrl-], as a terminal actually sends it: the byte 0x1d, which arrives
+    /// spelled `Ctrl-5` unless the terminal can say which key was pressed.
+    fn command(app: &mut App) {
+        app.on_key(KeyEvent {
+            code: KeyCode::Char('5'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+    }
+
+    #[test]
+    fn every_sshman_key_is_reachable_from_inside_a_shell() {
+        let dir = scratch("command");
+        let mut app = app_in(&dir);
+        let shell = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.focus_pane(shell);
+        assert!(app.in_term());
+
+        command(&mut app);
+        assert!(app.commanding, "the keyboard is sshman's now");
+
+        // The pane keys, spelled the way the file list spells them.
+        press(&mut app, '|');
+        assert_eq!(app.layout.panes(), 4, "a second shell opened beside it");
+        assert!(app.commanding, "and the keyboard is still sshman's");
+
+        // And the ones that have nothing to do with panes at all, which
+        // before this meant leaving the shell to reach them.
+        press(&mut app, 'w');
+        assert_eq!(app.mode, Mode::Workspaces);
+        assert!(!app.commanding, "opening something moves on from arranging");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_arrows_walk_past_a_shell_without_falling_into_it() {
+        let dir = scratch("walk");
+        let mut app = app_in(&dir);
+        let shell = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.focus_pane(here());
+
+        command(&mut app);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, shell, "the keyboard is pointing at the shell");
+        assert!(
+            app.commanding,
+            "but the shell does not have it, or the next arrow would be typed"
+        );
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.focus, here(), "so the arrows keep walking");
+
+        // ↵ is what hands it over.
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.commanding);
+        assert_eq!(app.focus, shell);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn esc_puts_the_keyboard_back_where_it_was() {
+        let dir = scratch("command-esc");
+        let mut app = app_in(&dir);
+        let shell = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.focus_pane(shell);
+
+        command(&mut app);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.focus, here(), "moved away");
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.commanding);
+        assert_eq!(
+            app.focus, shell,
+            "and put back, still typing where you were"
+        );
+
+        // Ctrl-] again does the same, so a double tap is never a surprise.
+        command(&mut app);
+        command(&mut app);
+        assert!(!app.commanding);
+        assert_eq!(app.focus, shell);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_command_key_never_reaches_the_shell() {
+        let dir = scratch("command-eats");
+        let mut app = app_in(&dir);
+        let shell = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.focus_pane(shell);
+
+        command(&mut app);
+        press(&mut app, 'm');
+        assert!(app.zoomed, "it zoomed rather than typing an m");
+        assert_eq!(app.layout.panes(), 3, "and nothing was opened or closed");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copied_text_is_held_and_handed_to_the_terminal_once() {
+        let dir = scratch("copy");
+        let mut app = app_in(&dir);
+        app.copy("two\nlines".into());
+
+        assert_eq!(app.status, "copied 2 lines");
+        assert_eq!(app.copied.as_deref(), Some("two\nlines"));
+        assert_eq!(app.take_clipboard().as_deref(), Some("two\nlines"));
+        assert_eq!(
+            app.take_clipboard(),
+            None,
+            "the terminal is handed it once, not on every frame"
+        );
+        assert_eq!(
+            app.copied.as_deref(),
+            Some("two\nlines"),
+            "but sshman keeps it, for pasting back into a pane"
+        );
+
+        app.copy("one line".into());
+        assert_eq!(app.status, "copied 8 character(s)");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn there_is_nothing_to_copy_without_a_selection() {
+        let dir = scratch("copy-none");
+        let mut app = app_in(&dir);
+        let shell = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.focus_pane(shell);
+
+        command(&mut app);
+        press(&mut app, 'y');
+        assert!(app.clipboard_out.is_none());
+        assert!(app.status.contains("nothing picked out"), "{}", app.status);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_new_tab_does_not_start_by_asking_where_to() {
+        // What the `[+]` button does. A tab on this machine needs nothing
+        // filled in and nothing to reach, so no form comes up and no
+        // connection is required of you.
+        let dir = scratch("newtab");
+        let mut app = app_in(&dir);
+        app.open_local_tab();
+
+        assert_eq!(app.mode, Mode::Browse, "nothing to fill in");
+        assert_eq!(app.pending.len(), 1, "a tab is on its way");
+        assert!(matches!(app.pending[0].target, Target::Local));
+        assert_eq!(
+            app.pending[0].initial_dir.as_deref(),
+            Some(dir.to_string_lossy().as_ref()),
+            "and it opens on the directory you were already looking at"
+        );
+    }
+
     fn fake_pending(app: &mut App) -> u64 {
         let (tx, rx) = std::sync::mpsc::channel();
         let (_, resp_rx) = std::sync::mpsc::channel();
@@ -4516,23 +6325,90 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Where `e` would send this file: its real path, or nowhere (meaning it
+    /// has to be fetched first).
+    fn edit_target(app: &mut App, at: Slot, name: &str) -> Option<PathBuf> {
+        app.pending_action = None;
+        app.launch_on(at, name, "true".into());
+        match app.pending_action.take() {
+            Some(UiAction::Editor { path, .. }) => Some(path),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_file_on_this_machine_is_edited_where_it_lies() {
+        let dir = scratch("edit-in-place");
+        std::fs::create_dir_all(dir.join("project/src")).unwrap();
+        std::fs::write(dir.join("project/src/main.rs"), b"x").unwrap();
+        let mut app = app_in(&dir);
+        fake_local_tab(&mut app, &dir.join("project/src").display().to_string());
+
+        // The left pane and a "this machine" tab are the same filesystem, so
+        // they have to behave the same way: the editor gets the real path,
+        // with the rest of the project around it, not a lone copy in /tmp.
+        assert_eq!(
+            edit_target(&mut app, Slot::files(Side::Remote), "main.rs"),
+            Some(dir.join("project/src/main.rs"))
+        );
+        assert_eq!(
+            edit_target(&mut app, here(), "anything.txt"),
+            Some(dir.join("anything.txt"))
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_on_a_server_still_comes_here_first() {
+        let dir = scratch("edit-remote");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "server", None);
+        app.tabs[0].trees[0].cwd = "/etc".into();
+
+        // Nothing to open in place: it is on another machine.
+        assert_eq!(
+            edit_target(&mut app, Slot::files(Side::Remote), "hosts"),
+            None
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_root_owned_file_goes_the_long_way_round_even_on_this_machine() {
+        let dir = scratch("edit-sudo");
+        let mut app = app_in(&dir);
+        fake_local_tab(&mut app, "/etc");
+        app.tabs[0].sudo = true;
+
+        // Your editor cannot open it, so it is fetched as root, edited, and
+        // pushed back as root — the only way that edit can happen at all.
+        assert_eq!(
+            edit_target(&mut app, Slot::files(Side::Remote), "shadow"),
+            None
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_tab_on_this_machine_is_a_single_pane() {
         let dir = scratch("local-tab");
         let mut app = app_in(&dir);
         fake_local_tab(&mut app, "/etc");
 
-        assert!(app.one_pane(), "there is no other side to it");
+        assert!(!app.other_side_on_screen(), "there is no other side to it");
         assert_eq!(
             app.focus,
-            Side::Remote,
+            Slot::files(Side::Remote),
             "the keyboard cannot sit on a pane that is not drawn"
         );
 
         // Tab has nowhere to go, and must not park the keyboard off screen.
         key(&mut app, KeyCode::Tab);
-        assert_eq!(app.focus, Side::Remote);
-        assert!(app.status.contains("only this machine"), "{}", app.status);
+        assert_eq!(app.focus, Slot::files(Side::Remote));
+        assert!(app.status.contains("one file list"), "{}", app.status);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4593,13 +6469,14 @@ mod tests {
         assert!(app.status.contains("single pane"), "{}", app.status);
 
         // A shell under it is something to zoom past.
-        app.tabs[0].shell = Some(Shell::spawn_local(&dir, 24, 80));
+        let shell = add_term(&mut app, Side::Remote, Shell::spawn_local(&dir, 24, 80));
         assert!(app.zoom_has_anything_to_hide());
         press(&mut app, 'm');
         assert!(app.zoomed);
 
         // A shell closed while zoomed must not strand anyone.
-        app.tabs[0].shell = None;
+        app.layout.retain(|s| s != shell);
+        app.settle_focus();
         press(&mut app, 'm');
         assert!(!app.zoomed, "un-zooming is always allowed");
 
@@ -4611,7 +6488,7 @@ mod tests {
         let dir = scratch("local-yank");
         let mut app = app_in(&dir);
         fake_local_tab(&mut app, "/etc");
-        app.tabs[0].pane.select_index(0);
+        app.tabs[0].trees[0].pane.select_index(0);
 
         press(&mut app, 'c');
         let clip = app.clip.as_ref().expect("c picked it up");
@@ -4628,7 +6505,7 @@ mod tests {
         fake_local_tab(&mut app, "/etc");
         fake_tab(&mut app, "server", None);
         app.goto_tab(0);
-        app.tabs[0].pane.select_index(0);
+        app.tabs[0].trees[0].pane.select_index(0);
         press(&mut app, 'c');
         assert!(app.clip.is_some());
 
@@ -4649,11 +6526,10 @@ mod tests {
         app.active = 0;
         app.adopt_layout();
 
-        // Set the first tab up wide with a tall shell.
-        app.layout = Layout {
-            split_pct: 30,
-            shell_height: 20,
-        };
+        // Set the first tab up wide.
+        let wide = Layout::sides(30);
+        app.layout = wide.clone();
+        app.stash_layout();
         app.goto_tab(1);
         assert_eq!(
             app.layout,
@@ -4662,17 +6538,10 @@ mod tests {
         );
 
         // The second tab gets sizes of its own.
-        app.layout.nudge_split(6);
-        let second = app.layout;
+        app.resize_pane(Dir::Across, 6);
+        let second = app.layout.clone();
         app.goto_tab(0);
-        assert_eq!(
-            app.layout,
-            Layout {
-                split_pct: 30,
-                shell_height: 20,
-            },
-            "the first tab's sizes come back with it"
-        );
+        assert_eq!(app.layout, wide, "the first tab's sizes come back with it");
         app.goto_tab(1);
         assert_eq!(app.layout, second, "and so do the second's");
 
@@ -4683,20 +6552,17 @@ mod tests {
     fn the_first_tab_opens_with_the_sizes_it_was_given() {
         let dir = scratch("first-tab");
         let mut app = app_in(&dir);
-        let saved = Layout {
-            split_pct: 40,
-            shell_height: 18,
-        };
+        let saved = Layout::sides(40);
         // Nothing is open, so `active` already points at where this one
         // lands. Its own sizes have to survive that.
-        fake_tab_with(&mut app, "one", None, saved);
+        fake_tab_with(&mut app, "one", None, saved.clone());
         assert_eq!(app.layout, saved);
         assert_eq!(app.tabs[0].layout, saved);
 
         // And the tab already on screen keeps what it had when a second
         // arrives with sizes of its own.
-        app.edit_layout(|l| l.nudge_split(-4));
-        let first = app.layout;
+        app.resize_pane(Dir::Across, -4);
+        let first = app.layout.clone();
         fake_tab_with(&mut app, "two", None, Layout::default());
         assert_eq!(app.layout, Layout::default(), "the new tab is on screen");
         assert_eq!(app.tabs[0].layout, first, "the old one is unharmed");
@@ -4709,19 +6575,18 @@ mod tests {
         let dir = scratch("ws-sizes");
         let mut app = app_in(&dir);
         fake_tab(&mut app, "one", None);
-        app.active = 0;
-        app.focus = Side::Remote;
+        app.focus = Slot::files(Side::Remote);
         app.panes_area = Rect::new(0, 2, 100, 30);
 
         // Resize, then save without switching tabs first — the tab's own copy
         // has to be up to date by then.
         app.on_key(KeyEvent {
             code: KeyCode::Right,
-            modifiers: KeyModifiers::ALT,
+            modifiers: KeyModifiers::ALT | KeyModifiers::SHIFT,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         });
-        let live = app.layout;
+        let live = app.layout.clone();
         assert_ne!(live, Layout::default(), "the key did something");
 
         let items = app.workspace_items();
@@ -4737,24 +6602,16 @@ mod tests {
         let mut app = app_in(&dir);
         fake_tab(&mut app, "one", None);
         fake_tab(&mut app, "two", None);
-        app.active = 0;
-        app.layout = Layout {
-            split_pct: 35,
-            shell_height: 25,
-        };
+        app.goto_tab(0);
+        let wide = Layout::sides(35);
+        app.layout = wide.clone();
+        app.stash_layout();
         app.goto_tab(1);
         press(&mut app, '=');
         assert_eq!(app.layout, Layout::default());
 
         app.goto_tab(0);
-        assert_eq!(
-            app.layout,
-            Layout {
-                split_pct: 35,
-                shell_height: 25,
-            },
-            "the other tab keeps what it was given"
-        );
+        assert_eq!(app.layout, wide, "the other tab keeps what it was given");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4763,13 +6620,14 @@ mod tests {
     fn resetting_puts_the_layout_back() {
         let dir = scratch("reset");
         let mut app = app_in(&dir);
-        app.layout = Layout {
-            split_pct: 75,
-            shell_height: 30,
-        };
+        app.layout = Layout::sides(75);
         app.zoomed = true;
         press(&mut app, '=');
-        assert_eq!(app.layout, Layout::default());
+        assert_eq!(
+            app.layout,
+            Layout::default(),
+            "the borders go back to the middle"
+        );
         assert!(!app.zoomed);
         std::fs::remove_dir_all(&dir).ok();
     }

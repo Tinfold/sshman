@@ -3,11 +3,12 @@
 A two-pane SSH file manager in the terminal. Your machine on the left, the
 server on the right. Copy files either way with one key, open any file in your
 own editor, and switch the remote pane to `sudo` when you need to see root-only
-paths. Each pane can have a **live shell underneath it** — a real local shell
-below the local tree, a real remote shell below the remote one. Open **several
-servers at once in tabs**, each with its own directory, shell and sudo state.
-Servers you connect to are remembered, so next time you pick one from a list,
-and a dropped connection comes back on its own. **Docker containers work as
+paths. **Split any pane** for a real shell — local or on the server, as many as
+you like, with text you can select and copy out — or arrange a tab as a file
+tree, your editor and a terminal, where clicking a file opens it in the editor
+beside you. Open **several servers at once in tabs**, each with its own
+directory, panes and sudo state. Servers you connect to are remembered, so next
+time you pick one from a list, and a dropped connection comes back on its own. **Docker containers work as
 targets too** — local ones or ones running on a server — and behave exactly
 like a host — Docker or Podman.
 
@@ -28,7 +29,7 @@ the server.
 └─────────────────────────── F6 to focus ──┘┗━━━━━━━━━━━━━━━━━━━ F6 back to files ━━━━━┛
  ↑ app.conf  1.4M / 2.1M  (67%)
 ✓ 1 item(s) copied to remote
- F6  back to files   Ctrl-]  same   every other key goes to the shell
+ F6  back to files   Ctrl-]  sshman keys   drag  select   every other key goes to the shell
 ```
 
 ## Build
@@ -74,19 +75,19 @@ new one. `Esc` leaves `known_hosts` untouched.
 
 | | |
 |---|---|
-| `Tab` | switch panes |
+| `Tab` | move to the next file list (`Shift-Tab` the previous) |
 | `↑ ↓` / `k j`, `PgUp` `PgDn`, `g` `G` | move |
 | `Enter` / `→` | enter a directory, or open a file in `$EDITOR` |
 | `←` / `h` | parent directory |
 | `~` | home directory |
 | `f` | type a path to jump to |
-| `t` | point the other pane at this directory |
+| `t` | point the other file list at this directory |
 | `/` | filter as you type (`Esc` clears it) |
 | `.` | show/hide dotfiles |
 | `R` | reload both panes |
 | `Space` | mark a file |
 | `a` | mark all / clear marks |
-| **`c`** / `F5` | **copy to the other pane's directory** (see below when zoomed) |
+| **`c`** / `F5` | **copy to the other machine's directory** (see below when there is no other side on screen) |
 | `M` | cut, to be put down elsewhere on the same side |
 | `P` | paste what `c` or `M` picked up into this directory |
 | `e` / `F4` | edit in `$EDITOR` |
@@ -104,12 +105,18 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `w` | workspaces: saved sets of connections |
 | `W` | close the tab on screen |
 | `Ctrl-←` / `Ctrl-→`, `Alt-1`…`Alt-9` | move between tabs |
-| `S` | open/close a shell under the focused pane |
-| `F6` / `Ctrl-]` | move the keyboard between the file list and the shell |
+| `S` | cut the focused pane in two, with a terminal below — or close the last one |
+| `\|` | the same, with the terminal beside it |
+| `T` | the same, with another file list beside it |
+| `F9` | close the focused pane, from anywhere |
+| `A` | pick a ready-made arrangement for this tab |
+| `F6` | move the keyboard between the file list and the shell |
+| `Ctrl-]` | command mode: hand the keyboard to sshman (see below) |
+| `Alt-↑↓←→` | move the keyboard to the pane that way |
+| `Alt-Shift-↑↓←→` | move the border nearest the focused pane |
+| `y` / `Y` | copy what is picked out in a shell / paste it into one |
 | `m` / `F3` | give the whole screen to the focused pane, or undo that |
-| `Alt-←` / `Alt-→` | move the divider between the two sides |
-| `Alt-↑` / `Alt-↓` | move the top edge of the shell pane |
-| `=` | back to an even split |
+| `=` | even the borders up again |
 | `s` | toggle sudo mode |
 | `n` / `F7`, `r` / `F2`, `d` / `F8` | mkdir, rename, delete |
 | `C` | connection screen: connect to a server, always in a new tab |
@@ -117,67 +124,176 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `q` | quit |
 
 The mouse works too: scroll wheel, click to focus a pane and select a row, drag
-any border between panes to resize, and click the `[⤢]` in a pane's corner to
-maximise it. In a shell pane, a program that has asked for the mouse gets it —
-btop's clicks, a pager's wheel — and holding `Shift` scrolls the pane's own
-history instead.
+any border between panes to resize, click the `[⤢]` in a pane's corner to
+maximise it or the `[✕]` beside it to close it, and click the `[+]` at the
+right of the top bar for a new tab on this machine. Dragging across a shell
+pane picks text out and copies it when the button comes up. In a shell pane a
+program that has asked for the mouse gets it instead — btop's clicks, a pager's
+wheel — and holding `Shift` is the way past that, to the pane's own scrollback
+and to selecting over it.
 
 Copying acts on your marked files, or on the row under the cursor if you have
 not marked anything. Directories are copied recursively, and existing files at
 the destination are overwritten. Deleting always asks first.
 
-## Pane sizes
+## Command mode
 
-The two sides start on an even split with the shell, when there is one, taking
-the bottom of its column. Both dividers move: `Alt-←` and `Alt-→` for the one
-down the middle, `Alt-↑` and `Alt-↓` for the top
-edge of the shell, and dragging either border with the mouse does the same. The
-file list keeps three rows whatever the shell asks for, and neither side can be
-squeezed below a fifth of the width.
+A focused shell takes every key — that is what makes it a real terminal — so
+the rest of sshman is behind one chord. **`Ctrl-]` hands the keyboard to
+sshman.** Every key then does exactly what it does with a file list focused:
+`C` connects, `w` is the workspaces, `,` is the settings, `S` opens a shell,
+`q` quits. There is one set of keys, not one set per place you happen to be
+standing.
 
-**Sizes belong to the tab.** A server you set up wide is still wide when you
-come back to it, and the tab beside it keeps its own arrangement. A new tab
-opens with the sizes that were on screen, so setting up a split once carries
-into the next connection rather than snapping back, and `=` puts the tab on
-screen back to an even split without touching the others. Workspaces write the
-sizes down with everything else they remember.
+On top of those it adds the four that only make sense while sshman is holding
+the keyboard:
 
-Zoom is not a size, so it does not belong to a tab: it follows you across them,
-as described below.
+| | |
+|---|---|
+| `↑` `↓` `←` `→` | move to the pane that way, without going into it |
+| `↵` | hand the keyboard to the pane you have moved to |
+| `Shift-↑↓←→` | move the border nearest it |
+| `Esc` / `Ctrl-]` | put the keyboard back where it was |
+
+The arrows move without handing anything over, so they **walk past a shell
+rather than falling into it** — you can cross three panes to reach the fourth
+and only then press `↵`. The pane the arrows are on says ` ↵ use this pane ` on
+its bottom border, so there is never a question of which one that is. `↵` into
+a terminal puts you back to typing in it; `Esc` puts the keyboard back where
+you took it from.
+
+`h` `j` `k` `l` sit beside the arrows here, as they do in a file list. Where
+the arrows are already spoken for — in a file list, where they move the cursor
+— the same two ideas are spelled with `Alt`: `Alt-↑↓←→` moves the keyboard
+between panes and `Alt-Shift-↑↓←→` moves the border. It is one rule either way:
+**arrows move the keyboard, `Shift` and arrows move the border.**
+
+(`Ctrl-]` is the byte `0x1d`, which most terminals report as `Ctrl-5`. sshman
+takes both spellings — before, it only took the one, and the chord quietly did
+nothing on the terminals that send the other.)
+
+## Panes
+
+A tab is a set of panes, and the set is a tree: every pane is either something
+to look at — a file list, a terminal — or two arrangements sharing the space,
+with a percentage saying how the space between them is divided. What sshman
+opens with is not a special case, it is just the tree you begin with:
+
+```
+Split{ across, 50%, Files(local), Files(remote) }
+```
+
+so splitting a pane, closing one, dragging a border and zooming are all one set
+of operations rather than one set per shape the screen might take.
+
+**Making panes.** `S` cuts the focused pane in two and puts a terminal in the
+half that opens up; `|` does the same sideways, and `T` puts another file list
+there instead. A pane is on the machine whose pane you split, so splitting the
+remote pane gives you a shell — or a second directory — on the server.
+
+**Closing panes.** `F9` closes the focused pane and its neighbour takes the
+space, from anywhere including inside a shell. Every pane also carries an
+`[✕]` in its corner, which closes *that* pane whether or not it has the
+keyboard — the quickest way to be rid of one you are not in. `S` from a file
+list still closes the last terminal that machine has open, the way it always
+has. The last pane on a tab cannot be closed; `W` closes the tab.
+
+**Moving between them.** `Tab` steps through the file lists in the order they
+are drawn, so with the two sshman opens with it crosses the middle, and with
+more it reaches every one of them. `Alt-↑↓←→` moves to the pane across the
+nearest border that way, and clicking one does the same. `F6` goes in and out
+of a terminal in one press, and `Ctrl-]` is [command mode](#command-mode).
+
+### More than one file list
+
+`T` gives the machine you are on a second file list, opening where the first
+one is looking, and `f` points it somewhere else. There can be as many as you
+have room for, on either machine or both — two directories of a server side by
+side, or of your own machine, or the four of them at once.
+
+Everything that acts between two panes acts between **the focused list and the
+one marked `c copies here`**: the other one when there are two, and otherwise
+the one you were in last. It is drawn on the pane itself, so there is nothing
+to work out.
+
+```
+┏ THIS MACHINE 1 ~/src ━━━━━━━━━[✕][⤢]┓┌ THIS MACHINE 2 ~/src/ui ──[✕][⤢]┐
+┃ -rw-r--r--  229K app.rs             ┃│ -rw-r--r--  8.1K pane.rs        │
+┃ -rw-r--r--  8.1K archive.rs         ┃│ -rw-r--r--  13K  hints.rs       │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━ 20 items ━┛└ c copies here ────── 2 items ───┘
+```
+
+`c` between two lists on the same machine runs one `cp -a` **there** — nothing
+is copied down and sent back — so it is as fast as that machine is, works under
+sudo, and keeps modes, ownership and timestamps. Across the middle it is still
+an upload or a download. Either way `t` points the marked list at the directory
+you are in, and `M`/`P` still cut and paste within one machine.
+
+**Ready-made arrangements.** `A` offers four, and each is a starting point
+rather than a mode sshman is in — anything they build can be built by hand:
+
+| | |
+|---|---|
+| Side by side | this machine and the server, the way sshman opens |
+| One pane | the pane you are on, filling the tab |
+| Two lists here | two directories of the same machine, to copy between |
+| Files and a terminal | a narrow file list, and a terminal beside it |
+| Editor | a file list, your editor beside it, a terminal underneath |
+
+Rearranging closes the terminals the new arrangement has no room for, the same
+as closing their panes one at a time: an arrangement is what is on screen, and
+nothing is left running out of sight.
+
+**Sizes.** `Alt-←` and `Alt-→` move the border nearest the focused pane;
+`Alt-↑` and `Alt-↓` do the same up and down. Dragging any border with the mouse
+does it too. No pane is ever cut below eight columns or three rows, and no
+border can be pushed past a tenth of the space it divides.
+
+**The arrangement belongs to the tab.** A server you set up wide is still wide
+when you come back to it, and the tab beside it keeps its own shape. A new tab
+opens with the arrangement that was on screen — minus the panes belonging to
+the tab you were on, whose terminals are not the new one's to show — and `=`
+evens the borders up on the tab on screen without touching the others.
+Workspaces write the whole arrangement down with everything else they remember.
+
+Zoom is not part of the arrangement, so it does not belong to a tab: it follows
+you across them, as described below.
 
 `m` gives the whole screen to whatever is focused, and `m`, `F3` or `Esc` gives
 the other panes back. Every pane also carries a button in its top-right corner
 — `[⤢]` to maximise, `[⤡]` to put it back — so the mouse can do it too, and
-clicking the far pane's button blows up that pane rather than the focused one.
+clicking another pane's button blows up that pane rather than the focused one.
 
 The zoom follows the focus rather than pinning one pane, so `Tab` and `F6` work
-zoomed exactly as they do at any other size: you stay
-zoomed, on whatever you moved to. `F3` does the same job from inside a shell,
-where every other key belongs to the shell — including `m`.
+zoomed exactly as they do at any other size: you stay zoomed, on whatever you
+moved to. `F3` does the same job from inside a shell, where every other key
+belongs to the shell — including `m`.
 
 A zoomed shell is resized on the far end like any other, so full-screen `top`
 or `vim` gets the whole terminal.
 
-Each tab remembers whether you were in its files or in its shell. Switching
-tabs while zoomed into a shell shows the other tab's shell, or its file list
-when that tab has no shell open — and coming back puts you in the shell you
-left, still running. Unzoomed both are on screen either way, so switching tabs
-there leaves the keyboard on the file list rather than dropping it into a shell
-that would swallow the `Ctrl-←`/`Ctrl-→` you are cycling with.
+Each tab remembers which pane had the keyboard. Switching tabs while zoomed
+into a shell shows the other tab's shell, or its file list when that tab has
+none — and coming back puts you in the shell you left, still running. Unzoomed
+both are on screen either way, so switching tabs there leaves the keyboard on
+the file list rather than dropping it into a shell that would swallow the
+`Ctrl-←`/`Ctrl-→` you are cycling with. The local file list is the same pane on
+every tab, so being on it when you switch means staying on it.
 
 ## Moving files about within one side
 
-With both panes on screen `c` copies across the middle. There is no across when
-one pane fills the screen, so there `c` picks the selection up instead and `P`
-puts it down in whatever directory you have navigated to since. `M` is the same
-but a move. The title bar shows what is being carried until it lands, and `Esc`
-drops it.
+With another file list on screen `c` copies into it. There is no other list
+when it is not there — zoomed, on a tab that is only this machine, or in an
+arrangement with no room for one — so there `c` picks the selection up instead
+and `P` puts it down in whatever directory you have navigated to since. `M` is
+the same but a move. The title bar shows what is being carried until it lands,
+and `Esc` drops it.
 
 Both halves of a paste run as one `cp -a` or `mv` on one machine — nothing is
 copied down and sent back — so it is as fast as the server is, works under sudo,
 and keeps modes, ownership and timestamps. Files never leave the side they came
 from: a clipboard picked up on the remote pane will not paste into the local one
-(`c` on an unzoomed pane is the key that copies between the two).
+(`c` with another list on screen is the key that copies between the two).
 
 Unlike `c`, a paste never overwrites. If any name is already taken in the
 destination, the whole paste stops and says which one, leaving everything as it
@@ -291,7 +407,9 @@ your own disk with marks rather than typed paths.
 
 `s` turns on sudo there too. That is real `sudo`, asking for your password and
 feeding it to `sudo -S` on stdin exactly as the server side does, so a local tab
-can browse and write root-owned places your own account cannot.
+can browse and write root-owned places your own account cannot. That is the one
+case where `e` does not open a file in place: a root-owned file is not yours to
+open, so it is fetched as root, edited, and pushed back as root.
 
 The one thing it cannot do is install an SSH key, since there is no login to set
 up. Forwarded ports are equally beside the point, so a workspace saves a local
@@ -346,33 +464,50 @@ you first connect.
 
 ## Tabs: several servers at once
 
-`C` opens the connection screen again and the server you pick arrives as a new
-tab; `W` closes the one on screen. `Ctrl-←`/`Ctrl-→` move between them, `Alt-1`
+Clicking the `[+]` at the right of the top bar opens a tab straight away, on
+this machine, in the directory you were looking at — a new tab asks you
+nothing, and `L` does the same from the keyboard. `C` opens the connection
+screen instead, and the server you pick arrives as its own tab. `W` closes the
+one on screen. `Ctrl-←`/`Ctrl-→` move between them, `Alt-1`
 … `Alt-9` jump straight to one, and clicking a tab works too. The bar only
 appears once you have more than one.
 
 ```
  sshman  deploy@web01  tab 1/3
- 1 deploy@web01    2 root@db1:2222 #    3 me@10.0.0.5 ⟳     C new · W close · Ctrl-←/→ switch
+ 1 deploy@web01    2 root@db1:2222 #    3 me@10.0.0.5 ⟳    + or L new tab · C connect · W close · Ctrl-←/→ switch
+```
+
+With more tabs than the row can hold it becomes a window on to them, always
+showing the one you are on, with `‹3` and `4›` at the ends saying how many did
+not fit — clicking either steps that way. Names shorten as the tabs pile up
+rather than the row running off the screen, and the reminder of the keys at the
+end gives up its space first.
+
+```
+ ‹3  4 web04   5 web05   6 db1 #   7 cache ⟳   2›
 ```
 
 A `#` marks a tab in sudo mode and `⟳` one that is reconnecting. Each tab is a
-separate SSH connection with its own directory, marks, filter, shell, sudo
+separate SSH connection with its own panes, directories, marks, filter, sudo
 state and transfers — a large copy on one tab does not hold up another, and
-turning on sudo in one does not touch the rest. The local pane is shared, since
-there is only one of your machine.
+turning on sudo in one does not touch the rest. The lists and terminals on
+*your* machine are shared, since there is only one of it: each tab's
+arrangement decides which of them it shows, and a shell left running in one tab
+is still running when another shows it.
 
 ## Shells in the panes
 
-Press `S` and a real shell opens under the focused file tree — a local shell
-under the local pane, a shell on the server under the remote pane. Both can be
-open at once. They are proper terminals, not a command box: `vim`, `top`,
-`less`, colours and Ctrl-C all behave, because each one runs on a pty with a
-terminal emulator behind it.
+Press `S` and a real shell opens under the focused pane — a local shell under
+the local pane, a shell on the server under the remote pane. `|` puts one
+beside it instead. As many as you like, on either machine. They are proper
+terminals, not a command box: `vim`, `top`, `less`, colours and Ctrl-C all
+behave, because each one runs on a pty with a terminal emulator behind it.
 
-`F6` (or `Ctrl-]`) moves the keyboard between the file list and the shell. While
-the shell has focus **every** key goes to it, including `Ctrl-C`, `Esc` and `q`
-— `F6` is the way back out. The footer says so whenever a shell is focused.
+`F6` moves the keyboard between the file list and the shell. While the shell
+has focus **every** key goes to it, including `Ctrl-C`, `Esc` and `q` — `F6` is
+the way back out, and `Ctrl-]` is [command mode](#command-mode), which reaches
+the rest of sshman without leaving the shell at all. The footer says so
+whenever a shell is focused.
 
 - The local shell starts in the local pane's directory, running `$SHELL`.
 - The remote shell starts in the remote pane's directory.
@@ -380,9 +515,39 @@ the shell has focus **every** key goes to it, including `Ctrl-C`, `Esc` and `q`
 - Full-screen programs work: `vim`, `top`, `btop`. One that asks for the mouse
   is given it — clicks, drags and the wheel all reach it — and `Shift` with the
   wheel scrolls the pane's own history regardless.
-- Pasting into a focused shell works (bracketed paste).
+- Pasting into a focused shell works, and is handed on as a bracketed paste
+  when the program inside has asked for one — so a multi-line paste lands in
+  the shell's line editor instead of running line by line before you have read
+  it.
 - When a shell exits, the pane says so; `S` closes it, `S` again starts a fresh
   one.
+- A terminal belongs to the tab whose pane you opened it in. Switching tabs
+  hides it rather than ending it, and it is still there when you come back.
+
+### Selecting text in a shell
+
+Drag across a shell pane and the text is picked out, marked by turning those
+cells inside out — sshman has no background of its own to paint over them, and
+reversing whatever the program drew reads as a selection in any theme. The
+selection runs in reading order, the whole of every row between its two ends,
+and a row that wrapped runs on into the next rather than gaining a newline that
+was never typed.
+
+Letting the button up copies it, the way selecting in a terminal does. It goes
+to the system clipboard through the terminal itself (OSC 52), which is the only
+way that works when sshman is at the far end of an SSH connection: there is no
+display to talk to, only the terminal, and the terminal owns the clipboard.
+Some terminals need it turned on — `set-clipboard on` in tmux, `clipboard_control`
+in kitty. sshman keeps the text either way, so `Y` types it into any shell pane
+whether or not the clipboard could be reached — and `y` copies the selection
+again, for when a drag reached the clipboard but you would rather it had not.
+
+Scrollback is included: scroll back with the wheel and drag over what you find
+there. A program that has asked for the mouse — `btop`, `vim`, a pager — gets
+the drag instead, and holding `Shift` is the way past it, the same escape hatch
+a terminal gives you. Anything that redraws what is under a selection — a
+keystroke, a scroll, a resize — lets go of it rather than leaving a highlight
+over text that has moved on.
 
 The remote shell opens **its own SSH connection**, reusing the same host-key
 and authentication path. That is deliberate: file transfers are driven by
@@ -444,8 +609,9 @@ link drops, and its pane says `[exited]`. `S` twice starts a new one.
 
 ## Themes
 
-Press `,`, pick **Theme**, and `↵` (or `←`/`→`) steps through them. The screen
-redraws as you go, so you are choosing by looking rather than by guessing.
+Press `,`, pick **Theme**, and `↵` (or `←`/`→`) steps through them — the seven
+below, and any of your own. The screen redraws as you go, so you are choosing
+by looking rather than by guessing.
 
 | | |
 |---|---|
@@ -470,10 +636,55 @@ the program running in it paints its own colours anyway.
 
 Every colour in the interface is one of twelve roles — accent, dim, text,
 muted, good, warn, bad, dir, link, exec, info, and the text drawn on a coloured
-chip — so a new theme is a table of twelve values in `src/theme.rs` and a line
-in `Theme::ALL`. Nothing else has to know about it. There is a test that walks
-every screen in every theme and fails if a single cell is painted a colour the
-theme did not choose, so a hard-coded colour cannot creep back in.
+chip. There is a test that walks every screen in every theme and fails if a
+single cell is painted a colour the theme did not choose, so a hard-coded
+colour cannot creep back in.
+
+### Themes of your own
+
+A theme is a file, not a table in the source. The seven above live in
+`themes/` and are built into the binary, so there is nothing to install; drop
+any `.json` file in `~/.config/sshman/themes/` and it is loaded beside them.
+A file that takes a name sshman already uses replaces it, which is how you
+rewrite one of ours without forking anything.
+
+```json
+{
+  "name": "midnight",
+  "about": "anything you like — JSON has nowhere else to put a comment",
+
+  "accent": "#7aa2f7",
+  "dim": "#3b4261",
+  "text": "#c0caf5",
+  "muted": "#9aa5ce",
+  "good": "#9ece6a",
+  "warn": "#e0af68",
+  "bad": "#f7768e",
+  "dir": "#7dcfff",
+  "link": "#bb9af7",
+  "exec": "#9ece6a",
+  "info": "#2ac3de",
+  "on_accent": "#1a1b26"
+}
+```
+
+Colours are written as `#rrggbb`, as `#rgb`, as one of the sixteen terminal
+colours by name (`cyan`, `dark gray`, `bright-red`), or as a number from 0 to
+255 for a slot in the 256-colour cube.
+
+Every colour is optional. Give a `"base"` and what you leave out comes from
+there, so a theme that only wants a different accent is three lines:
+
+```json
+{ "name": "mine", "base": "gruvbox", "accent": "#d3869b" }
+```
+
+With no `base`, what is left out comes from `terminal`.
+
+The settings pane (`,`) counts the themes it found and names the directory to
+put more in. A file it could not use is listed there too, with the reason — a
+colour it does not recognise, a role spelled wrong, a `base` that is not
+there — rather than quietly going missing.
 
 ## Editing files
 
@@ -487,8 +698,10 @@ instead:
 
 ```
 ╭ Settings ──────────────────────────────────────────────────────╮
-│  ▸ Editor    hx  (set here)                                    │
-│              the program e opens files with                    │
+│  ▸ Editor     hx  (set here)                                   │
+│               the program e opens files with                   │
+│    Opens with \e:o {file}\r  (for your editor)                  │
+│               the keys that open {file} in an editor pane      │
 ╰──────────────────────── ↵ change · Del clears · Esc closes ────╯
 ```
 
@@ -509,14 +722,76 @@ useless. An empty answer clears it and hands you back to the environment, and
 `--editor <program>` overrides it for a single run without changing what is
 saved.
 
-For a remote file, sshman downloads it to a temp path, releases the terminal,
-runs your editor, and uploads it again when the editor exits. A file you did not
+A file **on this machine** is opened where it lies — its real path, with the
+rest of its directory around it. That is true of the left pane and of a "this
+machine" tab alike: they are the same filesystem, so they behave the same way,
+and a save is a save rather than a copy back.
+
+For a file on a server or in a container, sshman downloads it to a temp path,
+releases the terminal, runs your editor, and uploads it again when the editor
+exits. A file you did not
 change is not re-uploaded. If your editor exits non-zero, nothing is uploaded
 and sshman tells you where the downloaded copy is, so an edit is never lost.
+
+The editor is started **in the file's own directory**, not wherever sshman was
+launched, so anything that works out which project it is in by looking around
+itself — an LSP, a fuzzy finder, `git` — finds the right tree.
 
 Because the program is run through your shell, `code -w` and similar work as
 written. Use a *blocking* editor: `code` and `subl` need `-w`, or the editor
 returns immediately and sshman will think you made no changes.
+
+### The editor pane
+
+All of that is sshman standing aside for your editor. The other way is to give
+the editor a pane and leave it there: press `A`, pick **Editor**, and the tab
+becomes a file list down the left, your editor beside it, and a terminal
+underneath.
+
+```
+┌ THIS MACHINE ~/src ──[⤢]┐┌ EDITOR ────────────────────────────[⤢]┐
+│ drwxr-xr-x  <DIR> src/  ││ 1 # sshman                            │
+│ -rw-r--r--  30.5K README││ 2                                     │
+│ ...                     ││ ...                                   │
+└─────────────── 7 items ─┘└──────────────────────── F6 to focus ──┘
+                           ┌ SHELL ─────────────────────────────[⤢]┐
+                           │ ~/src$ cargo test                     │
+                           └──────────────────────── F6 to focus ──┘
+```
+
+Clicking a file in the list opens it in that pane, and `e` does the same from
+the keyboard. With no editor pane open a click only moves the cursor, as it
+always has — opening a file on a single click would be a surprise otherwise.
+
+The pane is a terminal on **the machine whose file list you are in**. Arrange
+the remote pane that way and the editor is running on the server, over that
+tab's own connection, editing the file where it lives: nothing is downloaded,
+nothing is pushed back, and a save is a save. (Sudo mode is the exception — a
+root-owned file still goes the long way round, since the shell in the pane
+cannot read it either.)
+
+sshman knows the keystrokes for vim, neovim, helix, kakoune and emacs. For any
+other editor it treats the pane as the shell prompt it is and runs your editor
+as a command, which works for anything. To spell it out yourself, press `,` and
+pick **Opens with**:
+
+```json
+// ~/.config/sshman/config.json
+{
+  "editor": "hx",
+  "editor_open": "\\e:o {file}\\r"
+}
+```
+
+`{file}` is the path, as it is: what the keys around it are typed into is the
+editor's own command line, not a shell, and every editor escapes differently —
+a path with spaces in it wants keys of your own. `\e` is escape, `\r` a return,
+`\t` a tab and `\C-x` a control character, so vim's is `\e:e {file}\r` — escape
+first, because the editor may well be in insert mode. An empty setting means
+"run it at the prompt", where the path *is* quoted for the shell.
+
+If you quit the editor, the pane goes with it; opening the next file starts a
+fresh one on that file.
 
 ## Sudo mode
 

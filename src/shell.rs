@@ -53,6 +53,49 @@ enum RemoteLaunch {
 }
 
 /// A running (or finished) shell session.
+/// Text picked out with the mouse, in the coordinates of what is on screen:
+/// the cell the drag started on and the one it has reached.
+///
+/// It runs in reading order rather than as a rectangle — the whole of every
+/// row between the two ends — which is what a terminal selection has always
+/// meant and what the text of it has to agree with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Selection {
+    anchor: (u16, u16),
+    head: (u16, u16),
+    /// The button is still down, so the far end still follows the mouse.
+    dragging: bool,
+}
+
+impl Selection {
+    /// The two ends, put back into reading order.
+    pub fn span(self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// Is anything actually picked out? A press with no drag is not a
+    /// selection, it is a click.
+    pub fn is_empty(self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// The columns of `row` that are in it, as a half-open range. Rows in the
+    /// middle are covered from end to end.
+    pub fn columns(self, row: u16, cols: u16) -> Option<(u16, u16)> {
+        let (start, end) = self.span();
+        if row < start.0 || row > end.0 {
+            return None;
+        }
+        let from = if row == start.0 { start.1 } else { 0 };
+        let to = if row == end.0 { end.1 + 1 } else { cols };
+        (from < to).then(|| (from, to.min(cols)))
+    }
+}
+
 pub struct Shell {
     parser: Arc<Mutex<vt100::Parser>>,
     tx: Sender<Msg>,
@@ -61,6 +104,11 @@ pub struct Shell {
     cols: u16,
     /// How far the view is scrolled back, in lines. Reset by any keystroke.
     scrollback: usize,
+    /// Text picked out with the mouse, if any. It is about what is on screen,
+    /// so anything that redraws what is on screen — a keystroke, a scroll, a
+    /// resize — lets go of it rather than leaving a highlight over text that
+    /// has moved on.
+    selection: Option<Selection>,
     pub label: String,
 }
 
@@ -79,6 +127,7 @@ impl Shell {
             rows,
             cols,
             scrollback: 0,
+            selection: None,
             label,
         };
         let parser_for_thread = Arc::clone(&parser);
@@ -94,6 +143,18 @@ impl Shell {
     /// container on this machine is entered, via `docker exec -it`.
     pub fn spawn_local_command(label: String, cmdline: String, rows: u16, cols: u16) -> Self {
         Self::spawn_local_inner(label, Path::new("."), Some(cmdline), rows, cols)
+    }
+
+    /// The same, but started in a directory of its own: how an editor pane on
+    /// this machine opens where the file list is looking.
+    pub fn spawn_local_in(
+        label: String,
+        cwd: &Path,
+        cmdline: String,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        Self::spawn_local_inner(label, cwd, Some(cmdline), rows, cols)
     }
 
     fn spawn_local_inner(
@@ -187,6 +248,8 @@ impl Shell {
         }
         self.rows = rows;
         self.cols = cols;
+        // The grid it was picked out of is about to be a different shape.
+        self.selection = None;
         {
             let mut guard = self.parser.lock().unwrap_or_else(|e| e.into_inner());
             guard.screen_mut().set_size(rows, cols);
@@ -195,6 +258,7 @@ impl Shell {
     }
 
     pub fn send_key(&mut self, key: KeyEvent) {
+        self.selection = None;
         if let Some(bytes) = encode_key(&key) {
             // Typing should snap the view back to the prompt, the way a real
             // terminal does.
@@ -228,13 +292,98 @@ impl Shell {
         true
     }
 
+    /// Start picking text out at a cell.
+    pub fn begin_selection(&mut self, row: u16, col: u16) {
+        let at = self.clamp(row, col);
+        self.selection = Some(Selection {
+            anchor: at,
+            head: at,
+            dragging: true,
+        });
+    }
+
+    /// Follow the mouse while the button is down.
+    pub fn drag_selection(&mut self, row: u16, col: u16) {
+        let at = self.clamp(row, col);
+        if let Some(selection) = &mut self.selection
+            && selection.dragging
+        {
+            selection.head = at;
+        }
+    }
+
+    /// The button came up. Hands back what was picked out, if anything.
+    pub fn end_selection(&mut self) -> Option<String> {
+        let selection = self.selection.as_mut()?;
+        selection.dragging = false;
+        if selection.is_empty() {
+            // A click, not a drag.
+            self.selection = None;
+            return None;
+        }
+        self.selected_text()
+    }
+
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection.filter(|s| !s.is_empty())
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// The text of what is picked out, as the terminal itself would give it:
+    /// a row that wrapped runs on into the next rather than gaining a newline
+    /// that was never typed.
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection()?.span();
+        let text =
+            self.with_screen(|screen| screen.contents_between(start.0, start.1, end.0, end.1 + 1));
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// A mouse position, brought inside the grid.
+    fn clamp(&self, row: u16, col: u16) -> (u16, u16) {
+        (
+            row.min(self.rows.saturating_sub(1)),
+            col.min(self.cols.saturating_sub(1)),
+        )
+    }
+
+    /// Put text in as though it had been pasted.
+    ///
+    /// A program that has asked for bracketed paste gets it bracketed, which
+    /// is what stops a shell running the lines of a multi-line paste one after
+    /// another before you have looked at them.
     pub fn paste(&mut self, text: &str) {
+        self.set_scrollback(0);
+        let bracketed = self.with_screen(|screen| screen.bracketed_paste());
+        let mut bytes = Vec::with_capacity(text.len() + 12);
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[200~");
+        }
+        bytes.extend_from_slice(text.as_bytes());
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[201~");
+        }
+        let _ = self.tx.send(Msg::Bytes(bytes));
+    }
+
+    /// Type into the terminal as though the keys had been pressed: the bytes
+    /// go in exactly as given.
+    ///
+    /// How a file picked in a file list reaches the editor running in an
+    /// editor pane. It is deliberately *not* a paste: an editor that has asked
+    /// for bracketed paste would take `\e:e file\r` as text to insert rather
+    /// than as the keys to open something.
+    pub fn type_in(&mut self, text: &str) {
         self.set_scrollback(0);
         let _ = self.tx.send(Msg::Bytes(text.as_bytes().to_vec()));
     }
 
     /// Scroll the view; positive scrolls back into history.
     pub fn scroll(&mut self, lines: isize) {
+        self.selection = None;
         let target = (self.scrollback as isize + lines).max(0) as usize;
         self.set_scrollback(target.min(SCROLLBACK));
     }
@@ -1057,11 +1206,100 @@ mod tests {
         assert!(encode_key(&key(KeyCode::F(20), KeyModifiers::NONE)).is_none());
     }
 
+    fn selection(anchor: (u16, u16), head: (u16, u16)) -> Selection {
+        Selection {
+            anchor,
+            head,
+            dragging: false,
+        }
+    }
+
+    #[test]
+    fn a_selection_reads_the_same_dragged_either_way() {
+        let forwards = selection((1, 4), (3, 2));
+        let backwards = selection((3, 2), (1, 4));
+        assert_eq!(forwards.span(), ((1, 4), (3, 2)));
+        assert_eq!(
+            backwards.span(),
+            forwards.span(),
+            "dragging up is dragging down"
+        );
+    }
+
+    #[test]
+    fn a_press_with_no_drag_is_a_click_rather_than_a_selection() {
+        assert!(selection((2, 5), (2, 5)).is_empty());
+        assert!(!selection((2, 5), (2, 6)).is_empty());
+    }
+
+    #[test]
+    fn a_selection_covers_whole_rows_between_its_ends() {
+        // Reading order, not a rectangle: from part-way along one row, through
+        // everything between, to part-way along another.
+        let s = selection((1, 4), (3, 2));
+        assert_eq!(s.columns(0, 80), None, "above it");
+        assert_eq!(s.columns(1, 80), Some((4, 80)), "from the cell it started");
+        assert_eq!(s.columns(2, 80), Some((0, 80)), "all of the row between");
+        assert_eq!(
+            s.columns(3, 80),
+            Some((0, 3)),
+            "up to and including the end"
+        );
+        assert_eq!(s.columns(4, 80), None, "below it");
+    }
+
+    #[test]
+    fn a_selection_on_one_row_is_the_cells_between_its_ends() {
+        let s = selection((2, 3), (2, 6));
+        assert_eq!(s.columns(2, 80), Some((3, 7)));
+        // And never wider than the pane, however far the mouse went.
+        assert_eq!(selection((2, 3), (2, 200)).columns(2, 80), Some((3, 80)));
+    }
+
+    #[test]
+    fn text_is_picked_out_of_the_screen_and_let_go_of_when_it_moves() {
+        let mut shell = Shell::spawn_local(Path::new("/"), 24, 80);
+        shell.type_in("printf 'alpha\\nbravo\\n'\n");
+
+        // A row of its own, not the echoed command line that also holds the
+        // word: what is being picked out here is the output.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let at = loop {
+            let rows: Vec<String> = shell.with_screen(|s| s.rows(0, 80).collect());
+            if let Some(at) = rows.iter().position(|r| r.trim() == "alpha")
+                && rows.get(at + 1).is_some_and(|r| r.trim() == "bravo")
+            {
+                break at as u16;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never printed anything:\n{}",
+                shell.with_screen(|s| s.contents())
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+
+        shell.begin_selection(at, 0);
+        shell.drag_selection(at + 1, 4);
+        let text = shell.end_selection().expect("something was picked out");
+        assert_eq!(text, "alpha\nbravo");
+
+        // Anything that redraws what is under it lets the selection go, rather
+        // than leaving a highlight over text that has moved on.
+        shell.begin_selection(at, 0);
+        shell.drag_selection(at, 4);
+        assert!(shell.selection().is_some());
+        shell.scroll(3);
+        assert!(shell.selection().is_none());
+
+        shell.type_in("exit\n");
+    }
+
     #[test]
     fn local_shell_runs_a_command_and_reports_exit() {
         // A real pty, a real shell: the whole local path end to end.
         let mut shell = Shell::spawn_local(Path::new("/"), 24, 80);
-        shell.paste("echo embedded-shell-works\n");
+        shell.type_in("echo embedded-shell-works\n");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -1078,7 +1316,7 @@ mod tests {
         }
 
         assert!(shell.is_alive());
-        shell.paste("exit\n");
+        shell.type_in("exit\n");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while shell.is_alive() {
             assert!(

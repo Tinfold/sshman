@@ -11,8 +11,10 @@ use ratatui::widgets::{
 
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, ConnectFocus, ConnectForm, Level, LinkState, Mode, Pane, Region, Side};
+use crate::app::{App, Arrangement, ConnectFocus, ConnectForm, Level, LinkState, Mode, Pane, Side};
 use crate::config::Setting;
+use crate::layout::{Areas, Slot};
+use crate::shell::Shell;
 use crate::theme::Theme;
 use crate::types::{EntryKind, FileEntry, ellipsize, fmt_time, human_size};
 
@@ -38,31 +40,28 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_tab_bar(f, app, rows[1]);
     }
 
-    // Recorded for the mouse, and cleared first so a pane that is not drawn
-    // this frame cannot be clicked on where it used to be.
-    app.panes_area = rows[2];
-    app.files_area = [Rect::ZERO; 2];
-    app.shell_area = [None, None];
-    app.shell_inner = [None, None];
-    app.zoom_buttons.clear();
-    app.divider_x = None;
+    // A pane whose terminal has gone is not drawn where it used to be, and
+    // the keyboard is never left pointing at one.
+    app.settle_focus();
 
-    if app.zoomed {
-        draw_side(f, app, app.focus, rows[2], Some(app.region));
-    } else if app.on_local_tab() {
-        // A tab on this machine is one pane: putting the local half beside it
-        // would be the same filesystem drawn twice.
-        draw_side(f, app, Side::Remote, rows[2], None);
-    } else {
-        let left = app.layout.split_pct;
-        let cols = Layout::horizontal([
-            Constraint::Percentage(left),
-            Constraint::Percentage(100 - left),
-        ])
-        .split(rows[2]);
-        app.divider_x = Some(cols[1].x);
-        draw_side(f, app, Side::Local, cols[0], None);
-        draw_side(f, app, Side::Remote, cols[1], None);
+    // Recorded for the mouse, and worked out once here so a click is matched
+    // against exactly what was drawn.
+    app.panes_area = rows[2];
+    app.areas = match app.zoomed {
+        // Zoomed, the focused pane is the arrangement: there are no borders
+        // to drag and nothing else to click on.
+        true => Areas {
+            panes: vec![(app.focus, rows[2])],
+            dividers: Vec::new(),
+        },
+        false => app.layout.areas(rows[2]),
+    };
+    app.term_inner.clear();
+    app.zoom_buttons.clear();
+    app.close_buttons.clear();
+
+    for (slot, rect) in app.areas.panes.clone() {
+        draw_slot(f, app, slot, rect);
     }
 
     if gauge_h == 1 {
@@ -76,6 +75,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Picker => draw_picker(f, app, area),
         Mode::Workspaces => draw_workspaces(f, app, area),
         Mode::Settings => draw_settings(f, app, area),
+        Mode::Arrange => draw_arrange(f, app, area),
         Mode::Forwards => draw_forwards(f, app, area),
         Mode::Prompt => draw_prompt(f, app, area),
         Mode::Confirm => draw_confirm(f, app, area),
@@ -85,7 +85,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
+/// `[+]`, in cells.
+const NEW_TAB_W: u16 = 3;
+
+/// Where the new-tab button goes: the end of the top bar, which is there
+/// whatever else is — unlike the row of tabs, which only appears once there
+/// is more than one of them, and so is missing exactly when you want another.
+fn new_tab_button_area(area: Rect) -> Rect {
+    Rect {
+        x: area.right().saturating_sub(NEW_TAB_W + 1),
+        y: area.y,
+        width: NEW_TAB_W,
+        height: 1,
+    }
+}
+
+fn draw_title_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     let mut spans = vec![
         Span::styled(
@@ -196,6 +211,64 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // Drawn last so a long title cannot bury it, and only where it works:
+    // the keys it stands in for are the browsing keys.
+    app.new_tab_button = None;
+    if app.mode == Mode::Browse && area.width > NEW_TAB_W + 8 {
+        let rect = new_tab_button_area(area);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "[+]",
+                Style::new().fg(theme.accent).bold(),
+            ))),
+            rect,
+        );
+        app.new_tab_button = Some(rect);
+    }
+}
+
+/// `‹12 `: a chevron, a count of tabs that way, and a space.
+const TAB_MARK: u16 = 5;
+
+/// How much of a tab's name survives when there are several. Enough to tell
+/// two servers apart, and never so wide that one tab crowds the rest out.
+fn tab_title_budget(width: u16, tabs: usize) -> usize {
+    (width as usize / tabs.max(1))
+        .saturating_sub(8)
+        .clamp(6, 24)
+}
+
+/// The run of tabs that fits, always including the one on screen.
+///
+/// Widening from the active tab outwards rather than scrolling from the left
+/// keeps the tab you are looking at on screen without the row jumping about:
+/// stepping one along moves the window by one, and only when it has to.
+fn tab_window(widths: &[u16], active: usize, room: u16) -> std::ops::Range<usize> {
+    if widths.iter().sum::<u16>() <= room {
+        return 0..widths.len();
+    }
+    // Room for a marker at each end, saying how many did not fit.
+    let room = room.saturating_sub(TAB_MARK * 2);
+    let (mut first, mut last) = (active, active);
+    let mut used = widths.get(active).copied().unwrap_or(0);
+    loop {
+        let mut grew = false;
+        if last + 1 < widths.len() && used + widths[last + 1] <= room {
+            used += widths[last + 1];
+            last += 1;
+            grew = true;
+        }
+        if first > 0 && used + widths[first - 1] <= room {
+            used += widths[first - 1];
+            first -= 1;
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    first..last + 1
 }
 
 /// The row of open servers. Each chip carries its number, so `Alt-<n>` is
@@ -203,133 +276,175 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
 fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     app.tab_bar_row = Some(area.y);
+
+    let budget = tab_title_budget(area.width, app.tabs.len());
+    let chips: Vec<String> = app
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            let marker = match tab.link {
+                LinkState::Live => "",
+                LinkState::Reconnecting => " ⟳",
+                LinkState::Lost => " ✗",
+            };
+            let sudo = if tab.sudo { " #" } else { "" };
+            format!(
+                " {} {}{sudo}{marker} ",
+                index + 1,
+                ellipsize(&tab.title(), budget)
+            )
+        })
+        .collect();
+    // Each chip carries the space that follows it, so the widths add up to
+    // what the row actually takes.
+    let widths: Vec<u16> = chips.iter().map(|c| c.chars().count() as u16 + 1).collect();
+    let shown = tab_window(&widths, app.active, area.width);
+
     let mut spans = Vec::new();
     let mut x = area.x;
 
-    for (index, tab) in app.tabs.iter().enumerate() {
-        let active = index == app.active;
-        let marker = match tab.link {
-            LinkState::Live => "",
-            LinkState::Reconnecting => " ⟳",
-            LinkState::Lost => " ✗",
-        };
-        let sudo = if tab.sudo { " #" } else { "" };
-        let text = format!(" {} {}{sudo}{marker} ", index + 1, tab.title());
+    // What did not fit, on either side. Clicking one steps that way, which is
+    // the only thing the mark could sensibly mean.
+    if shown.start > 0 {
+        let text = format!("‹{} ", shown.start);
         let width = text.chars().count() as u16;
+        spans.push(Span::styled(text, Style::new().fg(theme.dim)));
+        app.tab_spans.push((x, x + width, shown.start - 1));
+        x += width;
+    }
 
+    for index in shown.clone() {
+        let active = index == app.active;
         let style = if active {
             Style::new().fg(theme.on_accent).bg(theme.accent).bold()
-        } else if tab.link != LinkState::Live {
+        } else if app.tabs[index].link != LinkState::Live {
             Style::new().fg(theme.bad)
         } else {
             Style::new().fg(theme.muted)
         };
-        spans.push(Span::styled(text, style));
+        let width = chips[index].chars().count() as u16;
+        spans.push(Span::styled(chips[index].clone(), style));
         spans.push(Span::raw(" "));
-
         app.tab_spans.push((x, x + width, index));
         x += width + 1;
-        if x >= area.right() {
-            break;
-        }
     }
-    spans.push(Span::styled(
-        "  C new · W close · Ctrl-←/→ switch",
-        Style::new().fg(theme.dim),
-    ));
+
+    if shown.end < app.tabs.len() {
+        let hidden = app.tabs.len() - shown.end;
+        let text = format!("{hidden}› ");
+        let width = text.chars().count() as u16;
+        spans.push(Span::styled(text, Style::new().fg(theme.dim)));
+        app.tab_spans.push((x, x + width, shown.end));
+        x += width;
+    }
+
+    // The reminder of what the keys are, but only where there is room for it:
+    // with the row full of tabs, the tabs are the useful half.
+    const HINT: &str = "  + or L new tab · C connect · W close · Ctrl-←/→ switch";
+    if x + HINT.chars().count() as u16 <= area.right() {
+        spans.push(Span::styled(HINT, Style::new().fg(theme.dim)));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// One side of the screen: the file list, and its shell underneath when open.
-/// How one side's area divides between its file list and its shell.
-///
-/// `zoom` is the region that has been given the whole screen. A zoomed shell
-/// that has since been closed leaves nothing to draw, so the files take the
-/// space back rather than the screen going blank.
-fn side_areas(
-    area: Rect,
-    zoom: Option<Region>,
-    has_shell: bool,
-    shell_height: u16,
-) -> (Rect, Option<Rect>) {
-    match zoom {
-        Some(Region::Shell) if has_shell => (Rect::ZERO, Some(area)),
-        Some(_) => (area, None),
-        None if has_shell => {
-            // Always leave the file list at least three rows, however far the
-            // shell has been grown.
-            let height = shell_height.min(area.height.saturating_sub(3)).max(3);
-            let parts =
-                Layout::vertical([Constraint::Min(3), Constraint::Length(height)]).split(area);
-            (parts[0], Some(parts[1]))
-        }
-        None => (area, None),
+/// One pane, wherever the arrangement put it.
+fn draw_slot(f: &mut Frame, app: &mut App, slot: Slot, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let buttons = place_buttons(app, slot, area);
+    let focused = app.focus == slot;
+    match slot {
+        Slot::Files { .. } => draw_files(f, app, slot, area, focused, buttons),
+        Slot::Term { .. } => draw_shell(f, app, slot, area, focused, buttons),
+    }
+    // With the keyboard handed to sshman, the focused pane is the one the
+    // arrows are pointing at rather than the one being typed in — worth
+    // saying on the pane itself, since ↵ is what tells them apart.
+    if focused && app.commanding && area.width >= MIN_WIDTH_FOR_BUTTON {
+        let theme = app.theme;
+        let chip = Line::from(Span::styled(
+            " ↵ use this pane ",
+            Style::new().fg(theme.on_accent).bg(theme.accent).bold(),
+        ));
+        let at = Rect {
+            x: area.x + 2,
+            y: area.bottom().saturating_sub(1),
+            width: (area.width - 3).min(17),
+            height: 1,
+        };
+        f.render_widget(chip, at);
     }
 }
 
-/// One side of the screen: its file list, and its shell below when there is
-/// one.
-fn draw_side(f: &mut Frame, app: &mut App, side: Side, area: Rect, zoom: Option<Region>) {
-    let (files_area, shell_area) =
-        side_areas(area, zoom, app.has_shell(side), app.layout.shell_height);
-
-    app.files_area[side.index()] = files_area;
-    app.shell_area[side.index()] = shell_area;
-
-    let label = match side {
+/// What a file list is called: whose it is, and — with more than one on that
+/// machine — which of them, counted in the order they are drawn rather than by
+/// the number the pane happens to hold.
+fn files_label(app: &App, slot: Slot) -> String {
+    let base = match slot.host() {
         Side::Local => "LOCAL",
         // A tab pointed at this machine has no remote side to speak of, and
         // calling it one beside the pane it is a copy of would be a lie.
         Side::Remote if app.tab().is_some_and(|t| t.is_local()) => "THIS MACHINE",
         Side::Remote => "REMOTE",
     };
-    let path = app.path_of(side);
+    match app.tree_number(slot) {
+        Some(n) => format!("{base} {n}"),
+        None => base.to_string(),
+    }
+}
+
+/// A file list, and everything the border around it has to say.
+fn draw_files(
+    f: &mut Frame,
+    app: &mut App,
+    slot: Slot,
+    area: Rect,
+    focused: bool,
+    buttons: Buttons,
+) {
+    let side = slot.host();
+    let label = files_label(app, slot);
+    let target = app.target() == Some(slot);
+    let path = app.path_of(slot);
     let sudo = side == Side::Remote && app.sudo();
     let live = side == Side::Local || app.connected();
-    let files_focused = app.focus == side && app.region == Region::Files;
-    let shell_focused = app.focus == side && app.region == Region::Shell;
-
-    if files_area.height > 0 {
-        if files_area.width >= MIN_WIDTH_FOR_BUTTON && app.zoom_has_anything_to_hide() {
-            app.zoom_buttons
-                .push((zoom_button_area(files_area), side, Region::Files));
-        }
-        let (zoomed, offer_zoom, theme) = (app.zoomed, app.zoom_has_anything_to_hide(), app.theme);
-        draw_pane(
-            f,
-            files_area,
-            label,
-            &path,
-            app.pane_mut(side),
-            files_focused,
-            sudo,
-            live,
-            zoomed,
-            offer_zoom,
-            theme,
-        );
-    }
-
-    if let Some(area) = shell_area {
-        if area.width >= MIN_WIDTH_FOR_BUTTON {
-            app.zoom_buttons
-                .push((zoom_button_area(area), side, Region::Shell));
-        }
-        draw_shell(f, app, side, area, shell_focused);
-    }
+    let theme = app.theme;
+    draw_pane(
+        f,
+        area,
+        &label,
+        &path,
+        app.pane_mut(slot),
+        focused,
+        sudo,
+        live,
+        target,
+        buttons,
+        theme,
+    );
 }
 
 /// The embedded terminal. The vt100 screen borrows its parser, so the widget
 /// has to be built and rendered inside the lock.
-fn draw_shell(f: &mut Frame, app: &mut App, side: Side, area: Rect, focused: bool) {
+fn draw_shell(
+    f: &mut Frame,
+    app: &mut App,
+    slot: Slot,
+    area: Rect,
+    focused: bool,
+    buttons: Buttons,
+) {
     let theme = app.theme;
-    let alive = app.shell(side).map(|s| s.is_alive()).unwrap_or(false);
-    let label = app.shell(side).map(|s| s.label.clone()).unwrap_or_default();
-    let scrolled = app.shell(side).map(|s| s.scrollback()).unwrap_or(0);
+    let alive = app.shell(slot).map(|s| s.is_alive()).unwrap_or(false);
+    let label = app.shell(slot).map(|s| s.label.clone()).unwrap_or_default();
+    let scrolled = app.shell(slot).map(|s| s.scrollback()).unwrap_or(0);
+    let editor = app.term(slot).is_some_and(|t| t.is_editor());
 
     let colour = if !alive {
         theme.dim
-    } else if side == Side::Remote && app.sudo() {
+    } else if slot.host() == Side::Remote && app.sudo() {
         theme.bad
     } else if focused {
         theme.accent
@@ -338,7 +453,12 @@ fn draw_shell(f: &mut Frame, app: &mut App, side: Side, area: Rect, focused: boo
     };
 
     let mut title = vec![
-        Span::styled(" SHELL ", Style::new().fg(colour).bold()),
+        // An editor pane says so: it is the one a click in a file list opens
+        // things in, and looks like any other terminal otherwise.
+        Span::styled(
+            if editor { " EDITOR " } else { " SHELL " },
+            Style::new().fg(colour).bold(),
+        ),
         Span::styled(label, Style::new().fg(theme.text)),
     ];
     if !alive {
@@ -375,10 +495,7 @@ fn draw_shell(f: &mut Frame, app: &mut App, side: Side, area: Rect, focused: boo
         })
         .title_top(Line::from(title))
         .title_bottom(Line::from(hint).right_aligned());
-    let block = match area.width >= MIN_WIDTH_FOR_BUTTON {
-        true => block.title_top(zoom_button(theme, focused, app.zoomed)),
-        false => block,
-    };
+    let block = block.title_top(pane_buttons(theme, focused, buttons));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -387,9 +504,10 @@ fn draw_shell(f: &mut Frame, app: &mut App, side: Side, area: Rect, focused: boo
     }
     // What the program inside is drawing on, and so what a mouse event has to
     // be measured against.
-    app.shell_inner[side.index()] = Some(inner);
+    app.term_inner.push((slot, inner));
 
-    let Some(shell) = app.shell_mut(side) else {
+    let selection = app.shell(slot).and_then(Shell::selection);
+    let Some(shell) = app.shell_mut(slot) else {
         return;
     };
     // Keep the emulator and the far end matched to the space we actually drew.
@@ -399,6 +517,25 @@ fn draw_shell(f: &mut Frame, app: &mut App, side: Side, area: Rect, focused: boo
         f.render_widget(PseudoTerminal::new(screen), inner);
     });
 
+    // Text picked out with the mouse, marked by turning the cells inside out
+    // rather than by painting a colour over them — sshman has no background
+    // of its own to use, and reversing whatever the program drew reads as a
+    // selection in any theme, on any terminal.
+    if let Some(selection) = selection {
+        let buffer = f.buffer_mut();
+        for row in 0..inner.height {
+            let Some((from, to)) = selection.columns(row, inner.width) else {
+                continue;
+            };
+            for col in from..to {
+                let (x, y) = (inner.x + col, inner.y + row);
+                if x < inner.right() && y < inner.bottom() {
+                    buffer[(x, y)].modifier ^= Modifier::REVERSED;
+                }
+            }
+        }
+    }
+
     if let Some((row, col)) = cursor {
         let (x, y) = (inner.x + col, inner.y + row);
         if x < inner.right() && y < inner.bottom() {
@@ -407,30 +544,85 @@ fn draw_shell(f: &mut Frame, app: &mut App, side: Side, area: Rect, focused: boo
     }
 }
 
-/// The zoom button that sits in the top-right corner of every pane: a way to
-/// do with the mouse what `m` and `F3` do with the keyboard.
+/// What the buttons in a pane's corner should offer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Buttons {
+    /// The pane already has the whole screen.
+    pub zoomed: bool,
+    /// Zooming would change what is on screen.
+    pub zoom: bool,
+    /// There is another pane to give this one's space back to.
+    pub close: bool,
+}
+
+/// The buttons in the top-right corner of every pane: a way to do with the
+/// mouse what the keyboard does with `m` and `F9`.
 ///
-/// It is the same button either way round — it maximises a pane that is
+/// The zoom is the same button either way round — it maximises a pane that is
 /// sharing the screen, and restores one that has taken it all — so its glyph
 /// says which of the two it would do next.
-fn zoom_button(theme: Theme, focused: bool, zoomed: bool) -> Line<'static> {
+fn pane_buttons(theme: Theme, focused: bool, buttons: Buttons) -> Line<'static> {
     let style = if focused {
         Style::new().fg(theme.accent).bold()
     } else {
         Style::new().fg(theme.dim)
     };
-    Line::from(Span::styled(if zoomed { "[⤡]" } else { "[⤢]" }, style)).right_aligned()
+    let mut spans = Vec::new();
+    if buttons.close {
+        spans.push(Span::styled(
+            "[✕]",
+            if focused {
+                Style::new().fg(theme.bad).bold()
+            } else {
+                style
+            },
+        ));
+    }
+    if buttons.zoom {
+        spans.push(Span::styled(
+            if buttons.zoomed { "[⤡]" } else { "[⤢]" },
+            style,
+        ));
+    }
+    Line::from(spans).right_aligned()
 }
 
-/// Where that button was drawn. A right-aligned title ends one cell inside the
-/// corner, and [`BUTTON_W`] wide, which is what the mouse has to hit.
-fn zoom_button_area(area: Rect) -> Rect {
+/// Where a button was drawn, counting back from the corner: 0 is the
+/// rightmost. A right-aligned title ends one cell inside the corner, and each
+/// button is [`BUTTON_W`] wide, which is what the mouse has to hit.
+fn button_area(area: Rect, from_right: u16) -> Rect {
     Rect {
-        x: area.right().saturating_sub(BUTTON_W + 1),
+        x: area.right().saturating_sub(BUTTON_W * (from_right + 1) + 1),
         y: area.y,
         width: BUTTON_W,
         height: 1,
     }
+}
+
+/// Which buttons a pane gets, and where each of them lands.
+///
+/// The renderer records them as it goes, so a click is matched against what
+/// was actually drawn rather than against a second guess at the layout.
+fn place_buttons(app: &mut App, slot: Slot, area: Rect) -> Buttons {
+    let buttons = Buttons {
+        zoomed: app.zoomed,
+        zoom: app.zoom_has_anything_to_hide() && area.width >= MIN_WIDTH_FOR_BUTTON,
+        // Zoomed there is nothing on screen to give the space back to, and
+        // closing the one pane you can see would be a trapdoor.
+        close: !app.zoomed && app.layout.panes() > 1 && area.width >= MIN_WIDTH_FOR_TWO_BUTTONS,
+    };
+    // They are placed from the corner inwards, so a close button with no zoom
+    // beside it takes the corner itself.
+    let mut from_right = 0;
+    if buttons.zoom {
+        app.zoom_buttons.push((button_area(area, from_right), slot));
+        from_right += 1;
+    }
+    if buttons.close {
+        app.close_buttons
+            .push((button_area(area, from_right), slot));
+    }
+    buttons
 }
 
 /// `[⤢]`, in cells.
@@ -438,6 +630,10 @@ const BUTTON_W: u16 = 3;
 
 /// Panes too narrow for a button and a title both keep the title.
 const MIN_WIDTH_FOR_BUTTON: u16 = 24;
+
+/// Narrower than this and only the zoom fits; the close button is the one to
+/// go, since `F9` is not hidden behind a pane being wide enough.
+const MIN_WIDTH_FOR_TWO_BUTTONS: u16 = 34;
 
 #[allow(clippy::too_many_arguments)]
 fn draw_pane(
@@ -449,8 +645,9 @@ fn draw_pane(
     focused: bool,
     sudo: bool,
     live: bool,
-    zoomed: bool,
-    offer_zoom: bool,
+    // This is the list `c` copies into.
+    target: bool,
+    buttons: Buttons,
     theme: Theme,
 ) {
     let border_style = if focused {
@@ -466,10 +663,10 @@ fn draw_pane(
         Style::new().fg(theme.muted)
     };
 
-    let has_button = area.width >= MIN_WIDTH_FOR_BUTTON && offer_zoom;
-    // Reserve room for the label, the borders and the button when shortening
-    // the path, so a long one cannot push the button off the end.
-    let button_room = if has_button { BUTTON_W + 1 } else { 0 };
+    // Reserve room for the label, the borders and the buttons when shortening
+    // the path, so a long one cannot push them off the end.
+    let shown = u16::from(buttons.zoom) + u16::from(buttons.close);
+    let button_room = if shown > 0 { BUTTON_W * shown + 1 } else { 0 };
     let path_room = area
         .width
         .saturating_sub(label.len() as u16 + 6 + button_room) as usize;
@@ -509,10 +706,16 @@ fn draw_pane(
         .border_style(border_style)
         .title_top(title)
         .title_bottom(Line::from(bottom).right_aligned());
-    let block = match has_button {
-        true => block.title_top(zoom_button(theme, focused, zoomed)),
+    // Which list `c` copies into, said on the list itself: with more than two
+    // on screen, "the other pane" is not something you should have to work out.
+    let block = match target && area.width >= MIN_WIDTH_FOR_BUTTON {
+        true => block.title_bottom(Line::from(Span::styled(
+            " c copies here ",
+            Style::new().fg(theme.on_accent).bg(theme.accent),
+        ))),
         false => block,
     };
+    let block = block.title_top(pane_buttons(theme, focused, buttons));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -762,14 +965,34 @@ fn fit_hints<'a>(hints: &[Hint<'a>], width: u16) -> Vec<Hint<'a>> {
 /// last, because [`fit_hints`] cuts from the end but keeps the tail.
 const SHELL_ZOOMED: &[Hint] = &[
     ("F6", "back to files"),
+    ("Ctrl-]", "sshman keys"),
     ("F3", "unzoom"),
+    ("F9", "close this pane"),
     ("", "every other key goes to the shell"),
 ];
 const SHELL: &[Hint] = &[
     ("F6", "back to files"),
-    ("Ctrl-]", "same"),
+    ("Ctrl-]", "sshman keys"),
+    ("drag", "select"),
     ("F3", "zoom"),
+    ("F9", "close this pane"),
     ("", "every other key goes to the shell"),
+];
+/// While sshman has the keyboard: the pane keys, and then every other sshman
+/// key, which works here exactly as it does with a file list focused.
+const COMMAND: &[Hint] = &[
+    ("↑↓←→", "pane"),
+    ("↵", "use it"),
+    ("Shift-↑↓←→", "resize"),
+    ("S", "shell"),
+    ("T", "list"),
+    ("F9", "close"),
+    ("m", "zoom"),
+    ("A", "arrange"),
+    ("y", "copy"),
+    ("C", "connect"),
+    ("?", "help"),
+    ("Esc", "back"),
 ];
 /// With one pane the keys that act across the middle have nothing to act on,
 /// so the ones that work inside one filesystem take their place. The only
@@ -794,6 +1017,9 @@ const LOCAL_TAB: &[Hint] = &[
     ("M", "cut"),
     ("P", "paste"),
     ("S", "shell"),
+    ("T", "new list"),
+    ("F9", "close pane"),
+    ("A", "arrange"),
     ("e", "edit"),
     ("d", "del"),
     ("C", "server"),
@@ -809,6 +1035,9 @@ const BROWSE: &[Hint] = &[
     ("d", "del"),
     ("m", "zoom"),
     ("S", "shell"),
+    ("T", "new list"),
+    ("F9", "close pane"),
+    ("A", "arrange"),
     (":", "cmd"),
     ("s", "sudo"),
     ("C", "connect"),
@@ -849,6 +1078,7 @@ const SETTINGS: &[Hint] = &[
     ("Del", "clear"),
     ("Esc", "close"),
 ];
+const ARRANGE: &[Hint] = &[("↑↓", "choose"), ("↵", "arrange"), ("Esc", "close")];
 const OUTPUT: &[Hint] = &[("↑↓", "scroll"), ("Esc", "close")];
 const HELP_HINTS: &[Hint] = &[("↑↓", "scroll"), ("any key", "close")];
 
@@ -857,6 +1087,7 @@ const HELP_HINTS: &[Hint] = &[("↑↓", "scroll"), ("any key", "close")];
 const ALL_HINTS: &[&[Hint]] = &[
     SHELL_ZOOMED,
     SHELL,
+    COMMAND,
     ZOOMED,
     LOCAL_TAB,
     BROWSE,
@@ -868,6 +1099,7 @@ const ALL_HINTS: &[&[Hint]] = &[
     FORWARDS,
     WORKSPACES,
     SETTINGS,
+    ARRANGE,
     OUTPUT,
     HELP_HINTS,
 ];
@@ -875,10 +1107,13 @@ const ALL_HINTS: &[&[Hint]] = &[
 /// Which list belongs on screen right now.
 fn hints_for(app: &App) -> &'static [Hint<'static>] {
     match app.mode {
+        // Waiting on the key after Ctrl-], the only useful thing to show is
+        // what that key can be.
+        Mode::Browse if app.commanding => COMMAND,
         // A focused shell takes every key, so only the way out is worth
         // showing.
-        Mode::Browse if app.region == Region::Shell && app.zoomed => SHELL_ZOOMED,
-        Mode::Browse if app.region == Region::Shell => SHELL,
+        Mode::Browse if app.in_term() && app.zoomed => SHELL_ZOOMED,
+        Mode::Browse if app.in_term() => SHELL,
         Mode::Browse if app.zoomed => ZOOMED,
         Mode::Browse if app.on_local_tab() => LOCAL_TAB,
         Mode::Browse => BROWSE,
@@ -897,6 +1132,7 @@ fn hints_for(app: &App) -> &'static [Hint<'static>] {
         Mode::Forwards => FORWARDS,
         Mode::Workspaces => WORKSPACES,
         Mode::Settings => SETTINGS,
+        Mode::Arrange => ARRANGE,
         Mode::Output => OUTPUT,
         Mode::Help => HELP_HINTS,
     }
@@ -1197,7 +1433,9 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
 /// changes to this function.
 fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
-    let rows = (Setting::ALL.len() * 2) as u16;
+    // Two rows a setting, then a line saying where the themes came from and
+    // one for every file that could not be read.
+    let rows = (Setting::ALL.len() * 2 + 2 + app.themes.problems.len()) as u16;
     let rect = centered(
         area,
         74,
@@ -1237,21 +1475,104 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(theme.accent),
             ),
             Span::styled(
-                format!("{:<10}", setting.label()),
+                format!("{:<12}", setting.label()),
                 if chosen { name.bold() } else { name },
             ),
-            Span::styled(ellipsize(&app.config.value(*setting), 34), value_style),
+            Span::styled(ellipsize(&app.config.value(*setting), 32), value_style),
             Span::styled(
                 format!("  ({})", app.config.origin(*setting)),
                 Style::new().fg(theme.dim),
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            format!("   {:<10}{}", "", setting.blurb()),
+            format!("   {:<12}{}", "", setting.blurb()),
+            Style::new().fg(theme.dim),
+        )));
+    }
+
+    // Where the colours come from, since a theme is now a file you can copy
+    // and edit rather than something only a new binary could change.
+    lines.push(Line::from(vec![
+        Span::styled(format!("   {:<12}", ""), Style::new().fg(theme.dim)),
+        Span::styled(
+            format!("{} themes", app.themes.entries.len()),
+            Style::new().fg(theme.muted),
+        ),
+        Span::styled(
+            match crate::theme::themes_dir() {
+                Some(dir) => format!(" · add your own in {}", ellipsize(&shorten_home(&dir), 34)),
+                None => String::new(),
+            },
+            Style::new().fg(theme.dim),
+        ),
+    ]));
+    for problem in &app.themes.problems {
+        lines.push(Line::from(Span::styled(
+            format!("   {}", ellipsize(problem, 67)),
+            Style::new().fg(theme.bad),
+        )));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The list of ready-made arrangements, in the shape of the settings pane:
+/// a name, and a line saying what you would get.
+fn draw_arrange(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
+    let rows = (Arrangement::ALL.len() * 2) as u16;
+    let rect = centered(
+        area,
+        74,
+        (rows + 4).min(area.height.saturating_sub(4)).max(7),
+    );
+    f.render_widget(Clear, rect);
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme.accent))
+        .title_top(Line::from(Span::styled(
+            " Arrange this tab ",
+            Style::new().fg(theme.accent).bold(),
+        )))
+        .title_bottom(
+            Line::from(Span::styled(
+                " ↵ arranges · S splits · | splits sideways · Esc closes ",
+                Style::new().fg(theme.dim),
+            ))
+            .right_aligned(),
+        );
+    let inner = block.inner(rect).inner(Margin::new(1, 0));
+    f.render_widget(block, rect);
+
+    let mut lines = Vec::new();
+    for (index, which) in Arrangement::ALL.iter().enumerate() {
+        let chosen = index == app.arrangement_sel;
+        let name = Style::new().fg(if chosen { theme.text } else { theme.muted });
+        lines.push(Line::from(vec![
+            Span::styled(
+                if chosen { " ▸ " } else { "   " },
+                Style::new().fg(theme.accent),
+            ),
+            Span::styled(which.label(), if chosen { name.bold() } else { name }),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("   {}", which.blurb()),
             Style::new().fg(theme.dim),
         )));
     }
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A path with your home directory written the way you would write it.
+fn shorten_home(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    match dirs::home_dir().map(|home| home.display().to_string()) {
+        Some(home) if !home.is_empty() && shown.starts_with(&home) => {
+            format!("~{}", &shown[home.len()..])
+        }
+        _ => shown,
+    }
 }
 
 fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
@@ -1661,10 +1982,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("", "Moving files about within one side"),
     ("M", "cut marked files, to be put down elsewhere"),
     ("P", "paste them into the directory on screen"),
-    (
-        "",
-        "  With one pane zoomed there is no other side to copy to, so",
-    ),
+    ("", "  With no other side on screen to copy to — zoomed, or"),
+    ("", "  arranged without one — there is no across, so"),
     (
         "",
         "  c picks files up instead of copying across. Both keys stay",
@@ -1680,7 +1999,49 @@ pub const HELP: &[(&str, &str)] = &[
     ("", "  in the way stops the whole paste with a message."),
     ("Esc", "drop what was picked up"),
     ("", ""),
-    ("", "Pane sizes"),
+    ("", "Panes"),
+    (
+        "",
+        "  A tab is a set of panes: file lists and terminals, split",
+    ),
+    (
+        "",
+        "  any way you like. It opens as this machine beside the",
+    ),
+    ("", "  server, and every arrangement is built from there."),
+    ("", ""),
+    (
+        "",
+        "  More than one file list on a machine is allowed, each in",
+    ),
+    ("", "  its own directory. c copies into the list marked"),
+    (
+        "",
+        "  \"c copies here\" — the other one, or the one you were in",
+    ),
+    ("", "  last — whether that is across the middle or two"),
+    ("", "  directories of the same machine, where the copy runs"),
+    (
+        "",
+        "  there rather than travelling. t points it at this one.",
+    ),
+    ("A", "pick a ready-made arrangement for this tab"),
+    ("S", "cut the focused pane in two, with a terminal below"),
+    ("|", "the same, with the terminal beside it"),
+    ("T", "the same, with another file list beside it"),
+    ("F9", "close the focused pane, from anywhere"),
+    ("[✕]", "the same, for the pane it is drawn in"),
+    ("Alt-↑↓←→", "move the keyboard to the pane that way"),
+    (
+        "",
+        "  Alt is what a file list needs, the arrows being its own.",
+    ),
+    (
+        "",
+        "  Ctrl-] says the same without it, and h j k l go beside the",
+    ),
+    ("", "  arrows in both."),
+    ("Ctrl-]", "command mode: every sshman key, from anywhere"),
     (
         "m / F3",
         "give the whole screen to the focused pane, or undo that",
@@ -1706,19 +2067,52 @@ pub const HELP: &[(&str, &str)] = &[
         "  shell, or its files when it has none — and coming back",
     ),
     ("", "  puts you in the shell you left."),
-    ("Alt-← / Alt-→", "move the divider between the two sides"),
-    ("Alt-↑ / Alt-↓", "move the top edge of the shell pane"),
+    ("Alt-Shift-↑↓←→", "move the border nearest the focused pane"),
     ("drag a border", "the same, with the mouse"),
-    ("=", "back to an even split, for the tab on screen"),
+    ("=", "even the borders up again, for the tab on screen"),
     (
         "",
-        "  Sizes belong to the tab, so each server keeps the shape you",
+        "  The arrangement belongs to the tab, so each server keeps",
     ),
     (
         "",
-        "  gave it and a new tab opens with the one on screen. A",
+        "  the shape you gave it and a new tab opens with the one on",
     ),
-    ("", "  workspace saves them along with everything else."),
+    ("", "  screen. A workspace saves it with everything else."),
+    ("", ""),
+    ("", "The editor pane"),
+    (
+        "A",
+        "then Editor: a file list, your editor, a terminal below",
+    ),
+    (
+        "",
+        "  The editor runs in a pane of its own, and clicking a file",
+    ),
+    (
+        "",
+        "  in the list opens it there — e does the same from the",
+    ),
+    (
+        "",
+        "  keyboard. On a server the pane is a shell on that server,",
+    ),
+    (
+        "",
+        "  so the file is edited where it lives with nothing to fetch",
+    ),
+    (
+        "",
+        "  or push back. sshman knows the keys for vim, helix, kakoune",
+    ),
+    (
+        "",
+        "  and emacs; for anything else it runs your editor at the",
+    ),
+    (
+        "",
+        "  pane's prompt. , sets the keys for an editor of your own.",
+    ),
     ("", ""),
     ("", "A tab on this machine"),
     ("L", "open one: a single pane, no server involved"),
@@ -1741,16 +2135,76 @@ pub const HELP: &[(&str, &str)] = &[
     ("", "  sshman --local opens straight onto one."),
     ("", ""),
     ("", "Shells inside the panes"),
-    ("S", "open or close a shell under the focused pane"),
     (
-        "F6 / Ctrl-]",
-        "move the keyboard between the files and the shell",
+        "S",
+        "open a shell under the focused pane, or close the last",
     ),
+    ("F6", "move the keyboard between the files and the shell"),
     (
         "",
         "  While the shell has focus every key goes to it, including",
     ),
     ("", "  Ctrl-C and Esc. F6 is the way back out."),
+    ("", ""),
+    ("", "Command mode: every sshman key, from anywhere"),
+    ("Ctrl-]", "hand the keyboard to sshman rather than the pane"),
+    (
+        "",
+        "  A focused shell takes every key, so this is how the rest of",
+    ),
+    (
+        "",
+        "  sshman is reached without leaving it. Every key then does",
+    ),
+    (
+        "",
+        "  exactly what it does with a file list focused — C connects,",
+    ),
+    (
+        "",
+        "  w is the workspaces, , is the settings — and these as well:",
+    ),
+    ("", ""),
+    (
+        "↑ ↓ ← →",
+        "move to the pane that way, without going into it",
+    ),
+    ("↵", "hand the keyboard to the pane you have moved to"),
+    ("Shift-↑↓←→", "move the border nearest it"),
+    ("Esc / Ctrl-]", "put the keyboard back where it was"),
+    (
+        "",
+        "  The arrows move without handing anything over, so they walk",
+    ),
+    (
+        "",
+        "  past a shell rather than falling into it. ↵ is what says",
+    ),
+    ("", "  \"this one\" — into a shell, if that is what it is."),
+    ("", ""),
+    ("", "Picking text out of a shell"),
+    ("drag", "select text; it is copied when the button comes up"),
+    (
+        "",
+        "  The selection is marked by turning those cells inside out.",
+    ),
+    (
+        "",
+        "  It goes to the system clipboard through the terminal —",
+    ),
+    (
+        "",
+        "  which works over SSH, where nothing else could — and is",
+    ),
+    (
+        "",
+        "  kept, so Ctrl-] p types it into any shell pane. A program",
+    ),
+    (
+        "",
+        "  that has asked for the mouse gets the drag instead; hold",
+    ),
+    ("", "  Shift to select over one of those."),
     ("wheel", "scroll the shell's history"),
     (
         "",
@@ -1802,8 +2256,9 @@ pub const HELP: &[(&str, &str)] = &[
     ("", "  afterglow or darcula."),
     (
         "e / F4",
-        "open in your editor; remote files come back automatically",
+        "open in your editor, in place when the file is on this",
     ),
+    ("", "  machine; a file on a server comes back automatically"),
     ("E", "open with a program you name"),
     ("v", "open in $PAGER"),
     (":", "run a command in the remote pane's directory"),
@@ -1896,6 +2351,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("", ""),
     ("", "Servers and tabs"),
     ("C", "the connection screen: a saved server or a new one"),
+    (
+        "[+]",
+        "the same, clicked: it sits at the end of the top bar",
+    ),
     ("", "  Whatever it connects to opens in a tab of its own."),
     (
         "W",
@@ -1979,6 +2438,7 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::sshconn::ConnectOpts;
+    use crate::theme::Themes;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -2125,8 +2585,9 @@ mod tests {
 
     #[test]
     fn the_chosen_theme_is_what_reaches_the_screen() {
-        for theme in Theme::ALL {
-            let (_, buffer) = painted(110, 30, |app| app.theme = *theme);
+        for named in &Themes::built_in().entries {
+            let theme = named.theme;
+            let (_, buffer) = painted(110, 30, |app| app.theme = theme);
             let used = palette(&buffer);
             // The focused pane's border and titles are the accent, and the
             // hints below are dim: if a role never arrives, something is
@@ -2134,17 +2595,17 @@ mod tests {
             assert!(
                 used.contains(&theme.accent),
                 "{}: nothing is drawn in the accent",
-                theme.name
+                named.name
             );
             assert!(
                 used.contains(&theme.dim),
                 "{}: nothing is drawn dim",
-                theme.name
+                named.name
             );
             assert!(
                 used.contains(&theme.text),
                 "{}: nothing is drawn as plain text",
-                theme.name
+                named.name
             );
         }
     }
@@ -2158,6 +2619,7 @@ mod tests {
             Mode::Browse,
             Mode::Connect,
             Mode::Settings,
+            Mode::Arrange,
             Mode::Workspaces,
             Mode::Help,
             Mode::Output,
@@ -2166,11 +2628,12 @@ mod tests {
             Mode::Prompt,
             Mode::Confirm,
         ];
-        for (theme, mode) in Theme::ALL
-            .iter()
-            .copied()
-            .flat_map(|t| screens.map(|m| (t, m)))
+        for (named, mode) in Themes::built_in()
+            .entries
+            .into_iter()
+            .flat_map(|t| screens.map(|m| (t.clone(), m)))
         {
+            let theme = named.theme;
             let (_, buffer) = painted(110, 30, |app| {
                 app.theme = theme;
                 app.mode = mode;
@@ -2198,10 +2661,30 @@ mod tests {
                      of its colours",
                     colour,
                     mode,
-                    theme.name
+                    named.name
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_top_bar_offers_a_new_tab_button_where_it_says_it_does() {
+        let (app, rows) = frame(110, 30, |_| {});
+        let rect = app.new_tab_button.expect("there is one");
+        assert_eq!(button_text(&rows, rect), "[+]", "at {rect:?}");
+        assert_eq!(rect.y, 0, "on the top bar");
+    }
+
+    #[test]
+    fn the_new_tab_button_is_not_offered_where_it_would_not_work() {
+        // Mouse handling belongs to browsing; a button that did nothing when
+        // clicked would be worse than no button.
+        let (app, _) = frame(110, 30, |app| app.mode = Mode::Connect);
+        assert_eq!(app.new_tab_button, None);
+
+        // Nor on a bar too narrow to hold it and a title both.
+        let (app, _) = frame(10, 20, |_| {});
+        assert_eq!(app.new_tab_button, None);
     }
 
     #[test]
@@ -2214,6 +2697,41 @@ mod tests {
         for (rect, ..) in &app.zoom_buttons {
             assert_eq!(button_text(&rows, *rect), "[⤢]", "at {rect:?}");
         }
+    }
+
+    #[test]
+    fn every_pane_offers_a_close_button_where_it_says_it_does() {
+        let (app, rows) = frame(110, 30, |_| {});
+        assert_eq!(app.close_buttons.len(), 2, "one per pane on screen");
+        for (rect, ..) in &app.close_buttons {
+            assert_eq!(button_text(&rows, *rect), "[✕]", "at {rect:?}");
+        }
+        // Side by side with the zoom, never on top of it.
+        for (close, ..) in &app.close_buttons {
+            for (zoom, ..) in &app.zoom_buttons {
+                assert!(
+                    close.right() <= zoom.x || zoom.right() <= close.x,
+                    "{close:?} and {zoom:?} overlap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_last_pane_on_screen_offers_no_way_to_close_it() {
+        // Zoomed there is nothing to give the space back to, and a button
+        // that shut the only pane you can see would be a trapdoor.
+        let (app, _) = frame(110, 30, |app| app.zoomed = true);
+        assert!(app.close_buttons.is_empty(), "{:?}", app.close_buttons);
+    }
+
+    #[test]
+    fn a_pane_with_room_for_one_button_keeps_the_zoom() {
+        // The close button is the one to go: F9 is not hidden behind a pane
+        // being wide enough, and the zoom has no other way in with a mouse.
+        let (app, _) = frame(60, 30, |_| {});
+        assert_eq!(app.zoom_buttons.len(), 2);
+        assert!(app.close_buttons.is_empty());
     }
 
     #[test]
@@ -2243,54 +2761,124 @@ mod tests {
         );
     }
 
-    const SIDE: Rect = Rect {
-        x: 0,
-        y: 0,
-        width: 40,
-        height: 24,
-    };
-
     #[test]
-    fn a_side_without_a_shell_is_all_files() {
-        let (files, shell) = side_areas(SIDE, None, false, 12);
-        assert_eq!(files, SIDE);
-        assert_eq!(shell, None);
+    fn the_tab_row_always_shows_the_tab_you_are_on() {
+        // Twenty tabs cannot fit, so the row is a window on to them. Wherever
+        // that window is, the one on screen has to be in it — a tab bar that
+        // does not show the current tab is worse than no tab bar.
+        let widths = vec![14u16; 20];
+        for active in [0, 1, 9, 18, 19] {
+            let shown = tab_window(&widths, active, 80);
+            assert!(shown.contains(&active), "{active} fell off the row");
+            let used: u16 = shown.clone().map(|i| widths[i]).sum();
+            assert!(used + TAB_MARK * 2 <= 80, "{shown:?} does not fit");
+            assert!(!shown.is_empty());
+        }
     }
 
     #[test]
-    fn a_shell_takes_its_height_off_the_bottom() {
-        let (files, shell) = side_areas(SIDE, None, true, 8);
-        let shell = shell.expect("there is a shell");
-        assert_eq!(shell.height, 8);
-        assert_eq!(shell.y, SIDE.bottom() - 8);
-        assert_eq!(files.height, SIDE.height - 8);
+    fn a_row_with_room_for_every_tab_is_not_windowed() {
+        let widths = vec![10u16; 4];
+        assert_eq!(tab_window(&widths, 0, 110), 0..4);
     }
 
     #[test]
-    fn the_file_list_keeps_three_rows_whatever_the_shell_asks_for() {
-        let (files, shell) = side_areas(SIDE, None, true, 100);
-        assert_eq!(files.height, 3, "the list is never squeezed out");
-        assert_eq!(shell.unwrap().height, SIDE.height - 3);
+    fn a_row_too_narrow_for_even_one_tab_still_shows_the_one_you_are_on() {
+        let widths = vec![40u16; 5];
+        let shown = tab_window(&widths, 3, 20);
+        assert_eq!(shown, 3..4);
     }
 
     #[test]
-    fn zooming_the_files_leaves_no_shell_to_draw() {
-        let (files, shell) = side_areas(SIDE, Some(Region::Files), true, 8);
-        assert_eq!(files, SIDE, "the files take the whole side");
-        assert_eq!(shell, None);
+    fn names_shrink_as_the_tabs_pile_up() {
+        assert_eq!(tab_title_budget(110, 2), 24, "two tabs have room to spare");
+        assert!(tab_title_budget(110, 8) < 24);
+        assert!(
+            tab_title_budget(110, 40) >= 6,
+            "but never to nothing at all"
+        );
     }
 
     #[test]
-    fn zooming_the_shell_leaves_no_files_to_draw() {
-        let (files, shell) = side_areas(SIDE, Some(Region::Shell), true, 8);
-        assert_eq!(shell, Some(SIDE));
-        assert_eq!(files.height, 0, "nothing is drawn for the list");
+    fn the_tab_row_says_how_many_did_not_fit_and_lets_you_step_to_them() {
+        let (app, rows) = frame(60, 20, |app| {
+            for host in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] {
+                app.fake_tab(host);
+            }
+            app.goto_tab(3);
+        });
+        let row = &rows[1];
+        assert!(row.contains('‹') || row.contains('›'), "{row}");
+        assert!(
+            row.contains(" 4 me@"),
+            "the tab on screen is on the row: {row}"
+        );
+        assert!(row.contains("‹2"), "and the two it scrolled past: {row}");
+        // Every chip on the row can be clicked, including the marks.
+        assert!(app.tab_spans.iter().any(|(_, _, i)| *i == 3));
+        for (start, end, _) in &app.tab_spans {
+            assert!(*end <= 60 && start < end, "{start}..{end}");
+        }
     }
 
     #[test]
-    fn a_zoomed_shell_that_has_gone_away_gives_the_space_back() {
-        let (files, shell) = side_areas(SIDE, Some(Region::Shell), false, 8);
-        assert_eq!(files, SIDE, "closing the shell must not blank the screen");
-        assert_eq!(shell, None);
+    fn a_selection_is_drawn_inside_out_over_whatever_the_program_painted() {
+        // No colour of sshman's own goes over it: reversing the cells reads as
+        // a selection in any theme, on any terminal, whatever is underneath.
+        let dir = std::env::temp_dir().join(format!("sshman-sel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (app, buffer) = painted(110, 30, |app| {
+            let slot = app.open_test_term(&dir);
+            app.focus = slot;
+            if let Some(shell) = app.shell_mut(slot) {
+                shell.begin_selection(0, 2);
+                shell.drag_selection(0, 5);
+            }
+        });
+        let inner = app
+            .term_inner
+            .first()
+            .map(|(_, rect)| *rect)
+            .expect("the terminal was drawn");
+
+        let reversed = |x: u16| {
+            buffer[(inner.x + x, inner.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        };
+        assert!(!reversed(1), "just before it");
+        for x in 2..=5 {
+            assert!(reversed(x), "column {x} is not marked");
+        }
+        assert!(!reversed(6), "just after it");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_pane_the_arrangement_names_is_drawn_where_it_says() {
+        // What the mouse is matched against has to be what was painted: a
+        // pane recorded somewhere it was not drawn is a click that lands in
+        // the wrong place, with nothing on screen to explain why.
+        let (app, _) = frame(110, 30, |_| {});
+        let slots: Vec<Slot> = app.areas.panes.iter().map(|(s, _)| *s).collect();
+        assert_eq!(slots, app.layout.slots());
+        for (_, rect) in &app.areas.panes {
+            assert!(rect.width > 0 && rect.height > 0, "{rect:?}");
+            assert!(app.panes_area.union(*rect) == app.panes_area, "{rect:?}");
+        }
+        assert_eq!(app.areas.dividers.len(), 1, "one border between the two");
+    }
+
+    #[test]
+    fn a_zoomed_pane_is_the_only_one_drawn() {
+        let (app, _) = frame(110, 30, |app| app.zoomed = true);
+        assert_eq!(app.areas.panes.len(), 1);
+        assert_eq!(app.areas.panes[0].0, app.focus);
+        assert_eq!(app.areas.panes[0].1, app.panes_area);
+        assert!(
+            app.areas.dividers.is_empty(),
+            "and there is no border to drag"
+        );
     }
 }
