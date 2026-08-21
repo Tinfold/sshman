@@ -12,6 +12,7 @@ use ratatui::widgets::{
 use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, ConnectFocus, ConnectForm, Level, LinkState, Mode, Pane, Region, Side};
+use crate::config::Setting;
 use crate::types::{EntryKind, FileEntry, ellipsize, fmt_time, human_size};
 
 const ACCENT: Color = Color::Cyan;
@@ -76,6 +77,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Connect => draw_connect(f, app, area),
         Mode::Picker => draw_picker(f, app, area),
         Mode::Workspaces => draw_workspaces(f, app, area),
+        Mode::Settings => draw_settings(f, app, area),
         Mode::Forwards => draw_forwards(f, app, area),
         Mode::Prompt => draw_prompt(f, app, area),
         Mode::Confirm => draw_confirm(f, app, area),
@@ -229,7 +231,7 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     spans.push(Span::styled(
-        "  T new · W close · Ctrl-←/→ switch",
+        "  C new · W close · Ctrl-←/→ switch",
         Style::new().fg(DIM),
     ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -697,104 +699,205 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
 }
 
-fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
-    let hints: &[(&str, &str)] = match app.mode {
-        // A focused shell takes every key, so only the way out is worth showing.
-        Mode::Browse if app.region == Region::Shell && app.zoomed => &[
-            ("F6", "back to files"),
-            ("F3", "unzoom"),
-            ("", "every other key goes to the shell"),
-        ],
-        Mode::Browse if app.region == Region::Shell => &[
-            ("F6", "back to files"),
-            ("Ctrl-]", "same"),
-            ("F3", "zoom"),
-            ("", "every other key goes to the shell"),
-        ],
-        // With one pane the keys that act across the middle have nothing to
-        // act on, so the ones that work inside one filesystem take their
-        // place. The only difference between the two ways of getting there is
-        // what `m` does next.
-        Mode::Browse if app.zoomed => &[
-            ("Tab", "side"),
-            ("↵", "open"),
-            ("Space", "mark"),
-            ("c", "copy"),
-            ("M", "cut"),
-            ("P", "paste"),
-            ("m", "unzoom"),
-            ("e", "edit"),
-            ("d", "del"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        Mode::Browse if app.on_local_tab() => &[
-            ("↵", "open"),
-            ("Space", "mark"),
-            ("c", "copy"),
-            ("M", "cut"),
-            ("P", "paste"),
-            ("S", "shell"),
-            ("e", "edit"),
-            ("d", "del"),
-            ("T", "server"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        Mode::Browse => &[
-            ("Tab", "pane"),
-            ("↵", "open"),
-            ("Space", "mark"),
-            ("c", "copy →"),
-            ("e", "edit"),
-            ("m", "zoom"),
-            ("S", "shell"),
-            ("T", "tab"),
-            ("L", "local tab"),
-            ("w", "workspaces"),
-            ("p", "ports"),
-            (":", "cmd"),
-            ("s", "sudo"),
-            ("d", "del"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        Mode::Connect => &[
-            ("Tab", "section"),
-            ("↑↓", "choose"),
-            ("↵", "connect"),
-            ("Del", "forget"),
-            ("Esc", "back"),
-        ],
-        Mode::Prompt => &[("↵", "confirm"), ("Esc", "cancel")],
+/// A key and what it does, as the bottom line lists them.
+type Hint<'a> = (&'a str, &'a str);
+
+/// Shown in place of what did not fit.
+const MORE: Hint<'static> = ("", "…");
+
+/// How many hints are kept whatever happens, counted from the end.
+///
+/// Every list ends with its ways out — `?` and `q`, or `Esc` — and a screen
+/// too narrow to show everything is exactly when you need those most.
+const PINNED: usize = 2;
+
+/// One hint's width on screen: ` key ` and then ` what it does  `.
+fn hint_width(hint: &Hint) -> usize {
+    let (key, text) = hint;
+    let key_width = match key.is_empty() {
+        true => 0,
+        false => key.chars().count() + 2,
+    };
+    key_width + text.chars().count() + 3
+}
+
+/// The hints that fit, in the order they matter.
+///
+/// The lists are written most-useful-first, so cutting from the end keeps the
+/// keys worth knowing. Anything dropped leaves a `…` behind, so a short line
+/// reads as abbreviated rather than as all there is.
+fn fit_hints<'a>(hints: &[Hint<'a>], width: u16) -> Vec<Hint<'a>> {
+    let width = width as usize;
+    let total: usize = hints.iter().map(hint_width).sum();
+    if total <= width || hints.len() <= PINNED {
+        return hints.to_vec();
+    }
+
+    let split = hints.len() - PINNED;
+    let tail = &hints[split..];
+    let mut used: usize = tail.iter().map(hint_width).sum::<usize>() + hint_width(&MORE);
+    let mut out = Vec::new();
+    for hint in &hints[..split] {
+        let hint_width = hint_width(hint);
+        if used + hint_width > width {
+            break;
+        }
+        out.push(*hint);
+        used += hint_width;
+    }
+    out.push(MORE);
+    out.extend_from_slice(tail);
+    out
+}
+
+/// Every hint list, in the order each is written: most useful first, ways out
+/// last, because [`fit_hints`] cuts from the end but keeps the tail.
+const SHELL_ZOOMED: &[Hint] = &[
+    ("F6", "back to files"),
+    ("F3", "unzoom"),
+    ("", "every other key goes to the shell"),
+];
+const SHELL: &[Hint] = &[
+    ("F6", "back to files"),
+    ("Ctrl-]", "same"),
+    ("F3", "zoom"),
+    ("", "every other key goes to the shell"),
+];
+/// With one pane the keys that act across the middle have nothing to act on,
+/// so the ones that work inside one filesystem take their place. The only
+/// difference between the two ways of getting there is what `m` does next.
+const ZOOMED: &[Hint] = &[
+    ("Tab", "side"),
+    ("↵", "open"),
+    ("Space", "mark"),
+    ("c", "copy"),
+    ("M", "cut"),
+    ("P", "paste"),
+    ("m", "unzoom"),
+    ("e", "edit"),
+    ("d", "del"),
+    ("?", "help"),
+    ("q", "quit"),
+];
+const LOCAL_TAB: &[Hint] = &[
+    ("↵", "open"),
+    ("Space", "mark"),
+    ("c", "copy"),
+    ("M", "cut"),
+    ("P", "paste"),
+    ("S", "shell"),
+    ("e", "edit"),
+    ("d", "del"),
+    ("C", "server"),
+    ("?", "help"),
+    ("q", "quit"),
+];
+const BROWSE: &[Hint] = &[
+    ("Tab", "pane"),
+    ("↵", "open"),
+    ("Space", "mark"),
+    ("c", "copy →"),
+    ("e", "edit"),
+    ("d", "del"),
+    ("m", "zoom"),
+    ("S", "shell"),
+    (":", "cmd"),
+    ("s", "sudo"),
+    ("C", "connect"),
+    ("w", "workspaces"),
+    ("p", "ports"),
+    ("L", "local tab"),
+    (",", "settings"),
+    ("?", "help"),
+    ("q", "quit"),
+];
+const CONNECT: &[Hint] = &[
+    ("Tab", "section"),
+    ("↑↓", "choose"),
+    ("↵", "connect"),
+    ("Del", "forget"),
+    ("Esc", "back"),
+];
+const PROMPT: &[Hint] = &[("↵", "confirm"), ("Esc", "cancel")];
+const CONFIRM_PHRASE: &[Hint] = &[("type the word", "then ↵"), ("Esc", "cancel")];
+const CONFIRM: &[Hint] = &[("y", "yes"), ("n", "no")];
+const PICKER: &[Hint] = &[("↑↓", "choose"), ("↵", "open in a tab"), ("Esc", "cancel")];
+const FORWARDS: &[Hint] = &[
+    ("a", "add"),
+    ("d", "stop"),
+    ("↑↓", "choose"),
+    ("Esc", "close"),
+];
+const WORKSPACES: &[Hint] = &[
+    ("↑↓", "choose"),
+    ("↵", "open"),
+    ("s", "save what is open"),
+    ("Del", "forget"),
+    ("Esc", "close"),
+];
+const SETTINGS: &[Hint] = &[
+    ("↑↓", "choose"),
+    ("↵", "change"),
+    ("Del", "clear"),
+    ("Esc", "close"),
+];
+const OUTPUT: &[Hint] = &[("↑↓", "scroll"), ("Esc", "close")];
+const HELP_HINTS: &[Hint] = &[("↑↓", "scroll"), ("any key", "close")];
+
+/// All of them, for the test that they are all written the right way round.
+#[cfg(test)]
+const ALL_HINTS: &[&[Hint]] = &[
+    SHELL_ZOOMED,
+    SHELL,
+    ZOOMED,
+    LOCAL_TAB,
+    BROWSE,
+    CONNECT,
+    PROMPT,
+    CONFIRM_PHRASE,
+    CONFIRM,
+    PICKER,
+    FORWARDS,
+    WORKSPACES,
+    SETTINGS,
+    OUTPUT,
+    HELP_HINTS,
+];
+
+/// Which list belongs on screen right now.
+fn hints_for(app: &App) -> &'static [Hint<'static>] {
+    match app.mode {
+        // A focused shell takes every key, so only the way out is worth
+        // showing.
+        Mode::Browse if app.region == Region::Shell && app.zoomed => SHELL_ZOOMED,
+        Mode::Browse if app.region == Region::Shell => SHELL,
+        Mode::Browse if app.zoomed => ZOOMED,
+        Mode::Browse if app.on_local_tab() => LOCAL_TAB,
+        Mode::Browse => BROWSE,
+        Mode::Connect => CONNECT,
+        Mode::Prompt => PROMPT,
         Mode::Confirm
             if app
                 .confirm
                 .as_ref()
                 .is_some_and(|c| c.require_phrase.is_some()) =>
         {
-            &[("type the word", "then ↵"), ("Esc", "cancel")]
+            CONFIRM_PHRASE
         }
-        Mode::Confirm => &[("y", "yes"), ("n", "no")],
-        Mode::Picker => &[("↑↓", "choose"), ("↵", "open in a tab"), ("Esc", "cancel")],
-        Mode::Forwards => &[
-            ("a", "add"),
-            ("d", "stop"),
-            ("↑↓", "choose"),
-            ("Esc", "close"),
-        ],
-        Mode::Workspaces => &[
-            ("↑↓", "choose"),
-            ("↵", "open"),
-            ("s", "save what is open"),
-            ("Del", "forget"),
-            ("Esc", "close"),
-        ],
-        Mode::Output => &[("↑↓", "scroll"), ("Esc", "close")],
-        Mode::Help => &[("↑↓", "scroll"), ("any key", "close")],
-    };
+        Mode::Confirm => CONFIRM,
+        Mode::Picker => PICKER,
+        Mode::Forwards => FORWARDS,
+        Mode::Workspaces => WORKSPACES,
+        Mode::Settings => SETTINGS,
+        Mode::Output => OUTPUT,
+        Mode::Help => HELP_HINTS,
+    }
+}
+
+fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
+    let hints = hints_for(app);
     let mut spans = Vec::new();
-    for (k, v) in hints {
+    for (k, v) in &fit_hints(hints, area.width) {
         if !k.is_empty() {
             spans.push(Span::styled(
                 format!(" {k} "),
@@ -1068,6 +1171,65 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Saved sets of connections.
+/// What is kept in the config file, and what it is set to now.
+///
+/// The options come from [`Setting::ALL`], so a new one appears here with no
+/// changes to this function.
+fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
+    let rows = (Setting::ALL.len() * 2) as u16;
+    let rect = centered(
+        area,
+        74,
+        (rows + 4).min(area.height.saturating_sub(4)).max(7),
+    );
+    f.render_widget(Clear, rect);
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title_top(Line::from(Span::styled(
+            " Settings ",
+            Style::new().fg(ACCENT).bold(),
+        )))
+        .title_bottom(
+            Line::from(Span::styled(
+                " ↵ change · Del clears · Esc closes ",
+                Style::new().fg(DIM),
+            ))
+            .right_aligned(),
+        );
+    let inner = block.inner(rect).inner(Margin::new(1, 0));
+    f.render_widget(block, rect);
+
+    let mut lines = Vec::new();
+    for (index, setting) in Setting::ALL.iter().enumerate() {
+        let chosen = index == app.settings_sel;
+        let name = Style::new().fg(if chosen { Color::White } else { Color::Gray });
+        let value_style = match app.config.is_set(*setting) {
+            true => Style::new().fg(ACCENT).bold(),
+            // Inherited from somewhere else, so it is shown but not claimed.
+            false => Style::new().fg(Color::Gray),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if chosen { " ▸ " } else { "   " }, Style::new().fg(ACCENT)),
+            Span::styled(
+                format!("{:<10}", setting.label()),
+                if chosen { name.bold() } else { name },
+            ),
+            Span::styled(ellipsize(&app.config.value(*setting), 34), value_style),
+            Span::styled(
+                format!("  ({})", app.config.origin(*setting)),
+                Style::new().fg(DIM),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("   {:<10}{}", "", setting.blurb()),
+            Style::new().fg(DIM),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
     let rows = app.workspaces.len().max(1) as u16;
     let rect = centered(
@@ -1526,21 +1688,24 @@ pub const HELP: &[(&str, &str)] = &[
     ("", "  workspace saves them along with everything else."),
     ("", ""),
     ("", "A tab on this machine"),
-    ("L", "open one, with no server involved"),
+    ("L", "open one: a single pane, no server involved"),
     (
         "",
-        "  Both panes are then this machine, which is the easy way to",
+        "  It opens where the local pane was, S gives it a shell here,",
     ),
     (
         "",
-        "  move things about locally. It behaves like any other tab:",
+        "  and everything a pane does works in it. With no other side",
     ),
     (
         "",
-        "  copy, edit, pack, delete, its own shell with S, and s for",
+        "  to copy to, c picks files up and P puts them down. s turns",
     ),
-    ("", "  sudo, which here is the real sudo and asks for your"),
-    ("", "  password. `sshman --local` starts on one."),
+    (
+        "",
+        "  on the real sudo and asks for your password. Starting with",
+    ),
+    ("", "  sshman --local opens straight onto one."),
     ("", ""),
     ("", "Shells inside the panes"),
     ("S", "open or close a shell under the focused pane"),
@@ -1576,9 +1741,24 @@ pub const HELP: &[(&str, &str)] = &[
     ("", "  never holds up a transfer."),
     ("", ""),
     ("", "Editing and running things"),
+    (",", "settings: what sshman remembers between sessions"),
+    (
+        "",
+        "  ↵ changes the one under the cursor, Del clears it back to",
+    ),
+    (
+        "",
+        "  whatever it would have been. Kept in the config file at",
+    ),
+    ("", "  ~/.config/sshman/config.json."),
+    (
+        "",
+        "  The editor lives here, and is used in place of $VISUAL and",
+    ),
+    ("", "  $EDITOR. --editor overrides it for a single run."),
     (
         "e / F4",
-        "open in $EDITOR; remote files come back automatically",
+        "open in your editor; remote files come back automatically",
     ),
     ("E", "open with a program you name"),
     ("v", "open in $PAGER"),
@@ -1671,7 +1851,8 @@ pub const HELP: &[(&str, &str)] = &[
     ),
     ("", ""),
     ("", "Servers and tabs"),
-    ("T", "connect to another server, in a new tab"),
+    ("C", "the connection screen: a saved server or a new one"),
+    ("", "  Whatever it connects to opens in a tab of its own."),
     (
         "W",
         "close the tab on screen (ends that session and its shell)",
@@ -1787,6 +1968,92 @@ mod tests {
             .skip(rect.x as usize)
             .take(rect.width as usize)
             .collect()
+    }
+
+    const HINTS: &[Hint<'static>] = &[
+        ("Tab", "pane"),
+        ("↵", "open"),
+        ("Space", "mark"),
+        ("c", "copy →"),
+        ("?", "help"),
+        ("q", "quit"),
+    ];
+
+    fn line_width(hints: &[Hint]) -> usize {
+        hints.iter().map(hint_width).sum()
+    }
+
+    #[test]
+    fn a_line_that_fits_is_left_alone() {
+        let wide = line_width(HINTS) as u16;
+        assert_eq!(fit_hints(HINTS, wide), HINTS);
+        assert_eq!(fit_hints(HINTS, wide + 40), HINTS);
+    }
+
+    #[test]
+    fn a_narrow_line_keeps_the_ways_out_and_says_it_was_cut() {
+        let fitted = fit_hints(HINTS, 40);
+        assert!(line_width(&fitted) <= 40, "{fitted:?}");
+        assert_eq!(
+            &fitted[fitted.len() - 2..],
+            &HINTS[HINTS.len() - 2..],
+            "help and quit survive whatever else goes"
+        );
+        assert!(fitted.contains(&MORE), "and the cut is visible: {fitted:?}");
+        // What is kept comes off the front, in order.
+        assert_eq!(fitted[0], HINTS[0]);
+    }
+
+    #[test]
+    fn the_narrower_it_gets_the_less_is_shown() {
+        let mut last = usize::MAX;
+        for width in [200, 60, 40, 30, 20] {
+            let fitted = fit_hints(HINTS, width);
+            assert!(
+                fitted.len() <= last,
+                "{width} showed more than the one before"
+            );
+            last = fitted.len();
+        }
+        // Even with nothing to spare, the ways out are still there.
+        let squeezed = fit_hints(HINTS, 1);
+        assert_eq!(&squeezed[squeezed.len() - 2..], &HINTS[HINTS.len() - 2..]);
+    }
+
+    #[test]
+    fn a_short_list_is_never_cut() {
+        // Two hints are all ways out; there is nothing to drop.
+        let pair: &[Hint] = &[("↵", "confirm"), ("Esc", "cancel")];
+        assert_eq!(fit_hints(pair, 1), pair);
+    }
+
+    #[test]
+    fn keys_are_measured_in_characters_not_bytes() {
+        // `Ctrl-←/→` is 8 characters and 12 bytes; measuring bytes would cut
+        // the line short of what actually fits.
+        assert_eq!(hint_width(&("Ctrl-←/→", "tabs")), 8 + 2 + 4 + 3);
+        assert_eq!(hint_width(&("", "every other key goes to the shell")), 36);
+    }
+
+    #[test]
+    fn every_hint_list_ends_with_a_way_out() {
+        // The fitting keeps the last two whatever happens, which is only the
+        // right rule while the lists are written that way round.
+        for hints in ALL_HINTS {
+            let tail: Vec<&str> = hints
+                .iter()
+                .rev()
+                .take(PINNED)
+                .map(|(key, text)| if key.is_empty() { *text } else { *key })
+                .collect();
+            assert!(
+                tail.iter().any(|k| matches!(
+                    *k,
+                    "q" | "Esc" | "n" | "any key" | "every other key goes to the shell"
+                )),
+                "{tail:?} has no way out in it"
+            );
+        }
     }
 
     #[test]

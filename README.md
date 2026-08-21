@@ -90,7 +90,8 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `M` | cut, to be put down elsewhere on the same side |
 | `P` | paste what `c` or `M` picked up into this directory |
 | `e` / `F4` | edit in `$EDITOR` |
-| `E` | edit with a program you name |
+| `E` | edit with a program you name, just this once |
+| `,` | settings: what sshman remembers between sessions |
 | `v` | view in `$PAGER` |
 | `:` | run a command in the remote pane's directory |
 | `!` | full-screen shell in that directory: `ssh` for a server, `exec` into a container, a login shell on this machine |
@@ -101,7 +102,6 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `p` | forwarded ports |
 | `N` | name the server on screen |
 | `w` | workspaces: saved sets of connections |
-| `T` | connect to another server, in a new tab |
 | `W` | close the tab on screen |
 | `Ctrl-←` / `Ctrl-→`, `Alt-1`…`Alt-9` | move between tabs |
 | `S` | open/close a shell under the focused pane |
@@ -113,7 +113,7 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `=` | back to an even split |
 | `s` | toggle sudo mode |
 | `n` / `F7`, `r` / `F2`, `d` / `F8` | mkdir, rename, delete |
-| `C` | connection screen (recent servers + form) |
+| `C` | connection screen: connect to a server, always in a new tab |
 | `?` | help |
 | `q` | quit |
 
@@ -279,7 +279,7 @@ showing. `sshman --local` starts on one.
 
 ```
  sshman  fedora  this machine  tab 1/2
- 1 fedora   2 web01    T new · W close · Ctrl-←/→ switch
+ 1 fedora   2 web01    C new · W close · Ctrl-←/→ switch
 ┏ THIS MACHINE /home/you/downloads ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃ drwxr-xr-x    <DIR> 2026-08-20 21:37 archive/                               ┃
 ```
@@ -347,14 +347,14 @@ you first connect.
 
 ## Tabs: several servers at once
 
-`T` opens the connection screen again and the server you pick arrives as a new
+`C` opens the connection screen again and the server you pick arrives as a new
 tab; `W` closes the one on screen. `Ctrl-←`/`Ctrl-→` move between them, `Alt-1`
 … `Alt-9` jump straight to one, and clicking a tab works too. The bar only
 appears once you have more than one.
 
 ```
  sshman  deploy@web01  tab 1/3
- 1 deploy@web01    2 root@db1:2222 #    3 me@10.0.0.5 ⟳     T new · W close · Ctrl-←/→ switch
+ 1 deploy@web01    2 root@db1:2222 #    3 me@10.0.0.5 ⟳     C new · W close · Ctrl-←/→ switch
 ```
 
 A `#` marks a tab in sudo mode and `⟳` one that is reconnecting. Each tab is a
@@ -445,18 +445,46 @@ link drops, and its pane says `[exited]`. `S` twice starts a new one.
 
 ## Editing files
 
-`e` opens the file in `$VISUAL`/`$EDITOR` (`vi` if neither is set); `E` asks
-which program to use, so anything works — `nano`, `hx`, `code -w`, even a
+`e` opens the file under the cursor in your editor; `E` asks which program to
+use for that one file, so anything works — `nano`, `hx`, `code -w`, even a
 non-interactive filter like `sed -i`.
+
+Which editor `e` means is yours to decide. Out of the box it is `$VISUAL`, then
+`$EDITOR`, then `vi`. Press `,` for the settings, pick **Editor**, and name one
+instead:
+
+```
+╭ Settings ──────────────────────────────────────────────────────╮
+│  ▸ Editor    hx  (set here)                                    │
+│              the program e opens files with                    │
+╰──────────────────────── ↵ change · Del clears · Esc closes ────╯
+```
+
+Each setting shows what it is set to and where that came from, so you can tell
+an answer of your own from one inherited from the environment. `Del` clears one
+back to whatever it would have been. They live in one file:
+
+```json
+// ~/.config/sshman/config.json
+{
+  "editor": "hx"
+}
+```
+
+That setting wins over `$VISUAL` and `$EDITOR`, which is the point of having it —
+`$EDITOR` is set on nearly every machine, so the other way round would leave it
+useless. An empty answer clears it and hands you back to the environment, and
+`--editor <program>` overrides it for a single run without changing what is
+saved.
 
 For a remote file, sshman downloads it to a temp path, releases the terminal,
 runs your editor, and uploads it again when the editor exits. A file you did not
 change is not re-uploaded. If your editor exits non-zero, nothing is uploaded
 and sshman tells you where the downloaded copy is, so an edit is never lost.
 
-Because the program is run through your shell, `EDITOR="code -w"` and similar
-work as written. Use a *blocking* editor: `code` and `subl` need `-w`, or the
-editor returns immediately and sshman will think you made no changes.
+Because the program is run through your shell, `code -w` and similar work as
+written. Use a *blocking* editor: `code` and `subl` need `-w`, or the editor
+returns immediately and sshman will think you made no changes.
 
 ## Sudo mode
 

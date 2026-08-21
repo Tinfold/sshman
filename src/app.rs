@@ -12,6 +12,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use crate::backend::{BackendKind, Target};
+use crate::config::{Config, Setting};
 use crate::forward::{Forward, Spec as ForwardSpec};
 use crate::history::History;
 use crate::input::TextInput;
@@ -55,6 +56,8 @@ pub enum Mode {
     Forwards,
     /// Choosing a saved set of connections.
     Workspaces,
+    /// Changing what is kept in the config file.
+    Settings,
     Browse,
     Prompt,
     Confirm,
@@ -91,6 +94,8 @@ pub enum PromptKind {
     Archive(Side, Vec<String>),
     /// Directory to unpack the named archive into.
     Extract(Side, String),
+    /// The editor to open files with from now on, and next time.
+    SetEditor,
 }
 
 pub struct PromptState {
@@ -597,6 +602,7 @@ pub struct App {
     pub picker: Option<PickerState>,
     pub workspaces: Workspaces,
     pub workspace_sel: usize,
+    pub settings_sel: usize,
     pub forward_sel: usize,
     /// Connections from a workspace that could not be made without a
     /// password. Kept so the user is told, and so `C` can offer them.
@@ -607,6 +613,10 @@ pub struct App {
     pub help_scroll: u16,
 
     pub cmd_history: Vec<String>,
+    /// Settings that outlive the session. The editor in use is derived from
+    /// this and the environment, and kept beside it so the hot path is a
+    /// clone rather than a lookup.
+    pub config: Config,
     pub editor: String,
     pub pager: String,
     /// The details the connection screen is working with — the active tab's
@@ -629,9 +639,8 @@ impl App {
         remote_start: Option<String>,
         auto_connect: bool,
     ) -> Self {
-        let editor = std::env::var("VISUAL")
-            .or_else(|_| std::env::var("EDITOR"))
-            .unwrap_or_else(|_| "vi".to_string());
+        let config = Config::load();
+        let editor = config.editor();
         let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
         let history = History::load();
         let (local_tx, local_rx) = std::sync::mpsc::channel();
@@ -685,6 +694,7 @@ impl App {
             picker: None,
             workspaces: Workspaces::load(),
             workspace_sel: 0,
+            settings_sel: 0,
             forward_sel: 0,
             needs_password: Vec::new(),
             output: Vec::new(),
@@ -692,6 +702,7 @@ impl App {
             output_scroll: 0,
             help_scroll: 0,
             cmd_history: Vec::new(),
+            config,
             editor,
             pager,
             opts,
@@ -1754,6 +1765,7 @@ impl App {
             Mode::Connect => self.connect_key(key),
             Mode::Picker => self.picker_key(key),
             Mode::Workspaces => self.workspace_key(key),
+            Mode::Settings => self.settings_key(key),
             Mode::Forwards => self.forward_key(key),
             Mode::Browse => self.browse_key(key),
             Mode::Prompt => self.prompt_key(key),
@@ -2138,6 +2150,7 @@ impl App {
                     self.pending_action = Some(UiAction::Shell);
                 }
             }
+            KeyCode::Char(',') => self.open_settings(),
             KeyCode::Char('~') => self.go_home(side),
             KeyCode::Char('D') => self.find_containers(side),
             KeyCode::Char('N') => self.start_rename_tab(),
@@ -2165,9 +2178,10 @@ impl App {
                     self.mode = Mode::Output;
                 }
             }
-            // Both open the connection screen; a successful connection always
-            // arrives as a new tab, leaving the ones you have alone.
-            KeyCode::Char('C') | KeyCode::Char('T') => self.open_connect_screen(),
+            // The connection screen. Whatever it connects to arrives as a new
+            // tab, leaving the ones you have alone, so there is one key for
+            // both "connect" and "another server please".
+            KeyCode::Char('C') => self.open_connect_screen(),
             // A tab that needs no server at all.
             KeyCode::Char('L') => self.open_local_tab(),
             KeyCode::Char('W') => self.close_tab(),
@@ -2411,6 +2425,88 @@ impl App {
                 }
                 self.run_extract(side, archive, value);
             }
+            PromptKind::SetEditor => self.set_editor(value),
+        }
+    }
+
+    pub fn open_settings(&mut self) {
+        self.settings_sel = self.settings_sel.min(Setting::ALL.len().saturating_sub(1));
+        self.mode = Mode::Settings;
+    }
+
+    /// The setting the cursor is on.
+    pub fn selected_setting(&self) -> Setting {
+        Setting::ALL[self.settings_sel.min(Setting::ALL.len() - 1)]
+    }
+
+    fn settings_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(',') => self.mode = Mode::Browse,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.settings_sel = (self.settings_sel + 1).min(Setting::ALL.len() - 1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.settings_sel = self.settings_sel.saturating_sub(1);
+            }
+            KeyCode::Enter => self.edit_setting(self.selected_setting()),
+            // Only a setting of your own can be cleared; the inherited value
+            // underneath it is not ours to remove.
+            KeyCode::Delete | KeyCode::Backspace => {
+                let setting = self.selected_setting();
+                if self.config.is_set(setting) {
+                    self.clear_setting(setting);
+                } else {
+                    self.set_status(
+                        format!("{} is not set here — nothing to clear", setting.label()),
+                        Level::Info,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Ask for a new value, coming back to the settings pane afterwards.
+    fn edit_setting(&mut self, setting: Setting) {
+        let (kind, title, current) = match setting {
+            Setting::Editor => (
+                PromptKind::SetEditor,
+                "Editor (empty uses $VISUAL, then $EDITOR)".to_string(),
+                self.config.editor.clone().unwrap_or_default(),
+            ),
+        };
+        self.open_prompt(kind, title, current);
+    }
+
+    fn clear_setting(&mut self, setting: Setting) {
+        match setting {
+            Setting::Editor => self.set_editor(String::new()),
+        }
+    }
+
+    /// Remember which editor to open files with.
+    ///
+    /// An empty answer clears the setting rather than storing a blank one, so
+    /// the way back to `$VISUAL` and `$EDITOR` is to rub it out.
+    fn set_editor(&mut self, value: String) {
+        let value = value.trim().to_string();
+        self.config.editor = (!value.is_empty()).then_some(value);
+        self.editor = self.config.editor();
+        let editor = self.editor.clone();
+        match self.config.save() {
+            Ok(()) => self.set_status(
+                match self.config.editor.is_some() {
+                    true => format!("editor set to {editor} — remembered for next time"),
+                    false => format!("editor cleared — using {editor}"),
+                },
+                Level::Good,
+            ),
+            // The session still has the new editor; only the remembering
+            // failed, and saying so beats pretending either way.
+            Err(e) => self.set_status(
+                format!("using {editor}, but it could not be saved: {e}"),
+                Level::Bad,
+            ),
         }
     }
 
@@ -3915,6 +4011,15 @@ mod tests {
         dir
     }
 
+    fn key(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+    }
+
     fn press(app: &mut App, c: char) {
         app.on_key(KeyEvent {
             code: KeyCode::Char(c),
@@ -4224,12 +4329,7 @@ mod tests {
         press(&mut app, 'm');
         assert!(app.zoomed);
         // Esc is the other way out, once it has nothing else to clear.
-        app.on_key(KeyEvent {
-            code: KeyCode::Esc,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        });
+        key(&mut app, KeyCode::Esc);
         assert!(!app.zoomed);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4248,14 +4348,52 @@ mod tests {
         );
 
         // Tab has nowhere to go, and must not park the keyboard off screen.
-        app.on_key(KeyEvent {
-            code: KeyCode::Tab,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        });
+        key(&mut app, KeyCode::Tab);
         assert_eq!(app.focus, Side::Remote);
         assert!(app.status.contains("only this machine"), "{}", app.status);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_editor_can_be_set_and_is_remembered() {
+        let dir = scratch("editor");
+        let mut app = app_in(&dir);
+        // Pointed at a scratch file: a test must never write over the
+        // settings of whoever is running it.
+        app.config = Config::at(dir.join("config.json"));
+
+        press(&mut app, ',');
+        assert_eq!(app.mode, Mode::Settings);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Prompt, "the chosen setting is asked about");
+
+        for c in "hx".chars() {
+            press(&mut app, c);
+        }
+        key(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.editor, "hx", "and in use straight away");
+        assert_eq!(
+            app.mode,
+            Mode::Settings,
+            "answering comes back to the pane it was asked from"
+        );
+        let written = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        assert!(written.contains("hx"), "{written}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clearing_the_editor_goes_back_to_the_environment() {
+        let dir = scratch("editor-clear");
+        let mut app = app_in(&dir);
+        app.config = Config::at(dir.join("config.json"));
+        app.set_editor("  ".into());
+
+        assert_eq!(app.config.editor, None, "a blank one is not stored");
+        assert_eq!(app.editor, crate::config::default_editor());
 
         std::fs::remove_dir_all(&dir).ok();
     }

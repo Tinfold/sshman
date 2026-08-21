@@ -7,6 +7,7 @@
 mod app;
 mod archive;
 mod backend;
+mod config;
 mod docker;
 mod fileops;
 mod forward;
@@ -99,6 +100,11 @@ struct Args {
     #[arg(long, value_name = "PROGRAM")]
     runtime: Option<String>,
 
+    /// Editor to open files with, for this run only. The saved setting (`,`)
+    /// is what sticks.
+    #[arg(long, value_name = "PROGRAM")]
+    editor: Option<String>,
+
     /// Open a saved workspace: reconnects everything it holds
     #[arg(short = 'w', long, value_name = "NAME")]
     workspace: Option<String>,
@@ -154,6 +160,15 @@ fn main() -> Result<()> {
     );
     if let Some(workspace) = requested {
         app.launch_workspace(&workspace);
+    }
+    // For this run only: a flag is an override, not a decision to remember.
+    if let Some(editor) = args
+        .editor
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        app.editor = editor.to_string();
     }
     if args.docker {
         app.browse_local_containers();
