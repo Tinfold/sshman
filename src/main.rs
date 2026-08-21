@@ -8,6 +8,7 @@ mod app;
 mod archive;
 mod backend;
 mod docker;
+mod fileops;
 mod forward;
 mod history;
 mod input;
@@ -39,7 +40,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::Position;
 
-use app::{App, Mode, Region, Side, UiAction};
+use app::{App, Drag, Mode, Region, Side, UiAction};
 use sshconn::ConnectOpts;
 use types::sh_quote;
 
@@ -324,6 +325,55 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
     }
 
     let at = Position::new(m.column, m.row);
+
+    // A drag in progress owns the mouse until the button comes back up, so
+    // that leaving the border behind while moving does not drop it.
+    if let Some(drag) = app.drag {
+        match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => match drag {
+                Drag::Columns => app.drag_split_to(m.column),
+                Drag::ShellTop => app.drag_shell_top_to(m.row),
+            },
+            MouseEventKind::Up(MouseButton::Left) => app.drag = None,
+            _ => {}
+        }
+        return;
+    }
+
+    // Pressing on a border starts a resize rather than reaching the pane
+    // underneath. Both borders are two columns or rows wide to grab: the two
+    // panes each draw their own edge, and they sit against each other.
+    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+        if let Some(x) = app.divider_x
+            && m.column + 1 >= x
+            && m.column <= x
+            && app.panes_area.contains(at)
+        {
+            app.drag = Some(Drag::Columns);
+            app.drag_split_to(m.column);
+            return;
+        }
+        for side in [Side::Local, Side::Remote] {
+            let Some(area) = app.shell_area[side.index()] else {
+                continue;
+            };
+            // A zoomed shell has no border worth dragging: it already has
+            // everything, and the height being changed is the one it will go
+            // back to, which is not on screen to see.
+            if app.zoomed {
+                break;
+            }
+            if m.row + 1 >= area.y
+                && m.row <= area.y
+                && m.column >= area.x
+                && m.column < area.right()
+            {
+                app.drag = Some(Drag::ShellTop);
+                app.drag_shell_top_to(m.row);
+                return;
+            }
+        }
+    }
 
     // The tab bar, when there is one.
     if Some(m.row) == app.tab_bar_row {

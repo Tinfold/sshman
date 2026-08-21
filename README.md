@@ -85,7 +85,9 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `R` | reload both panes |
 | `Space` | mark a file |
 | `a` | mark all / clear marks |
-| **`c`** / `F5` | **copy to the other pane's directory** |
+| **`c`** / `F5` | **copy to the other pane's directory** (see below when zoomed) |
+| `M` | cut, to be put down elsewhere on the same side |
+| `P` | paste what `c` or `M` picked up into this directory |
 | `e` / `F4` | edit in `$EDITOR` |
 | `E` | edit with a program you name |
 | `v` | view in `$PAGER` |
@@ -103,17 +105,58 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `S` | open/close a shell under the focused pane |
 | `F6` / `Ctrl-]` | move the keyboard between the file list and the shell |
 | `Ctrl-↑` / `Ctrl-↓` | make the shell pane taller / shorter |
+| `m` / `F3` | give the whole screen to the focused pane, or undo that |
+| `Alt-←` / `Alt-→` | move the divider between the two sides |
+| `Alt-↑` / `Alt-↓` | move the top edge of the shell pane |
+| `=` | back to an even split |
 | `s` | toggle sudo mode |
 | `n` / `F7`, `r` / `F2`, `d` / `F8` | mkdir, rename, delete |
 | `C` | connection screen (recent servers + form) |
 | `?` | help |
 | `q` | quit |
 
-The mouse works too: scroll wheel, and click to focus a pane and select a row.
+The mouse works too: scroll wheel, click to focus a pane and select a row, and
+drag any border between panes to resize.
 
 Copying acts on your marked files, or on the row under the cursor if you have
 not marked anything. Directories are copied recursively, and existing files at
 the destination are overwritten. Deleting always asks first.
+
+## Pane sizes
+
+The two sides start on an even split with the shell, when there is one, taking
+the bottom of its column. Both dividers move: `Alt-←` and `Alt-→` for the one
+down the middle, `Alt-↑` and `Alt-↓` (or `Ctrl-↑` and `Ctrl-↓`) for the top
+edge of the shell, and dragging either border with the mouse does the same. The
+file list keeps three rows whatever the shell asks for, and neither side can be
+squeezed below a fifth of the width. `=` puts it all back.
+
+`m` gives the whole screen to whatever is focused, and `m`, `F3` or `Esc` gives
+the other panes back. The zoom follows the focus rather than pinning one pane,
+so `Tab` and `F6` work zoomed exactly as they do at any other size: you stay
+zoomed, on whatever you moved to. `F3` does the same job from inside a shell,
+where every other key belongs to the shell — including `m`.
+
+A zoomed shell is resized on the far end like any other, so full-screen `top`
+or `vim` gets the whole terminal.
+
+## Moving files about within one side
+
+With both panes on screen `c` copies across the middle. There is no across when
+one pane fills the screen, so there `c` picks the selection up instead and `P`
+puts it down in whatever directory you have navigated to since. `M` is the same
+but a move. The title bar shows what is being carried until it lands, and `Esc`
+drops it.
+
+Both halves of a paste run as one `cp -a` or `mv` on one machine — nothing is
+copied down and sent back — so it is as fast as the server is, works under sudo,
+and keeps modes, ownership and timestamps. Files never leave the side they came
+from: a clipboard picked up on the remote pane will not paste into the local one
+(`c` on an unzoomed pane is the key that copies between the two).
+
+Unlike `c`, a paste never overwrites. If any name is already taken in the
+destination, the whole paste stops and says which one, leaving everything as it
+was.
 
 ## Archives
 

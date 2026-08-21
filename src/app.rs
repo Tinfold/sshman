@@ -158,6 +158,40 @@ pub struct PendingEdit {
     pub tab: usize,
 }
 
+/// A pane border being dragged with the mouse. The drag lives across events:
+/// it starts on the press, follows every move, and ends on the release.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Drag {
+    /// The upright border between the two sides.
+    Columns,
+    /// The top edge of a shell pane, which is the same edge for both sides
+    /// because they share one height.
+    ShellTop,
+}
+
+/// Files waiting to be pasted somewhere else on the side they came from.
+///
+/// The names are relative to `dir`, exactly as a pane holds them, so a paste
+/// is one shell command run with `dir` as its working directory.
+#[derive(Clone, Debug)]
+pub struct Clip {
+    pub side: Side,
+    pub dir: String,
+    pub names: Vec<String>,
+    /// A move: the originals go away when it lands.
+    pub cut: bool,
+}
+
+impl Clip {
+    pub fn action(&self) -> crate::fileops::Action {
+        if self.cut {
+            crate::fileops::Action::Move
+        } else {
+            crate::fileops::Action::Copy
+        }
+    }
+}
+
 /// Something the main loop must do with the terminal released.
 pub enum UiAction {
     Editor {
@@ -480,6 +514,10 @@ pub struct PendingConnect {
     install_key: bool,
 }
 
+/// How far the divider between the two sides can be pushed either way.
+const MIN_SPLIT: i16 = 20;
+const MAX_SPLIT: i16 = 80;
+
 pub struct App {
     pub mode: Mode,
     pub focus: Side,
@@ -498,6 +536,20 @@ pub struct App {
     pub help_view_height: u16,
     /// Rows given to a shell pane, including its border.
     pub shell_height: u16,
+    /// Share of the width the local side gets, as a percentage.
+    pub split_pct: u16,
+    /// Only the focused pane is drawn, filling the space both sides usually
+    /// share. It follows the focus rather than remembering a pane of its own:
+    /// whatever you are looking at is what is zoomed.
+    pub zoomed: bool,
+    /// The block the two sides are drawn in, and the column the divider
+    /// landed on, both recorded by the renderer so a drag can be turned back
+    /// into a size without recomputing the layout.
+    pub panes_area: Rect,
+    pub divider_x: Option<u16>,
+    pub drag: Option<Drag>,
+    /// What `c` or `M` picked up, waiting for `P`.
+    pub clip: Option<Clip>,
     pub local: Pane,
     pub local_cwd: PathBuf,
     pub local_shell: Option<Shell>,
@@ -579,6 +631,12 @@ impl App {
             output_view_height: 1,
             help_view_height: 1,
             shell_height: 12,
+            split_pct: 50,
+            zoomed: false,
+            panes_area: Rect::ZERO,
+            divider_x: None,
+            drag: None,
+            clip: None,
             local: Pane::default(),
             local_cwd: local_start,
             local_shell: None,
@@ -887,10 +945,13 @@ impl App {
                     .output()
                 {
                     Ok(out) if out.status.success() => {
+                        // Warnings on stderr from something that still
+                        // succeeded — tar coping with a file that changed
+                        // while it was read, say — are worth passing on.
                         let warning = String::from_utf8_lossy(&out.stderr);
                         let mut message = success;
                         if let Some(line) = warning.lines().find(|l| !l.trim().is_empty()) {
-                            message.push_str(&format!(" — tar said: {}", line.trim()));
+                            message.push_str(&format!(" — {}", line.trim()));
                         }
                         LocalOutcome {
                             message,
@@ -916,7 +977,7 @@ impl App {
                         }
                     }
                     Err(e) => LocalOutcome {
-                        message: format!("could not run tar: {e}"),
+                        message: format!("could not run the command: {e}"),
                         failed: true,
                         output: None,
                         containers: None,
@@ -1599,6 +1660,14 @@ impl App {
             return;
         }
 
+        // Zooming is window management rather than input, so it keeps working
+        // while a shell has the keyboard — otherwise a zoomed shell could
+        // only be shrunk by leaving it first.
+        if self.mode == Mode::Browse && key.code == KeyCode::F(3) {
+            self.toggle_zoom();
+            return;
+        }
+
         // A focused shell owns the keyboard. Every key goes to it — Ctrl-C has
         // to interrupt the running command, not quit sshman — so the escape
         // key is checked first and is the only way back out.
@@ -1823,6 +1892,20 @@ impl App {
 
         // Checked ahead of plain navigation, which would otherwise swallow
         // these before the modifier is ever looked at.
+        //
+        // Alt does the whole layout: sideways moves the divider between the
+        // two sides, up and down moves the top edge of the shell. Ctrl-up and
+        // Ctrl-down do the shell too, since that pair was the resize keys
+        // before there was anything else to resize.
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Left => return self.resize_split(-2),
+                KeyCode::Right => return self.resize_split(2),
+                KeyCode::Up => return self.resize_shell_pane(1),
+                KeyCode::Down => return self.resize_shell_pane(-1),
+                _ => {}
+            }
+        }
         if ctrl && matches!(key.code, KeyCode::Up | KeyCode::Down) {
             let delta = if key.code == KeyCode::Up { 1 } else { -1 };
             self.resize_shell_pane(delta);
@@ -1857,6 +1940,11 @@ impl App {
                 } else if !pane.marked.is_empty() {
                     pane.marked.clear();
                     self.set_status("marks cleared", Level::Info);
+                } else if self.zoomed {
+                    self.toggle_zoom();
+                } else if self.clip.is_some() {
+                    self.clip = None;
+                    self.set_status("clipboard cleared", Level::Info);
                 } else {
                     self.set_status("press q to quit", Level::Info);
                 }
@@ -1889,7 +1977,18 @@ impl App {
                 }
             }
 
-            KeyCode::Char('c') | KeyCode::F(5) => self.copy_to_other_side(),
+            // With both sides on screen this is the copy across the middle.
+            // With one filling the screen there is no across, so it picks the
+            // selection up for a paste elsewhere on the same filesystem.
+            KeyCode::Char('c') | KeyCode::F(5) => {
+                if self.zoomed {
+                    self.yank(false);
+                } else {
+                    self.copy_to_other_side();
+                }
+            }
+            KeyCode::Char('M') => self.yank(true),
+            KeyCode::Char('P') => self.paste_clip(),
             KeyCode::Char('e') | KeyCode::F(4) => {
                 let program = self.editor.clone();
                 self.open_with(side, program);
@@ -1977,6 +2076,10 @@ impl App {
             KeyCode::Char('z') => self.start_archive(side),
             KeyCode::Char('x') => self.start_extract(side),
             KeyCode::Char('X') => self.list_archive(side),
+
+            // ---- layout ----
+            KeyCode::Char('m') => self.toggle_zoom(),
+            KeyCode::Char('=') => self.reset_layout(),
 
             // ---- embedded shells ----
             KeyCode::Char('S') => self.toggle_shell(side),
@@ -2485,6 +2588,89 @@ impl App {
             }
         }
         self.pane_mut(from).marked.clear();
+    }
+
+    /// Pick up what is marked, to be put down elsewhere on the same side.
+    ///
+    /// This is what `c` does when one pane fills the screen: there is no other
+    /// side on show to copy to, and the useful thing to do with a selection is
+    /// carry it to another directory of the same filesystem.
+    fn yank(&mut self, cut: bool) {
+        let side = self.focus;
+        if side == Side::Remote && !self.connected() {
+            self.set_status("not connected", Level::Bad);
+            return;
+        }
+        let names = self.pane(side).targets();
+        if names.is_empty() {
+            self.set_status("nothing selected", Level::Info);
+            return;
+        }
+        let count = names.len();
+        self.clip = Some(Clip {
+            side,
+            dir: self.path_of(side),
+            names,
+            cut,
+        });
+        self.pane_mut(side).marked.clear();
+        let verb = if cut { "cut" } else { "copied" };
+        self.set_status(
+            format!("{count} item(s) {verb} — go to a directory and press P"),
+            Level::Good,
+        );
+    }
+
+    /// Put what `c` or `M` picked up into the directory on screen.
+    fn paste_clip(&mut self) {
+        let Some(clip) = self.clip.clone() else {
+            self.set_status("nothing to paste — c copies, M cuts", Level::Info);
+            return;
+        };
+        let side = self.focus;
+        // Both halves of a paste run as one command on one machine, so the
+        // clipboard cannot cross the middle. `c` on an unzoomed pane is the
+        // key that copies between the two.
+        if clip.side != side {
+            self.set_status(
+                format!(
+                    "that came from the {} side — Tab back to it, or use c to copy across",
+                    side_name(clip.side)
+                ),
+                Level::Bad,
+            );
+            return;
+        }
+        if side == Side::Remote && !self.connected() {
+            self.set_status("not connected", Level::Bad);
+            return;
+        }
+        let dest = self.path_of(side);
+        let action = clip.action();
+        let count = clip.names.len();
+        let verb = action.past_tense();
+
+        match side {
+            Side::Local => {
+                let cmd = crate::fileops::paste_command(&clip.dir, &clip.names, &dest, action);
+                self.spawn_local_command(
+                    format!("{verb} {count} item(s)"),
+                    cmd,
+                    format!("{count} item(s) {verb} into {dest}"),
+                );
+            }
+            Side::Remote => self.send(Req::Paste {
+                dir: clip.dir.clone(),
+                names: clip.names.clone(),
+                dest,
+                cut: clip.cut,
+                sudo: self.sudo(),
+            }),
+        }
+        // A copy can land in several places; a move only happens once.
+        if clip.cut {
+            self.clip = None;
+        }
     }
 
     fn request_delete(&mut self, side: Side) {
@@ -3207,10 +3393,78 @@ impl App {
     /// Grow (positive) or shrink the shell pane on the focused side.
     fn resize_shell_pane(&mut self, delta: i16) {
         if !self.has_shell(self.focus) {
+            self.set_status("no shell on this side — S opens one", Level::Info);
             return;
         }
         let next = (self.shell_height as i16 + delta).clamp(3, 60);
         self.shell_height = next as u16;
+    }
+
+    /// Move the divider between the two sides. Positive widens the local side.
+    ///
+    /// Both ends are capped well short of nothing: a pane narrow enough to
+    /// show only a border is not a pane, and getting back out of one with the
+    /// mouse would be fiddly.
+    fn resize_split(&mut self, delta: i16) {
+        if self.zoomed {
+            self.set_status(
+                "one pane fills the screen — m brings the other back",
+                Level::Info,
+            );
+            return;
+        }
+        self.split_pct = (self.split_pct as i16 + delta).clamp(MIN_SPLIT, MAX_SPLIT) as u16;
+    }
+
+    /// Put the divider under the mouse, from a drag.
+    pub fn drag_split_to(&mut self, x: u16) {
+        let area = self.panes_area;
+        if area.width == 0 {
+            return;
+        }
+        let offset = x.saturating_sub(area.x).min(area.width) as u32;
+        let pct = (offset * 100 / area.width as u32) as i16;
+        self.split_pct = pct.clamp(MIN_SPLIT, MAX_SPLIT) as u16;
+    }
+
+    /// Put the top edge of the shell pane under the mouse, from a drag. The
+    /// shell sits against the bottom of the panes, so the row it starts on is
+    /// all its height amounts to.
+    pub fn drag_shell_top_to(&mut self, row: u16) {
+        let height = self.panes_area.bottom().saturating_sub(row);
+        // Never more than the panes have between them: the drawing keeps
+        // three rows for the file list on top of that.
+        let ceiling = self.panes_area.height.clamp(3, 60);
+        self.shell_height = height.clamp(3, ceiling);
+    }
+
+    /// Back to an even split with a shell of the height we started with.
+    fn reset_layout(&mut self) {
+        self.split_pct = 50;
+        self.shell_height = 12;
+        self.zoomed = false;
+        self.set_status("layout reset", Level::Info);
+    }
+
+    /// Give the whole area to the focused pane, or hand it back.
+    ///
+    /// The zoom follows the focus afterwards, so Tab and F6 keep working the
+    /// way they do at any other size — you stay zoomed, on whatever you moved
+    /// to — and there is nothing to remember about which pane was blown up.
+    fn toggle_zoom(&mut self) {
+        self.zoomed = !self.zoomed;
+        if self.zoomed {
+            let what = match self.region {
+                Region::Files => side_name(self.focus).to_string(),
+                Region::Shell => format!("{} shell", side_name(self.focus)),
+            };
+            self.set_status(
+                format!("{what} fills the screen — m or F3 brings the other panes back"),
+                Level::Info,
+            );
+        } else {
+            self.set_status("both sides again", Level::Info);
+        }
     }
 
     /// The local pane's shell, or the active tab's.
@@ -3429,4 +3683,254 @@ fn file_signature(path: &std::path::Path) -> Option<(i64, u64)> {
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
     Some((mtime, meta.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::KeyEventState;
+    use std::path::Path;
+
+    /// An app looking at a scratch directory, with nothing connected — the
+    /// local side is the half that works without a server. Without a server
+    /// to connect to it would open on the connection screen, and these are
+    /// all about the keys that browsing takes.
+    fn app_in(dir: &Path) -> App {
+        let mut app = App::new(ConnectOpts::default(), dir.to_path_buf(), None, false);
+        app.mode = Mode::Browse;
+        app.status.clear();
+        app
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sshman-app-{}-{name}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("one.txt"), b"one\n").unwrap();
+        dir
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.on_key(KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+    }
+
+    fn select(app: &mut App, name: &str) {
+        let index = app
+            .local
+            .view
+            .iter()
+            .position(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} is not in the pane"));
+        app.local.select_index(index);
+    }
+
+    #[test]
+    fn c_copies_across_until_a_pane_is_zoomed() {
+        let dir = scratch("c-key");
+        let mut app = app_in(&dir);
+        select(&mut app, "one.txt");
+
+        // Both panes on screen: c is the copy to the other side, which
+        // without a server has nowhere to go.
+        press(&mut app, 'c');
+        assert!(app.clip.is_none(), "c must not pick anything up here");
+        assert_eq!(app.status, "not connected");
+
+        // Zoomed there is no other side, so the same key picks files up.
+        press(&mut app, 'm');
+        assert!(app.zoomed);
+        press(&mut app, 'c');
+        let clip = app.clip.as_ref().expect("c picked the file up");
+        assert_eq!(clip.names, ["one.txt"]);
+        assert!(!clip.cut, "c copies");
+        assert_eq!(clip.side, Side::Local);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_copy_lands_in_the_directory_on_screen() {
+        let dir = scratch("paste");
+        let mut app = app_in(&dir);
+        select(&mut app, "one.txt");
+        press(&mut app, 'm');
+        press(&mut app, 'c');
+
+        app.goto_local(dir.join("dst"));
+        press(&mut app, 'P');
+
+        // The copy runs off the UI thread, as every local command does.
+        let landed = dir.join("dst/one.txt");
+        for _ in 0..200 {
+            if landed.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&landed).unwrap(), "one\n");
+        assert!(
+            dir.join("one.txt").exists(),
+            "a copy leaves the original alone"
+        );
+        assert!(app.clip.is_some(), "and can be pasted somewhere else too");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_paste_onto_a_name_already_there_says_so_and_writes_nothing() {
+        let dir = scratch("clobber");
+        std::fs::write(dir.join("dst/one.txt"), b"do not lose me\n").unwrap();
+        let mut app = app_in(&dir);
+        select(&mut app, "one.txt");
+        press(&mut app, 'm');
+        press(&mut app, 'c');
+
+        app.goto_local(dir.join("dst"));
+        press(&mut app, 'P');
+        for _ in 0..200 {
+            app.drain_workers();
+            if app.status_level == Level::Bad {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            app.status.contains("one.txt is already there"),
+            "it has to name the file in the way: {}",
+            app.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dst/one.txt")).unwrap(),
+            "do not lose me\n",
+            "and leave it alone"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cut_is_used_up_by_the_paste_that_lands_it() {
+        let dir = scratch("cut");
+        let mut app = app_in(&dir);
+        select(&mut app, "one.txt");
+        press(&mut app, 'M');
+        assert!(app.clip.as_ref().unwrap().cut);
+
+        app.goto_local(dir.join("dst"));
+        press(&mut app, 'P');
+        assert!(app.clip.is_none(), "a move only happens once");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_clipboard_does_not_cross_the_middle() {
+        let dir = scratch("cross");
+        let mut app = app_in(&dir);
+        app.clip = Some(Clip {
+            side: Side::Remote,
+            dir: "/etc".into(),
+            names: vec!["hosts".into()],
+            cut: false,
+        });
+        press(&mut app, 'P');
+        assert!(
+            app.status.contains("remote"),
+            "it has to say why: {}",
+            app.status
+        );
+        assert!(app.clip.is_some(), "and hold on to what it has");
+        assert!(
+            !dir.join("hosts").exists(),
+            "nothing may be written locally"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nothing_is_picked_up_from_an_empty_selection() {
+        let dir = scratch("empty");
+        let mut app = app_in(&dir);
+        app.local.state.select(None);
+        press(&mut app, 'M');
+        assert!(app.clip.is_none());
+        assert_eq!(app.status, "nothing selected");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zoom_follows_the_focus_and_esc_undoes_it() {
+        let dir = scratch("zoom");
+        let mut app = app_in(&dir);
+        assert!(!app.zoomed);
+        press(&mut app, 'm');
+        assert!(app.zoomed);
+        // Esc is the other way out, once it has nothing else to clear.
+        app.on_key(KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert!(!app.zoomed);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_divider_follows_the_mouse_but_leaves_both_sides_usable() {
+        let dir = scratch("divider");
+        let mut app = app_in(&dir);
+        app.panes_area = Rect::new(0, 2, 100, 20);
+
+        app.drag_split_to(70);
+        assert_eq!(app.split_pct, 70);
+        // Dragged off either end, both panes stay wide enough to use.
+        app.drag_split_to(0);
+        assert_eq!(app.split_pct, MIN_SPLIT as u16);
+        app.drag_split_to(100);
+        assert_eq!(app.split_pct, MAX_SPLIT as u16);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_shell_edge_follows_the_mouse_within_its_limits() {
+        let dir = scratch("shell-edge");
+        let mut app = app_in(&dir);
+        app.panes_area = Rect::new(0, 2, 100, 30);
+
+        // The shell runs from the row under the cursor to the bottom.
+        app.drag_shell_top_to(22);
+        assert_eq!(app.shell_height, 10);
+        // Dragged past the top, it stops rather than swallowing the screen.
+        app.drag_shell_top_to(0);
+        assert_eq!(app.shell_height, 30);
+        // And it never shrinks to nothing.
+        app.drag_shell_top_to(99);
+        assert_eq!(app.shell_height, 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resetting_puts_the_layout_back() {
+        let dir = scratch("reset");
+        let mut app = app_in(&dir);
+        app.split_pct = 75;
+        app.shell_height = 30;
+        app.zoomed = true;
+        press(&mut app, '=');
+        assert_eq!(
+            (app.split_pct, app.shell_height, app.zoomed),
+            (50, 12, false)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

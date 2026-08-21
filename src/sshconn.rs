@@ -1512,6 +1512,81 @@ mod live {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Copying and moving inside the server, which is what a paste does when
+    /// one pane fills the screen and there is no other side to copy to.
+    #[test]
+    #[ignore = "needs a live SSH server"]
+    fn pastes_happen_entirely_on_the_far_end() {
+        use crate::fileops::{Action, paste_command};
+
+        let Some(mut c) = connect() else { return };
+        c.sudo_password = env("SSHMAN_TEST_SUDO_PASS");
+        let home = c.home.clone();
+        let (src, dst) = (rjoin(&home, "paste/src"), rjoin(&home, "paste/dst"));
+
+        // A name with a space in it, because the command loops over the names
+        // in the shell and that is where quoting goes wrong.
+        c.exec(&format!(
+            "rm -rf {home}/paste && mkdir -p {src} {dst} \
+             && echo hello > {src}/'a file.txt' && chmod 640 {src}/'a file.txt'",
+            home = sh_quote(&home),
+            src = sh_quote(&src),
+            dst = sh_quote(&dst),
+        ))
+        .expect("set up the fixture");
+
+        let names = vec!["a file.txt".to_string()];
+        let (_, _, code) = c
+            .run(&paste_command(&src, &names, &dst, Action::Copy), false)
+            .unwrap();
+        assert_eq!(code, 0, "the copy should have run");
+        let (meta, _, _) = c
+            .exec(&format!("stat -c '%a' {}/'a file.txt'", sh_quote(&dst)))
+            .unwrap();
+        assert_eq!(meta.trim(), "640", "a copy carries the original's mode");
+
+        // Again, onto what is now there: nothing may be overwritten, and the
+        // message has to name the file in the way.
+        let (_, err, code) = c
+            .run(&paste_command(&src, &names, &dst, Action::Copy), false)
+            .unwrap();
+        assert_ne!(code, 0, "the second copy must refuse");
+        assert!(
+            err.contains("a file.txt is already there"),
+            "and say which file: {err:?}"
+        );
+
+        // A move empties the source rather than duplicating it.
+        let onward = rjoin(&home, "paste/onward");
+        c.mkdir(&onward, false).expect("mkdir");
+        let (_, _, code) = c
+            .run(&paste_command(&dst, &names, &onward, Action::Move), false)
+            .unwrap();
+        assert_eq!(code, 0);
+        let (out, _, _) = c
+            .exec(&format!(
+                "ls {} | wc -l; ls {}",
+                sh_quote(&dst),
+                sh_quote(&onward)
+            ))
+            .unwrap();
+        assert!(out.starts_with('0'), "the source is empty now: {out:?}");
+        assert!(out.contains("a file.txt"), "and the file is over there");
+
+        // And with sudo it reaches where the login user cannot go.
+        c.check_sudo().expect("sudo should work for the test user");
+        let (_, _, code) = c
+            .run(&paste_command(&src, &names, "/root", Action::Copy), true)
+            .unwrap();
+        assert_eq!(code, 0, "a paste as root lands in /root");
+        let (out, _, _) = c.exec_sudo("cat /root/'a file.txt'").unwrap();
+        assert_eq!(out, "hello\n");
+
+        c.exec_sudo("rm -f /root/'a file.txt'").expect("cleanup");
+        c.exec(&format!("rm -rf {}/paste", sh_quote(&home)))
+            .expect("cleanup");
+    }
+
     #[test]
     #[ignore = "needs a live SSH server"]
     fn exec_reports_output_and_exit_status() {

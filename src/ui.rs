@@ -39,11 +39,26 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_tab_bar(f, app, rows[1]);
     }
 
-    let cols =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[2]);
+    // Recorded for the mouse, and cleared first so a pane that is not drawn
+    // this frame cannot be clicked on where it used to be.
+    app.panes_area = rows[2];
+    app.files_area = [Rect::ZERO; 2];
+    app.shell_area = [None, None];
+    app.divider_x = None;
 
-    draw_side(f, app, Side::Local, cols[0]);
-    draw_side(f, app, Side::Remote, cols[1]);
+    if app.zoomed {
+        draw_side(f, app, app.focus, rows[2], Some(app.region));
+    } else {
+        let left = app.split_pct;
+        let cols = Layout::horizontal([
+            Constraint::Percentage(left),
+            Constraint::Percentage(100 - left),
+        ])
+        .split(rows[2]);
+        app.divider_x = Some(cols[1].x);
+        draw_side(f, app, Side::Local, cols[0], None);
+        draw_side(f, app, Side::Remote, cols[1], None);
+    }
 
     if gauge_h == 1 {
         draw_progress(f, app, rows[3]);
@@ -112,6 +127,27 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(
             label,
             Style::new().fg(Color::Black).bg(Color::Red).bold(),
+        ));
+    }
+    if app.zoomed {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            " ZOOM ",
+            Style::new().fg(Color::Black).bg(ACCENT).bold(),
+        ));
+    }
+    // What is on the clipboard has to survive the walk to wherever it is going,
+    // and the status line will have moved on by then.
+    if let Some(clip) = &app.clip {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!(
+                " {} {} {} ",
+                if clip.cut { "✂" } else { "⧉" },
+                clip.names.len(),
+                if clip.cut { "cut" } else { "copied" }
+            ),
+            Style::new().fg(Color::Black).bg(Color::Magenta).bold(),
         ));
     }
     // A workspace can leave connections waiting on a password. That must not
@@ -188,18 +224,36 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// One side of the screen: the file list, and its shell underneath when open.
-fn draw_side(f: &mut Frame, app: &mut App, side: Side, area: Rect) {
-    let (files_area, shell_area) = match app.has_shell(side) {
-        // Always leave the file list at least three rows, however far the
-        // shell has been grown.
-        true => {
-            let height = app.shell_height.min(area.height.saturating_sub(3)).max(3);
+/// How one side's area divides between its file list and its shell.
+///
+/// `zoom` is the region that has been given the whole screen. A zoomed shell
+/// that has since been closed leaves nothing to draw, so the files take the
+/// space back rather than the screen going blank.
+fn side_areas(
+    area: Rect,
+    zoom: Option<Region>,
+    has_shell: bool,
+    shell_height: u16,
+) -> (Rect, Option<Rect>) {
+    match zoom {
+        Some(Region::Shell) if has_shell => (Rect::ZERO, Some(area)),
+        Some(_) => (area, None),
+        None if has_shell => {
+            // Always leave the file list at least three rows, however far the
+            // shell has been grown.
+            let height = shell_height.min(area.height.saturating_sub(3)).max(3);
             let parts =
                 Layout::vertical([Constraint::Min(3), Constraint::Length(height)]).split(area);
             (parts[0], Some(parts[1]))
         }
-        false => (area, None),
-    };
+        None => (area, None),
+    }
+}
+
+/// One side of the screen: its file list, and its shell below when there is
+/// one.
+fn draw_side(f: &mut Frame, app: &mut App, side: Side, area: Rect, zoom: Option<Region>) {
+    let (files_area, shell_area) = side_areas(area, zoom, app.has_shell(side), app.shell_height);
 
     app.files_area[side.index()] = files_area;
     app.shell_area[side.index()] = shell_area;
@@ -214,16 +268,18 @@ fn draw_side(f: &mut Frame, app: &mut App, side: Side, area: Rect) {
     let files_focused = app.focus == side && app.region == Region::Files;
     let shell_focused = app.focus == side && app.region == Region::Shell;
 
-    draw_pane(
-        f,
-        files_area,
-        label,
-        &path,
-        app.pane_mut(side),
-        files_focused,
-        sudo,
-        live,
-    );
+    if files_area.height > 0 {
+        draw_pane(
+            f,
+            files_area,
+            label,
+            &path,
+            app.pane_mut(side),
+            files_focused,
+            sudo,
+            live,
+        );
+    }
 
     if let Some(area) = shell_area {
         draw_shell(f, app, side, area, shell_focused);
@@ -567,10 +623,31 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
     let hints: &[(&str, &str)] = match app.mode {
         // A focused shell takes every key, so only the way out is worth showing.
+        Mode::Browse if app.region == Region::Shell && app.zoomed => &[
+            ("F6", "back to files"),
+            ("F3", "unzoom"),
+            ("", "every other key goes to the shell"),
+        ],
         Mode::Browse if app.region == Region::Shell => &[
             ("F6", "back to files"),
             ("Ctrl-]", "same"),
+            ("F3", "zoom"),
             ("", "every other key goes to the shell"),
+        ],
+        // Zoomed, the keys that act across the middle have nothing to act on,
+        // so the ones that work inside one filesystem take their place.
+        Mode::Browse if app.zoomed => &[
+            ("Tab", "side"),
+            ("↵", "open"),
+            ("Space", "mark"),
+            ("c", "copy"),
+            ("M", "cut"),
+            ("P", "paste"),
+            ("m", "unzoom"),
+            ("e", "edit"),
+            ("d", "del"),
+            ("?", "help"),
+            ("q", "quit"),
         ],
         Mode::Browse => &[
             ("Tab", "pane"),
@@ -578,6 +655,7 @@ fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
             ("Space", "mark"),
             ("c", "copy →"),
             ("e", "edit"),
+            ("m", "zoom"),
             ("S", "shell"),
             ("T", "tab"),
             ("w", "workspaces"),
@@ -1292,6 +1370,50 @@ pub const HELP: &[(&str, &str)] = &[
         "  (marks are optional — with none, the cursor row is used)",
     ),
     ("", ""),
+    ("", "Moving files about within one side"),
+    ("M", "cut marked files, to be put down elsewhere"),
+    ("P", "paste them into the directory on screen"),
+    (
+        "",
+        "  With one pane zoomed there is no other side to copy to, so",
+    ),
+    (
+        "",
+        "  c picks files up instead of copying across. Both keys stay",
+    ),
+    (
+        "",
+        "  on the side they started on: a paste is one command on one",
+    ),
+    (
+        "",
+        "  machine, and nothing is ever overwritten — a name already",
+    ),
+    ("", "  in the way stops the whole paste with a message."),
+    ("Esc", "drop what was picked up"),
+    ("", ""),
+    ("", "Pane sizes"),
+    (
+        "m / F3",
+        "give the whole screen to the focused pane, or undo that",
+    ),
+    (
+        "",
+        "  The zoom follows the focus, so Tab and F6 keep working and",
+    ),
+    (
+        "",
+        "  m, F3 or Esc brings the other panes back. F3 works from",
+    ),
+    (
+        "",
+        "  inside a shell, where every other key is the shell's.",
+    ),
+    ("Alt-← / Alt-→", "move the divider between the two sides"),
+    ("Alt-↑ / Alt-↓", "move the top edge of the shell pane"),
+    ("drag a border", "the same, with the mouse"),
+    ("=", "back to an even split"),
+    ("", ""),
     ("", "Shells inside the panes"),
     ("S", "open or close a shell under the focused pane"),
     (
@@ -1304,6 +1426,7 @@ pub const HELP: &[(&str, &str)] = &[
     ),
     ("", "  Ctrl-C and Esc. F6 is the way back out."),
     ("Ctrl-↑ / Ctrl-↓", "make the shell pane taller or shorter"),
+    ("F3", "give the shell the whole screen, or undo that"),
     ("wheel", "scroll the shell's history"),
     (
         "",
@@ -1481,5 +1604,61 @@ fn centered_line(area: Rect) -> Rect {
         y: area.y + area.height / 2,
         height: 1,
         ..area
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIDE: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 24,
+    };
+
+    #[test]
+    fn a_side_without_a_shell_is_all_files() {
+        let (files, shell) = side_areas(SIDE, None, false, 12);
+        assert_eq!(files, SIDE);
+        assert_eq!(shell, None);
+    }
+
+    #[test]
+    fn a_shell_takes_its_height_off_the_bottom() {
+        let (files, shell) = side_areas(SIDE, None, true, 8);
+        let shell = shell.expect("there is a shell");
+        assert_eq!(shell.height, 8);
+        assert_eq!(shell.y, SIDE.bottom() - 8);
+        assert_eq!(files.height, SIDE.height - 8);
+    }
+
+    #[test]
+    fn the_file_list_keeps_three_rows_whatever_the_shell_asks_for() {
+        let (files, shell) = side_areas(SIDE, None, true, 100);
+        assert_eq!(files.height, 3, "the list is never squeezed out");
+        assert_eq!(shell.unwrap().height, SIDE.height - 3);
+    }
+
+    #[test]
+    fn zooming_the_files_leaves_no_shell_to_draw() {
+        let (files, shell) = side_areas(SIDE, Some(Region::Files), true, 8);
+        assert_eq!(files, SIDE, "the files take the whole side");
+        assert_eq!(shell, None);
+    }
+
+    #[test]
+    fn zooming_the_shell_leaves_no_files_to_draw() {
+        let (files, shell) = side_areas(SIDE, Some(Region::Shell), true, 8);
+        assert_eq!(shell, Some(SIDE));
+        assert_eq!(files.height, 0, "nothing is drawn for the list");
+    }
+
+    #[test]
+    fn a_zoomed_shell_that_has_gone_away_gives_the_space_back() {
+        let (files, shell) = side_areas(SIDE, Some(Region::Shell), false, 8);
+        assert_eq!(files, SIDE, "closing the shell must not blank the screen");
+        assert_eq!(shell, None);
     }
 }

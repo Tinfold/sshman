@@ -72,6 +72,14 @@ pub enum Req {
         archive: String,
         sudo: bool,
     },
+    /// Copy or move files from `dir` into `dest`, both on the far end.
+    Paste {
+        dir: String,
+        names: Vec<String>,
+        dest: String,
+        cut: bool,
+        sudo: bool,
+    },
     /// Unpack `archive` from `dir` into `dest`.
     Extract {
         dir: String,
@@ -446,7 +454,8 @@ fn req_wants_sudo(req: &Req) -> bool {
         | Req::FetchForEdit { sudo, .. }
         | Req::Archive { sudo, .. }
         | Req::Extract { sudo, .. }
-        | Req::PushEdit { sudo, .. } => *sudo,
+        | Req::PushEdit { sudo, .. }
+        | Req::Paste { sudo, .. } => *sudo,
         _ => false,
     }
 }
@@ -466,6 +475,11 @@ fn describe(req: &Req) -> String {
         Req::Delete { paths, .. } => format!("deleting {} item(s)…", paths.len()),
         Req::FetchForEdit { path, .. } => format!("fetching {path}…"),
         Req::PushEdit { path, .. } => format!("saving {path}…"),
+        Req::Paste { names, cut, .. } => format!(
+            "{} {} item(s)…",
+            if *cut { "moving" } else { "copying" },
+            names.len()
+        ),
         Req::SetSudo(_) => "checking sudo…".into(),
         Req::Connect(_) | Req::Quit => String::new(),
     }
@@ -688,6 +702,39 @@ fn handle_inner(
                     "tar failed (exit {code}): {}",
                     first_line(if err.trim().is_empty() { &out } else { &err })
                 ))),
+                Err(e) => reply.send(Resp::Failed(e.to_string())),
+            }
+        }
+
+        Req::Paste {
+            dir,
+            names,
+            dest,
+            cut,
+            sudo,
+        } => {
+            let action = if cut {
+                crate::fileops::Action::Move
+            } else {
+                crate::fileops::Action::Copy
+            };
+            let count = names.len();
+            let cmd = crate::fileops::paste_command(&dir, &names, &dest, action);
+            match c.run(&cmd, sudo) {
+                Ok((_, _, 0)) => reply.send(Resp::Done {
+                    msg: format!("{count} item(s) {} into {dest}", action.past_tense()),
+                    refresh_local: false,
+                    refresh_remote: true,
+                }),
+                // The refusal to overwrite arrives this way, and its message
+                // names the file that is in the way.
+                Ok((out, err, _)) => {
+                    reply.send(Resp::Failed(first_line(if err.trim().is_empty() {
+                        &out
+                    } else {
+                        &err
+                    })))
+                }
                 Err(e) => reply.send(Resp::Failed(e.to_string())),
             }
         }
