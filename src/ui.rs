@@ -59,6 +59,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.term_inner.clear();
     app.zoom_buttons.clear();
     app.close_buttons.clear();
+    app.pane_titles.clear();
 
     for (slot, rect) in app.areas.panes.clone() {
         draw_slot(f, app, slot, rect);
@@ -359,22 +360,35 @@ fn draw_slot(f: &mut Frame, app: &mut App, slot: Slot, area: Rect) {
         Slot::Files { .. } => draw_files(f, app, slot, area, focused, buttons),
         Slot::Term { .. } => draw_shell(f, app, slot, area, focused, buttons),
     }
-    // With the keyboard handed to sshman, the focused pane is the one the
-    // arrows are pointing at rather than the one being typed in — worth
-    // saying on the pane itself, since ↵ is what tells them apart.
-    if focused && app.commanding && area.width >= MIN_WIDTH_FOR_BUTTON {
-        let theme = app.theme;
-        let chip = Line::from(Span::styled(
-            " ↵ use this pane ",
-            Style::new().fg(theme.on_accent).bg(theme.accent).bold(),
+    // What the pane is in the middle of, said on the pane itself: which one
+    // the arrows are pointing at while sshman holds the keyboard, which one
+    // has been picked up, and where a dragged one would land.
+    let theme = app.theme;
+    let chip = if app.carrying && focused {
+        Some((" ✥ moving this pane ", theme.warn))
+    } else if app.moving == Some(slot) {
+        Some((" ✥ moving ", theme.warn))
+    } else if app.moving.is_some() && app.move_over == Some(slot) {
+        Some((" change places ", theme.good))
+    } else if app.commanding && focused {
+        Some((" ↵ use this pane ", theme.accent))
+    } else {
+        None
+    };
+    if let Some((text, colour)) = chip
+        && area.width >= MIN_WIDTH_FOR_BUTTON
+    {
+        let line = Line::from(Span::styled(
+            text,
+            Style::new().fg(theme.on_accent).bg(colour).bold(),
         ));
         let at = Rect {
             x: area.x + 2,
             y: area.bottom().saturating_sub(1),
-            width: (area.width - 3).min(17),
+            width: (area.width - 3).min(text.chars().count() as u16),
             height: 1,
         };
-        f.render_widget(chip, at);
+        f.render_widget(line, at);
     }
 }
 
@@ -406,6 +420,7 @@ fn draw_files(
 ) {
     let side = slot.host();
     let label = files_label(app, slot);
+    place_title(app, slot, area, &label);
     let target = app.target() == Some(slot);
     let path = app.path_of(slot);
     let sudo = side == Side::Remote && app.sudo();
@@ -441,6 +456,7 @@ fn draw_shell(
     let label = app.shell(slot).map(|s| s.label.clone()).unwrap_or_default();
     let scrolled = app.shell(slot).map(|s| s.scrollback()).unwrap_or(0);
     let editor = app.term(slot).is_some_and(|t| t.is_editor());
+    place_title(app, slot, area, if editor { "EDITOR" } else { "SHELL" });
 
     let colour = if !alive {
         theme.dim
@@ -603,6 +619,31 @@ fn button_area(area: Rect, from_right: u16) -> Rect {
 ///
 /// The renderer records them as it goes, so a click is matched against what
 /// was actually drawn rather than against a second guess at the layout.
+/// Where a pane's name is written, which is what a drag takes hold of to move
+/// the pane. Recorded by the renderer, so a click is matched against what was
+/// actually drawn.
+fn place_title(app: &mut App, slot: Slot, area: Rect, label: &str) {
+    // Zoomed there is nowhere to drop it: the drag would be a click that did
+    // nothing and looked like it should have.
+    if app.areas.panes.len() < 2 {
+        return;
+    }
+    // ` LABEL `, starting one cell in from the corner.
+    let width = label.chars().count() as u16 + 2;
+    if width + 4 > area.width {
+        return;
+    }
+    app.pane_titles.push((
+        Rect {
+            x: area.x + 1,
+            y: area.y,
+            width,
+            height: 1,
+        },
+        slot,
+    ));
+}
+
 fn place_buttons(app: &mut App, slot: Slot, area: Rect) -> Buttons {
     let buttons = Buttons {
         zoomed: app.zoomed,
@@ -984,6 +1025,7 @@ const COMMAND: &[Hint] = &[
     ("↑↓←→", "pane"),
     ("↵", "use it"),
     ("Shift-↑↓←→", "resize"),
+    ("g", "move it"),
     ("S", "shell"),
     ("T", "list"),
     ("F9", "close"),
@@ -993,6 +1035,13 @@ const COMMAND: &[Hint] = &[
     ("C", "connect"),
     ("?", "help"),
     ("Esc", "back"),
+];
+/// And while one of them has been picked up.
+const CARRYING: &[Hint] = &[
+    ("↑↓←→", "shove it past its neighbour"),
+    ("Shift-↑↓←→", "send it to that edge"),
+    ("↵", "drop it and use it"),
+    ("Esc", "put it down"),
 ];
 /// With one pane the keys that act across the middle have nothing to act on,
 /// so the ones that work inside one filesystem take their place. The only
@@ -1088,6 +1137,7 @@ const ALL_HINTS: &[&[Hint]] = &[
     SHELL_ZOOMED,
     SHELL,
     COMMAND,
+    CARRYING,
     ZOOMED,
     LOCAL_TAB,
     BROWSE,
@@ -1109,6 +1159,7 @@ fn hints_for(app: &App) -> &'static [Hint<'static>] {
     match app.mode {
         // Waiting on the key after Ctrl-], the only useful thing to show is
         // what that key can be.
+        Mode::Browse if app.carrying => CARRYING,
         Mode::Browse if app.commanding => COMMAND,
         // A focused shell takes every key, so only the way out is worth
         // showing.
@@ -2171,6 +2222,23 @@ pub const HELP: &[(&str, &str)] = &[
     ),
     ("↵", "hand the keyboard to the pane you have moved to"),
     ("Shift-↑↓←→", "move the border nearest it"),
+    ("g", "pick the pane up, to move it rather than the keyboard"),
+    ("", "  ↑ ↓ ← →  shove it past its neighbour"),
+    ("", "  Shift-↑↓←→  send it to that edge, a column or a row"),
+    ("", "  ↵  drop it and use it     Esc  put it down"),
+    (
+        "",
+        "  The keyboard goes with the pane, so the arrows keep meaning",
+    ),
+    (
+        "",
+        "  the same thing however far it has travelled. Dragging a pane",
+    ),
+    (
+        "",
+        "  by its name and letting go over another does the same with",
+    ),
+    ("", "  the mouse."),
     ("Esc / Ctrl-]", "put the keyboard back where it was"),
     (
         "",
@@ -2853,6 +2921,31 @@ mod tests {
         assert!(!reversed(6), "just after it");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pane_is_taken_hold_of_where_its_name_is_written() {
+        // The mouse moves a pane by its name, so what was recorded to click
+        // on has to be where the name actually landed.
+        let (app, rows) = frame(110, 30, |_| {});
+        assert_eq!(app.pane_titles.len(), 2, "one per pane on screen");
+        for (rect, slot) in &app.pane_titles {
+            let text: String = rows[rect.y as usize]
+                .chars()
+                .skip(rect.x as usize)
+                .take(rect.width as usize)
+                .collect();
+            let label = files_label(&app, *slot);
+            assert_eq!(text, format!(" {label} "), "at {rect:?}");
+        }
+    }
+
+    #[test]
+    fn the_only_pane_there_is_offers_nothing_to_take_hold_of() {
+        // There is nowhere to move it to, so the drag would be a click that
+        // did nothing and looked like it should have.
+        let (app, _) = frame(110, 30, |app| app.zoomed = true);
+        assert!(app.pane_titles.is_empty(), "{:?}", app.pane_titles);
     }
 
     #[test]

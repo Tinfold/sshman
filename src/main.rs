@@ -380,6 +380,19 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         return;
     }
 
+    // A pane being carried by its name follows the mouse until it is let go
+    // of, and lands on whatever pane it is over.
+    if app.moving.is_some() {
+        match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                app.move_over = app.areas.at(m.column, m.row);
+            }
+            MouseEventKind::Up(MouseButton::Left) => app.drop_moved_pane(),
+            _ => {}
+        }
+        return;
+    }
+
     // A drag in progress owns the mouse until the button comes back up, so
     // that leaving the border behind while moving does not drop it.
     if app.drag.is_some() {
@@ -425,6 +438,26 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
             app.click_zoom_button(slot);
             return;
         }
+    }
+
+    // A pane is picked up by its name, which is why the name is drawn where
+    // it is. Tested before the borders: the name sits on one, and a pane you
+    // meant to move is not a border you meant to drag.
+    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some((_, slot)) = app
+            .pane_titles
+            .iter()
+            .find(|(rect, _)| rect.contains(at))
+            .copied()
+    {
+        app.focus_pane(slot);
+        app.moving = Some(slot);
+        app.move_over = None;
+        app.set_status(
+            "moving this pane — let go over another to change places",
+            app::Level::Info,
+        );
+        return;
     }
 
     // Pressing on a border starts a resize rather than reaching the pane

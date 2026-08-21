@@ -672,6 +672,9 @@ pub struct App {
     /// Where each pane's buttons were drawn, and which pane they belong to.
     pub zoom_buttons: Vec<(Rect, Slot)>,
     pub close_buttons: Vec<(Rect, Slot)>,
+    /// Where each pane's name was drawn, which is what the mouse takes hold
+    /// of to move the pane.
+    pub pane_titles: Vec<(Rect, Slot)>,
     /// Screen span of each tab chip, recorded by the renderer so a click can
     /// be matched to a tab.
     pub tab_spans: Vec<(u16, u16, usize)>,
@@ -756,6 +759,13 @@ pub struct App {
     pub commanding: bool,
     /// The pane the keyboard came from, so `Esc` can put it back.
     command_from: Option<Slot>,
+    /// The focused pane has been picked up: the arrows shove it about the
+    /// arrangement rather than moving the keyboard through it.
+    pub carrying: bool,
+    /// A pane being dragged by its name with the mouse, and the pane it would
+    /// change places with if the button came up now.
+    pub moving: Option<Slot>,
+    pub move_over: Option<Slot>,
     /// Text picked out of a terminal pane, kept so it can be put back into
     /// one even where the system clipboard cannot be reached.
     pub copied: Option<String>,
@@ -832,6 +842,7 @@ impl App {
             new_tab_button: None,
             zoom_buttons: Vec::new(),
             close_buttons: Vec::new(),
+            pane_titles: Vec::new(),
             tab_spans: Vec::new(),
             tab_bar_row: None,
             output_view_height: 1,
@@ -884,6 +895,9 @@ impl App {
             help_scroll: 0,
             commanding: false,
             command_from: None,
+            carrying: false,
+            moving: None,
+            move_over: None,
             copied: None,
             clipboard_out: None,
             selecting: None,
@@ -2560,6 +2574,12 @@ impl App {
     /// `x` for the close `F9` does — so there is one set to remember rather
     /// than two.
     fn command_key(&mut self, key: KeyEvent) {
+        // A pane that has been picked up: the arrows move the pane itself,
+        // and everything else puts it down first.
+        if self.carrying && self.carry_key(key) {
+            return;
+        }
+
         // Moving between panes is what the arrows are for while sshman has
         // the keyboard, and h j k l alongside them for the same reason they
         // move the cursor in a file list.
@@ -2586,6 +2606,7 @@ impl App {
 
             // The keyboard goes back to a pane only when you say so, which is
             // what lets the arrows walk past a shell without falling into it.
+            KeyCode::Char('g') => return self.toggle_carry(),
             KeyCode::Enter => return self.leave_command(false),
             KeyCode::Esc => return self.leave_command(true),
             _ if is_command_key(&key) => return self.leave_command(true),
@@ -2610,6 +2631,113 @@ impl App {
         }
     }
 
+    /// The keys that only mean something while a pane is picked up. Says
+    /// whether it took the key.
+    fn carry_key(&mut self, key: KeyEvent) -> bool {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            // Shove it past its neighbour, again and again if you like: the
+            // keyboard goes with it, so the arrows keep meaning the same
+            // thing however far it has travelled.
+            KeyCode::Left | KeyCode::Char('h') if !shift => self.shove(Dir::Across, false),
+            KeyCode::Right | KeyCode::Char('l') if !shift => self.shove(Dir::Across, true),
+            KeyCode::Up | KeyCode::Char('k') if !shift => self.shove(Dir::Down, false),
+            KeyCode::Down | KeyCode::Char('j') if !shift => self.shove(Dir::Down, true),
+
+            // Shift sends it the whole way: a column or a row of its own,
+            // against that edge of the tab.
+            KeyCode::Left => self.send_pane_to_edge(Dir::Across, true),
+            KeyCode::Right => self.send_pane_to_edge(Dir::Across, false),
+            KeyCode::Up => self.send_pane_to_edge(Dir::Down, true),
+            KeyCode::Down => self.send_pane_to_edge(Dir::Down, false),
+
+            KeyCode::Char('g') | KeyCode::Esc => {
+                self.carrying = false;
+                self.set_status("put down — arrows move the keyboard again", Level::Info);
+            }
+            KeyCode::Enter => {
+                self.carrying = false;
+                self.leave_command(false);
+            }
+            // Anything else puts the pane down and then means what it always
+            // means, so a stray key is never a trap.
+            _ => {
+                self.carrying = false;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Pick the focused pane up, or put it down again.
+    fn toggle_carry(&mut self) {
+        if self.carrying {
+            self.carrying = false;
+            self.set_status("put down", Level::Info);
+            return;
+        }
+        if self.layout.panes() < 2 {
+            self.set_status("there is nowhere to move the only pane", Level::Info);
+            return;
+        }
+        self.carrying = true;
+        let name = self.pane_name(self.focus);
+        self.set_status(
+            format!("moving {name} — arrows shove it, Shift-arrows send it to an edge, ↵ drops it"),
+            Level::Good,
+        );
+    }
+
+    /// Change places with the pane across the nearest border that way. The
+    /// keyboard follows the pane rather than the place.
+    fn shove(&mut self, dir: Dir, forward: bool) {
+        let Some(other) = self.layout.neighbour(self.focus, dir, forward) else {
+            self.set_status("no pane that way to change places with", Level::Info);
+            return;
+        };
+        let here = self.focus;
+        if self.layout.swap(here, other) {
+            self.stash_layout();
+            let name = self.pane_name(here);
+            self.set_status(format!("moved {name}"), Level::Good);
+        }
+    }
+
+    /// Send the focused pane to one edge of the tab, as a column or a row of
+    /// its own.
+    fn send_pane_to_edge(&mut self, dir: Dir, first: bool) {
+        let here = self.focus;
+        if self.layout.send_to_edge(here, dir, first) {
+            self.stash_layout();
+            let name = self.pane_name(here);
+            let edge = match (dir, first) {
+                (Dir::Across, true) => "the left",
+                (Dir::Across, false) => "the right",
+                (Dir::Down, true) => "the top",
+                (Dir::Down, false) => "the bottom",
+            };
+            self.set_status(format!("{name} sent to {edge}"), Level::Good);
+        } else {
+            self.set_status("there is nowhere to send it", Level::Info);
+        }
+    }
+
+    /// A pane dragged by its name onto another one changes places with it.
+    pub fn drop_moved_pane(&mut self) {
+        let (Some(from), Some(onto)) = (self.moving.take(), self.move_over.take()) else {
+            self.moving = None;
+            self.move_over = None;
+            return;
+        };
+        if from == onto || !self.layout.swap(from, onto) {
+            return;
+        }
+        self.stash_layout();
+        self.focus_pane(from);
+        let name = self.pane_name(from);
+        self.set_status(format!("moved {name}"), Level::Good);
+    }
+
     /// Take the keyboard for sshman.
     fn enter_command(&mut self) {
         self.commanding = true;
@@ -2624,6 +2752,7 @@ impl App {
     /// to the one you took it from.
     fn leave_command(&mut self, back: bool) {
         self.commanding = false;
+        self.carrying = false;
         if back
             && let Some(slot) = self.command_from.take()
             && self.layout.contains(slot)
@@ -6116,6 +6245,114 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert!(!app.commanding);
         assert_eq!(app.focus, shell);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pane_can_be_shoved_past_its_neighbours() {
+        let dir = scratch("shove");
+        let mut app = app_in(&dir);
+        let shell = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.focus_pane(shell);
+
+        command(&mut app);
+        press(&mut app, 'g');
+        assert!(app.carrying);
+
+        let rect = |app: &App, slot| app.layout.areas(Rect::new(0, 0, 100, 30)).of(slot);
+        let below = rect(&app, shell).expect("drawn");
+        let files = rect(&app, here()).expect("drawn");
+        assert!(below.y > files.y, "the shell starts underneath");
+
+        key(&mut app, KeyCode::Up);
+        assert_eq!(rect(&app, shell), Some(files), "and has changed places");
+        assert_eq!(rect(&app, here()), Some(below));
+        assert_eq!(app.focus, shell, "the keyboard went with the pane");
+        assert!(app.carrying, "still holding it, so the arrows keep shoving");
+        assert_eq!(app.layout.panes(), 3, "and nothing opened or closed");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pane_can_be_sent_the_whole_way_to_an_edge() {
+        // What a swap could never do: a pane stacked under another becomes a
+        // column beside everything.
+        let dir = scratch("edge");
+        let mut app = app_in(&dir);
+        let shell = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.focus_pane(shell);
+
+        command(&mut app);
+        press(&mut app, 'g');
+        app.on_key(KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+
+        let area = Rect::new(0, 0, 100, 30);
+        let rect = app.layout.areas(area).of(shell).expect("drawn");
+        assert_eq!(rect.height, area.height, "the full height of the tab");
+        assert_eq!(rect.right(), area.right(), "hard against the right");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pane_is_put_down_by_anything_that_is_not_a_move() {
+        let dir = scratch("put-down");
+        let mut app = app_in(&dir);
+        let shell = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.focus_pane(shell);
+
+        // Esc puts it down without giving the keyboard back: one step at a
+        // time, so a change of mind costs one key.
+        command(&mut app);
+        press(&mut app, 'g');
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.carrying);
+        assert!(app.commanding, "still sshman's keyboard");
+
+        // And a key that means something else puts it down and then means it,
+        // so a stray key is never a trap.
+        press(&mut app, 'g');
+        press(&mut app, 'm');
+        assert!(!app.carrying);
+        assert!(app.zoomed, "the m still zoomed");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pane_dragged_onto_another_changes_places_with_it() {
+        let dir = scratch("drag-pane");
+        let mut app = app_in(&dir);
+        let shell = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+
+        // What the mouse records on the way past.
+        app.moving = Some(shell);
+        app.move_over = Some(here());
+        app.drop_moved_pane();
+
+        let areas = app.layout.areas(Rect::new(0, 0, 100, 30));
+        assert!(
+            areas.of(shell).unwrap().y < areas.of(here()).unwrap().y,
+            "the shell came up to where the file list was"
+        );
+        assert_eq!(app.focus, shell, "and the keyboard went with it");
+        assert!(app.moving.is_none() && app.move_over.is_none());
+
+        // Let go over itself, or over nothing, and nothing happens.
+        let before = app.layout.clone();
+        app.moving = Some(shell);
+        app.move_over = Some(shell);
+        app.drop_moved_pane();
+        app.moving = Some(shell);
+        app.drop_moved_pane();
+        assert_eq!(app.layout, before);
 
         std::fs::remove_dir_all(&dir).ok();
     }

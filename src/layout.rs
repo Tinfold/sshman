@@ -288,6 +288,47 @@ impl Layout {
         }
     }
 
+    /// Exchange two panes, keeping the shape of the arrangement: each takes
+    /// the space the other had.
+    pub fn swap(&mut self, a: Slot, b: Slot) -> bool {
+        if a == b {
+            return false;
+        }
+        let (Some(to_a), Some(to_b)) = (self.path_to(a), self.path_to(b)) else {
+            return false;
+        };
+        if let Some(node) = self.node_at_mut(&to_a) {
+            *node = Node::Leaf(b);
+        }
+        if let Some(node) = self.node_at_mut(&to_b) {
+            *node = Node::Leaf(a);
+        }
+        true
+    }
+
+    /// Take a pane out of wherever it is and put it back against one edge of
+    /// the whole arrangement, as a column or a row of its own.
+    ///
+    /// The shape it leaves closes up behind it, the same as if it had been
+    /// shut — which is what makes this a move rather than a swap: a pane
+    /// stacked under another can become a column beside everything.
+    pub fn send_to_edge(&mut self, slot: Slot, dir: Dir, first: bool) -> bool {
+        if self.panes() < 2 || !self.contains(slot) {
+            return false;
+        }
+        self.retain(|s| s != slot);
+        let rest = Box::new(self.root.clone());
+        let leaf = Box::new(Node::Leaf(slot));
+        let (first, second) = if first { (leaf, rest) } else { (rest, leaf) };
+        self.root = Node::Split {
+            dir,
+            ratio: 50,
+            first,
+            second,
+        };
+        true
+    }
+
     /// Put a different pane where this one was, keeping the space it had.
     pub fn replace(&mut self, old: Slot, new: Slot) -> bool {
         let Some(path) = self.path_to(old) else {
@@ -844,6 +885,67 @@ mod tests {
         let areas = l.areas(PANES);
         assert_eq!(areas.of(local()).unwrap().width, 50);
         assert_eq!(areas.of(term).unwrap().height, 15);
+    }
+
+    #[test]
+    fn two_panes_can_change_places() {
+        let mut l = Layout::default();
+        let term = Slot::term(Side::Remote, 1);
+        l.split(remote(), Dir::Down, term, 70);
+        let before = l.areas(PANES);
+
+        assert!(l.swap(local(), term));
+        let after = l.areas(PANES);
+        assert_eq!(
+            after.of(term),
+            before.of(local()),
+            "the terminal took the whole left column"
+        );
+        assert_eq!(after.of(local()), before.of(term));
+        assert_eq!(
+            after.of(remote()),
+            before.of(remote()),
+            "and nothing else moved"
+        );
+        assert_eq!(l.panes(), 3, "a swap opens and closes nothing");
+    }
+
+    #[test]
+    fn a_pane_cannot_change_places_with_itself_or_with_one_that_is_not_there() {
+        let mut l = Layout::default();
+        assert!(!l.swap(local(), local()));
+        assert!(!l.swap(local(), Slot::term(Side::Local, 9)));
+        assert_eq!(l, Layout::default());
+    }
+
+    #[test]
+    fn a_pane_can_be_sent_to_an_edge_of_the_whole_arrangement() {
+        // A terminal stacked under the remote files becomes a column beside
+        // both of them — which a swap could never do.
+        let mut l = Layout::default();
+        let term = Slot::term(Side::Remote, 1);
+        l.split(remote(), Dir::Down, term, 70);
+
+        assert!(l.send_to_edge(term, Dir::Across, true));
+        assert_eq!(l.slots(), [term, local(), remote()]);
+        let areas = l.areas(PANES);
+        assert_eq!(areas.of(term).unwrap().x, PANES.x, "hard against the left");
+        assert_eq!(areas.of(term).unwrap().height, PANES.height, "full height");
+
+        // And to the bottom, where it spans everything.
+        assert!(l.send_to_edge(term, Dir::Down, false));
+        let areas = l.areas(PANES);
+        let rect = areas.of(term).unwrap();
+        assert_eq!(rect.x, PANES.x);
+        assert_eq!(rect.width, PANES.width, "the full width");
+        assert_eq!(rect.bottom(), PANES.bottom());
+    }
+
+    #[test]
+    fn the_only_pane_there_is_cannot_be_moved_anywhere() {
+        let mut l = Layout::only(remote());
+        assert!(!l.send_to_edge(remote(), Dir::Across, true));
+        assert_eq!(l.slots(), [remote()]);
     }
 
     #[test]

@@ -114,6 +114,7 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `Ctrl-]` | command mode: hand the keyboard to sshman (see below) |
 | `Alt-↑↓←→` | move the keyboard to the pane that way |
 | `Alt-Shift-↑↓←→` | move the border nearest the focused pane |
+| `Ctrl-]` `g` | pick the focused pane up and move it |
 | `y` / `Y` | copy what is picked out in a shell / paste it into one |
 | `m` / `F3` | give the whole screen to the focused pane, or undo that |
 | `=` | even the borders up again |
@@ -153,6 +154,7 @@ the keyboard:
 | `↑` `↓` `←` `→` | move to the pane that way, without going into it |
 | `↵` | hand the keyboard to the pane you have moved to |
 | `Shift-↑↓←→` | move the border nearest it |
+| `g` | pick the pane up, to move the pane rather than the keyboard |
 | `Esc` / `Ctrl-]` | put the keyboard back where it was |
 
 The arrows move without handing anything over, so they **walk past a shell
@@ -162,11 +164,43 @@ its bottom border, so there is never a question of which one that is. `↵` into
 a terminal puts you back to typing in it; `Esc` puts the keyboard back where
 you took it from.
 
+### Moving a pane
+
+`g` picks the focused pane up. The arrows then move **the pane** rather than
+the keyboard:
+
+| | |
+|---|---|
+| `↑` `↓` `←` `→` | shove it past its neighbour, and again to keep going |
+| `Shift-↑↓←→` | send it the whole way to that edge, as a column or a row |
+| `↵` | drop it and use it |
+| `Esc` / `g` | put it down, keyboard still sshman's |
+
+The pane it is carrying says ` ✥ moving this pane ` on its bottom border, and
+the keyboard goes with the pane — so the arrows keep meaning the same thing
+however far it has travelled, and you can shove one across three panes without
+recounting which way is which.
+
+Shoving swaps two panes and keeps the shape of the arrangement. `Shift` and an
+arrow is the one that *changes* the shape: it takes the pane out of wherever it
+is, closes the gap behind it, and puts it back as a full column or row against
+that edge. A terminal stacked under a file list becomes a terminal beside
+everything, which no amount of swapping could do.
+
+**With the mouse:** drag a pane by its name — the ` LOCAL ` or ` SHELL ` at the
+start of its top border — and let go over another pane to change them over. The
+one being carried says ` ✥ moving `, and the one under the cursor says
+` change places `, so there is no guessing where it will land. The name is
+tested before the border underneath it, so dragging the border still resizes.
+
+### One rule for the arrows
+
 `h` `j` `k` `l` sit beside the arrows here, as they do in a file list. Where
 the arrows are already spoken for — in a file list, where they move the cursor
 — the same two ideas are spelled with `Alt`: `Alt-↑↓←→` moves the keyboard
 between panes and `Alt-Shift-↑↓←→` moves the border. It is one rule either way:
-**arrows move the keyboard, `Shift` and arrows move the border.**
+**arrows move the keyboard, `Shift` and arrows move the border — and after `g`,
+the pane itself.**
 
 (`Ctrl-]` is the byte `0x1d`, which most terminals report as `Ctrl-5`. sshman
 takes both spellings — before, it only took the one, and the chord quietly did
