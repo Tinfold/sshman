@@ -1,16 +1,18 @@
-//! What the worker talks to: an SSH server or a container.
+//! What the worker talks to: an SSH server, a container, or this machine.
 //!
 //! Everything above this point — panes, transfers, archives, shells, sudo —
-//! is written against this trait, so a container behaves like a server without
-//! the rest of the program knowing the difference. The two differ in only
-//! three visible ways, all captured here: how elevation is granted, whether an
-//! SSH key can be installed, and what the tab is called.
+//! is written against this trait, so a container behaves like a server
+//! without the rest of the program knowing the difference, and so does a tab
+//! pointed at the machine you are sitting at. They differ in only a few
+//! visible ways, all captured here: how elevation is granted, whether an SSH
+//! key can be installed, and what the tab is called.
 
 use std::path::Path;
 
 use anyhow::{Result, bail};
 
 use crate::docker::DockerConn;
+use crate::local::LocalConn;
 use crate::sshconn::{Conn, ConnectError, ConnectOpts};
 use crate::types::FileEntry;
 
@@ -18,12 +20,16 @@ use crate::types::FileEntry;
 pub enum BackendKind {
     Ssh,
     Container,
+    /// This machine, reached by running things rather than by connecting.
+    Local,
 }
 
 /// What to connect to.
 #[derive(Clone, Debug)]
 pub enum Target {
     Ssh(ConnectOpts),
+    /// The machine sshman is running on. Nothing to dial, nothing to drop.
+    Local,
     Docker {
         /// `None` for a container on this machine; otherwise the server whose
         /// container runtime holds it.
@@ -42,6 +48,7 @@ impl Target {
         match self {
             Self::Ssh(opts) => Some(opts),
             Self::Docker { via, .. } => via.as_ref(),
+            Self::Local => None,
         }
     }
 
@@ -54,6 +61,7 @@ impl Target {
             o
         };
         match self {
+            Self::Local => Self::Local,
             Self::Ssh(o) => Self::Ssh(strip(o.clone())),
             Self::Docker {
                 via,
@@ -69,6 +77,7 @@ impl Target {
 
     pub fn describe(&self) -> String {
         match self {
+            Self::Local => "this machine".into(),
             Self::Ssh(o) => format!("{}@{}:{}", o.user, o.host, o.port),
             Self::Docker {
                 via: None,
@@ -145,6 +154,8 @@ pub trait Backend: Send {
 /// Build a connection for a target.
 pub fn connect(target: &Target) -> Result<Box<dyn Backend>, ConnectError> {
     match target {
+        // Nothing to connect to: it is already here.
+        Target::Local => Ok(Box::new(LocalConn::open())),
         Target::Ssh(opts) => Ok(Box::new(Conn::connect(opts)?)),
         Target::Docker {
             via,
@@ -337,5 +348,99 @@ impl Backend for DockerConn {
     fn list_containers(&self) -> Result<(String, Vec<crate::docker::Container>)> {
         // Containers inside containers are not something we go looking for.
         bail!("this tab is a container; open containers from a server or local tab")
+    }
+}
+
+// ---- this machine ----------------------------------------------------------
+
+impl Backend for LocalConn {
+    fn descriptor(&self) -> Descriptor {
+        Descriptor {
+            kind: BackendKind::Local,
+            user: self.user.clone(),
+            host: self.host.clone(),
+            // No port, the same as a container; the UI hides it.
+            port: 0,
+            home: self.home.clone(),
+        }
+    }
+
+    /// This machine is here for as long as sshman is, so there is nothing to
+    /// probe and nothing that could drop.
+    fn is_alive(&self) -> bool {
+        true
+    }
+
+    fn run(&self, cmd: &str, elevated: bool) -> Result<(String, String, i32)> {
+        LocalConn::run(self, cmd, elevated)
+    }
+
+    fn list(&self, path: &str, elevated: bool) -> Result<Vec<FileEntry>> {
+        LocalConn::list(self, path, elevated)
+    }
+
+    fn resolve_dir(&self, path: &str, elevated: bool) -> Result<String> {
+        LocalConn::resolve_dir(self, path, elevated)
+    }
+
+    fn mkdir(&self, path: &str, elevated: bool) -> Result<()> {
+        LocalConn::mkdir(self, path, elevated)
+    }
+
+    fn rename(&self, from: &str, to: &str, elevated: bool) -> Result<()> {
+        LocalConn::rename(self, from, to, elevated)
+    }
+
+    fn remove(&self, path: &str, elevated: bool) -> Result<()> {
+        LocalConn::remove(self, path, elevated)
+    }
+
+    fn tree_size(&self, path: &str, _elevated: bool) -> u64 {
+        crate::local::tree_size(Path::new(path))
+    }
+
+    /// Both directions are a copy from one part of this machine to another.
+    fn download(
+        &mut self,
+        path: &str,
+        dest: &Path,
+        elevated: bool,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<()> {
+        self.copy(path, &dest.to_string_lossy(), elevated, progress)
+    }
+
+    fn upload(
+        &mut self,
+        local: &Path,
+        dest: &str,
+        elevated: bool,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<()> {
+        self.copy(&local.to_string_lossy(), dest, elevated, progress)
+    }
+
+    fn enable_elevation(&mut self, secret: Option<String>) -> Result<String> {
+        self.set_sudo_password(secret);
+        if let Err(e) = self.check_sudo() {
+            // Never leave a password behind that did not work.
+            self.set_sudo_password(None);
+            return Err(e);
+        }
+        Ok("sudo mode ON — this tab now reads and writes as root".into())
+    }
+
+    fn disable_elevation(&mut self) {
+        self.set_sudo_password(None);
+    }
+
+    fn install_public_key(&self, _public_key: &str) -> Result<bool> {
+        bail!("this tab is the machine you are on, so there is no login to set up")
+    }
+
+    fn list_containers(&self) -> Result<(String, Vec<crate::docker::Container>)> {
+        let runtime = crate::docker::detect_runtime(None, preferred_runtime().as_deref())?;
+        let list = crate::docker::list_containers(None, &runtime)?;
+        Ok((runtime, list))
     }
 }

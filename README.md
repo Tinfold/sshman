@@ -49,6 +49,7 @@ cargo build --release --features vendored
 
 ```sh
 sshman                          # connection form
+sshman --local                  # a tab on this machine, no server involved
 sshman web01                    # a ~/.ssh/config alias, resolved like ssh does
 sshman deploy@10.0.0.5 -p 2222
 sshman web01 -i ~/.ssh/deploy_key --remote-path /etc/nginx
@@ -92,10 +93,11 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `E` | edit with a program you name |
 | `v` | view in `$PAGER` |
 | `:` | run a command in the remote pane's directory |
-| `!` | interactive `ssh` shell, starting in that directory |
+| `!` | full-screen shell in that directory: `ssh` for a server, `exec` into a container, a login shell on this machine |
 | `o` | show the last command's output again |
 | `z` / `x` / `X` | pack / unpack / list an archive |
 | `D` | open a Docker container in a new tab |
+| `L` | open a one-pane tab on this machine, with no server involved |
 | `p` | forwarded ports |
 | `N` | name the server on screen |
 | `w` | workspaces: saved sets of connections |
@@ -115,8 +117,11 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `?` | help |
 | `q` | quit |
 
-The mouse works too: scroll wheel, click to focus a pane and select a row, and
-drag any border between panes to resize.
+The mouse works too: scroll wheel, click to focus a pane and select a row, drag
+any border between panes to resize, and click the `[⤢]` in a pane's corner to
+maximise it. In a shell pane, a program that has asked for the mouse gets it —
+btop's clicks, a pager's wheel — and holding `Shift` scrolls the pane's own
+history instead.
 
 Copying acts on your marked files, or on the row under the cursor if you have
 not marked anything. Directories are copied recursively, and existing files at
@@ -129,16 +134,37 @@ the bottom of its column. Both dividers move: `Alt-←` and `Alt-→` for the on
 down the middle, `Alt-↑` and `Alt-↓` (or `Ctrl-↑` and `Ctrl-↓`) for the top
 edge of the shell, and dragging either border with the mouse does the same. The
 file list keeps three rows whatever the shell asks for, and neither side can be
-squeezed below a fifth of the width. `=` puts it all back.
+squeezed below a fifth of the width.
+
+**Sizes belong to the tab.** A server you set up wide is still wide when you
+come back to it, and the tab beside it keeps its own arrangement. A new tab
+opens with the sizes that were on screen, so setting up a split once carries
+into the next connection rather than snapping back, and `=` puts the tab on
+screen back to an even split without touching the others. Workspaces write the
+sizes down with everything else they remember.
+
+Zoom is not a size, so it does not belong to a tab: it follows you across them,
+as described below.
 
 `m` gives the whole screen to whatever is focused, and `m`, `F3` or `Esc` gives
-the other panes back. The zoom follows the focus rather than pinning one pane,
-so `Tab` and `F6` work zoomed exactly as they do at any other size: you stay
+the other panes back. Every pane also carries a button in its top-right corner
+— `[⤢]` to maximise, `[⤡]` to put it back — so the mouse can do it too, and
+clicking the far pane's button blows up that pane rather than the focused one.
+
+The zoom follows the focus rather than pinning one pane, so `Tab` and `F6` work
+zoomed exactly as they do at any other size: you stay
 zoomed, on whatever you moved to. `F3` does the same job from inside a shell,
 where every other key belongs to the shell — including `m`.
 
 A zoomed shell is resized on the far end like any other, so full-screen `top`
 or `vim` gets the whole terminal.
+
+Each tab remembers whether you were in its files or in its shell. Switching
+tabs while zoomed into a shell shows the other tab's shell, or its file list
+when that tab has no shell open — and coming back puts you in the shell you
+left, still running. Unzoomed both are on screen either way, so switching tabs
+there leaves the keyboard on the file list rather than dropping it into a shell
+that would swallow the `Ctrl-←`/`Ctrl-→` you are cycling with.
 
 ## Moving files about within one side
 
@@ -245,6 +271,33 @@ with the workspace**, so reopening one brings its tunnels back up.
 Each forward runs on its own SSH connection, for the same reason the shells do,
 so a busy tunnel never holds up a file transfer.
 
+## A tab on this machine
+
+Not everything worth doing needs a server. `L` opens a tab that is just this
+machine: **one pane**, no far side, starting in the directory the local pane was
+showing. `sshman --local` starts on one.
+
+```
+ sshman  fedora  this machine  tab 1/2
+ 1 fedora   2 web01    T new · W close · Ctrl-←/→ switch
+┏ THIS MACHINE /home/you/downloads ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ drwxr-xr-x    <DIR> 2026-08-20 21:37 archive/                               ┃
+```
+
+`S` opens a shell on this machine underneath it, and everything else a pane can
+do works there: `e` edits, `z` packs, `d` deletes, `/` filters. With no other
+side to copy to, `c` picks files up and `P` puts them down, the same keys a
+zoomed pane uses — which makes it a good place to shuffle a directory around
+your own disk with marks rather than typed paths.
+
+`s` turns on sudo there too. That is real `sudo`, asking for your password and
+feeding it to `sudo -S` on stdin exactly as the server side does, so a local tab
+can browse and write root-owned places your own account cannot.
+
+The one thing it cannot do is install an SSH key, since there is no login to set
+up. Forwarded ports are equally beside the point, so a workspace saves a local
+tab's directory, name and pane sizes and nothing else.
+
 ## Names
 
 A server can be called what you actually call it. Type one in the **Name**
@@ -270,9 +323,11 @@ and `Enter` on one to open it again.
 ╰─────────────────────────────────────────────────────────────────────╯
 ```
 
-Each member remembers **which directory it was showing**, so reopening puts you
-back where you were rather than at three home directories — and the local
-pane's directory is restored too. Containers are saved by name rather than by
+Each member remembers **which directory it was showing** and **the pane sizes
+it was using**, so reopening puts you back where you were rather than at three
+home directories in three identical panes — and the local pane's directory is
+restored too. A workspace saved by an older version simply has no sizes in it,
+and opens at whatever is on screen. Containers are saved by name rather than by
 the id they happened to have, so a workspace survives them being recreated.
 
 ```sh
@@ -323,6 +378,9 @@ the shell has focus **every** key goes to it, including `Ctrl-C`, `Esc` and `q`
 - The local shell starts in the local pane's directory, running `$SHELL`.
 - The remote shell starts in the remote pane's directory.
 - `Ctrl-↑` / `Ctrl-↓` resize the pane; the scroll wheel moves through history.
+- Full-screen programs work: `vim`, `top`, `btop`. One that asks for the mouse
+  is given it — clicks, drags and the wheel all reach it — and `Shift` with the
+  wheel scrolls the pane's own history regardless.
 - Pasting into a focused shell works (bracketed paste).
 - When a shell exits, the pane says so; `S` closes it, `S` again starts a fresh
   one.

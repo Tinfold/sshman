@@ -1,9 +1,9 @@
 //! Saved sets of connections.
 //!
 //! A workspace is the answer to "the four things I always open together".
-//! It records what each tab was connected to and which directory it was
-//! showing, so reopening puts you back where you were rather than at four
-//! home directories.
+//! It records what each tab was connected to, which directory it was showing
+//! and the sizes its panes had, so reopening puts you back where you were
+//! rather than at four home directories in four identical panes.
 //!
 //! Containers are stored by **name**, not by the id used while running: an id
 //! changes the moment a container is recreated, and a workspace is meant to
@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::Target;
+use crate::layout::Layout;
 use crate::sshconn::ConnectOpts;
 
 /// One connection inside a workspace.
@@ -34,6 +35,20 @@ pub enum Item {
         /// Ports this tab was forwarding, in the shorthand you typed.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         forwards: Vec<String>,
+        /// The pane sizes this tab was showing. Absent in workspaces saved
+        /// before sizes were remembered, which open at whatever is on screen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layout: Option<Layout>,
+    },
+    /// A tab on the machine sshman is running on. There is nothing to
+    /// reconnect, so its directory and sizes are the whole of it.
+    Local {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layout: Option<Layout>,
     },
     Container {
         /// Container name, so it survives being recreated.
@@ -46,6 +61,8 @@ pub enum Item {
         path: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         forwards: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layout: Option<Layout>,
     },
 }
 
@@ -53,6 +70,7 @@ impl Item {
     /// Build the connection details this item describes.
     pub fn to_target(&self) -> Target {
         match self {
+            Self::Local { .. } => Target::Local,
             Self::Ssh {
                 user,
                 host,
@@ -78,8 +96,9 @@ impl Item {
                 via: via.as_ref().and_then(|item| match item.to_target() {
                     Target::Ssh(opts) => Some(opts),
                     // A container reached through another container is not a
-                    // thing we build.
-                    Target::Docker { .. } => None,
+                    // thing we build, and one on this machine is reached with
+                    // no server in the way at all.
+                    Target::Docker { .. } | Target::Local => None,
                 }),
                 container: container.clone(),
                 runtime: runtime.clone(),
@@ -89,7 +108,9 @@ impl Item {
 
     pub fn path(&self) -> Option<&str> {
         match self {
-            Self::Ssh { path, .. } | Self::Container { path, .. } => path.as_deref(),
+            Self::Ssh { path, .. } | Self::Container { path, .. } | Self::Local { path, .. } => {
+                path.as_deref()
+            }
         }
     }
 
@@ -97,12 +118,24 @@ impl Item {
     pub fn forwards(&self) -> &[String] {
         match self {
             Self::Ssh { forwards, .. } | Self::Container { forwards, .. } => forwards,
+            // Nothing to forward to: the tab is already where the ports are.
+            Self::Local { .. } => &[],
+        }
+    }
+
+    /// The pane sizes to open this tab with, if they were written down.
+    /// Read from a file, so they are clamped before anyone draws with them.
+    pub fn layout(&self) -> Option<Layout> {
+        match self {
+            Self::Ssh { layout, .. }
+            | Self::Container { layout, .. }
+            | Self::Local { layout, .. } => layout.map(Layout::sane),
         }
     }
 
     pub fn name(&self) -> Option<&str> {
         match self {
-            Self::Ssh { name, .. } => name.as_deref(),
+            Self::Ssh { name, .. } | Self::Local { name, .. } => name.as_deref(),
             Self::Container { .. } => None,
         }
     }
@@ -110,6 +143,10 @@ impl Item {
     /// One line describing this item, for the workspace list.
     pub fn describe(&self) -> String {
         match self {
+            Self::Local { name, .. } => match name {
+                Some(name) if !name.trim().is_empty() => name.clone(),
+                _ => "this machine".into(),
+            },
             Self::Ssh {
                 user,
                 host,
@@ -300,7 +337,105 @@ mod tests {
             name: None,
             path: path.map(String::from),
             forwards: Vec::new(),
+            layout: None,
         }
+    }
+
+    #[test]
+    fn a_tab_on_this_machine_is_saved_with_the_rest() {
+        let item = Item::Local {
+            path: Some("/var/log".into()),
+            name: Some("logs".into()),
+            layout: Some(Layout {
+                split_pct: 35,
+                shell_height: 14,
+            }),
+        };
+        let text = serde_json::to_string(&item).unwrap();
+        let back: Item = serde_json::from_str(&text).unwrap();
+
+        assert!(matches!(back.to_target(), Target::Local));
+        assert_eq!(back.path(), Some("/var/log"));
+        assert_eq!(back.name(), Some("logs"));
+        assert_eq!(back.layout().unwrap().split_pct, 35);
+        assert_eq!(back.describe(), "logs");
+        assert!(
+            back.forwards().is_empty(),
+            "there is no tunnel to a machine you are already on"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_local_tab_describes_itself() {
+        let item = Item::Local {
+            path: None,
+            name: None,
+            layout: None,
+        };
+        assert_eq!(item.describe(), "this machine");
+    }
+
+    #[test]
+    fn pane_sizes_survive_the_round_trip_through_json() {
+        let item = Item::Ssh {
+            user: "me".into(),
+            host: "web01".into(),
+            port: 22,
+            key_path: None,
+            name: None,
+            path: Some("/etc".into()),
+            forwards: Vec::new(),
+            layout: Some(Layout {
+                split_pct: 70,
+                shell_height: 20,
+            }),
+        };
+        let text = serde_json::to_string(&item).unwrap();
+        let back: Item = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            back.layout(),
+            Some(Layout {
+                split_pct: 70,
+                shell_height: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn a_workspace_saved_before_sizes_were_remembered_still_opens() {
+        let text = r#"[{
+            "name": "prod",
+            "local_path": "/tmp",
+            "items": [{"kind": "ssh", "user": "me", "host": "web01", "port": 22}],
+            "saved_at": 0
+        }]"#;
+        let list: Vec<Workspace> = serde_json::from_str(text).expect("old files must still load");
+        assert_eq!(list[0].items.len(), 1);
+        assert_eq!(
+            list[0].items[0].layout(),
+            None,
+            "with no sizes to speak of, rather than a failure to parse"
+        );
+    }
+
+    #[test]
+    fn sizes_that_would_hide_a_pane_are_brought_back_into_range() {
+        let item = Item::Ssh {
+            user: "me".into(),
+            host: "web01".into(),
+            port: 22,
+            key_path: None,
+            name: None,
+            path: None,
+            forwards: Vec::new(),
+            // A hand-edited file, or one from a version that allowed more.
+            layout: Some(Layout {
+                split_pct: 99,
+                shell_height: 1,
+            }),
+        };
+        let got = item.layout().unwrap();
+        assert!(got.split_pct <= 80 && got.shell_height >= 3, "{got:?}");
     }
 
     #[test]
@@ -357,6 +492,7 @@ mod tests {
             name: Some("production".into()),
             path: Some("/srv".into()),
             forwards: vec!["3000".into(), "8080:db:5432".into()],
+            layout: None,
         };
         match item.to_target() {
             Target::Ssh(opts) => {
@@ -386,6 +522,7 @@ mod tests {
             via: Some(Box::new(ssh_item("server1", None))),
             path: Some("/data".into()),
             forwards: Vec::new(),
+            layout: None,
         };
         match item.to_target() {
             Target::Docker {
@@ -410,6 +547,7 @@ mod tests {
             via: None,
             path: None,
             forwards: Vec::new(),
+            layout: None,
         };
         match item.to_target() {
             Target::Docker { via, .. } => assert!(via.is_none()),
@@ -437,6 +575,7 @@ mod tests {
                 via: Some(Box::new(ssh_item("web01", None))),
                 path: Some("/data".into()),
                 forwards: vec!["9000".into()],
+                layout: None,
             },
         ];
         let json = serde_json::to_string(&items).unwrap();

@@ -3,7 +3,13 @@
 //! Each shell is a real terminal: a pty for the local side, an SSH channel with
 //! a pty for the remote side. Bytes from the shell are fed into a `vt100`
 //! parser, and the resulting screen is drawn straight into the pane, so `vim`,
-//! `top` and colours all behave.
+//! `top`, `btop` and colours all behave. One thing is rewritten on the way
+//! in — see [`Hvp`] — because the parser knows only one of the two spellings
+//! of "put the cursor here".
+//!
+//! Mouse events go the other way, to programs that have asked for them. What
+//! counts as asking, and how the answer should be spelled, is tracked by the
+//! parser from the sequences the program itself sent.
 //!
 //! The remote shell deliberately runs on **its own SSH connection**. The file
 //! transfer connection is driven by blocking calls on the worker thread; a
@@ -21,7 +27,10 @@ use std::thread;
 use std::time::Duration;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::sshconn::{ConnectOpts, establish};
 use crate::types::sh_quote;
@@ -194,6 +203,31 @@ impl Shell {
         }
     }
 
+    /// Hand a mouse event to the program inside, if it asked for them.
+    ///
+    /// `col` and `row` are zero-based within the shell's own area. Returns
+    /// whether it was taken, so the caller can fall back to doing something
+    /// with the event itself — scrolling the pane's history, most usefully.
+    pub fn send_mouse(&mut self, event: &MouseEvent, col: u16, row: u16) -> bool {
+        let (mode, encoding) = {
+            let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+            let screen = parser.screen();
+            (
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+            )
+        };
+        if mode == MouseProtocolMode::None {
+            return false;
+        }
+        // The program wants the mouse, so the event is its business whether or
+        // not this particular one is worth sending on.
+        if let Some(bytes) = encode_mouse(event, col, row, mode, encoding) {
+            let _ = self.tx.send(Msg::Bytes(bytes));
+        }
+        true
+    }
+
     pub fn paste(&mut self, text: &str) {
         self.set_scrollback(0);
         let _ = self.tx.send(Msg::Bytes(text.as_bytes().to_vec()));
@@ -247,9 +281,75 @@ fn write_notice(parser: &Arc<Mutex<vt100::Parser>>, text: &str) {
     guard.process(format!("\r\n{text}\r\n").as_bytes());
 }
 
-fn feed(parser: &Arc<Mutex<vt100::Parser>>, bytes: &[u8]) {
+fn feed(hvp: &mut Hvp, parser: &Arc<Mutex<vt100::Parser>>, bytes: &[u8]) {
+    let fixed = hvp.rewrite(bytes);
     let mut guard = parser.lock().unwrap_or_else(|e| e.into_inner());
-    guard.process(bytes);
+    guard.process(&fixed);
+}
+
+/// Rewrites `CSI … f` into `CSI … H` on the way to the parser.
+///
+/// The two are the same command — HVP and CUP both move the cursor to a row
+/// and column — but `vt100` implements only the `H` spelling. Anything that
+/// prefers `f` has every one of its positioning commands silently dropped,
+/// and its careful full-screen layout arrives as one long wrapped run of
+/// text. btop does exactly that: hundreds of `f`, not one `H`.
+///
+/// A read can end in the middle of a sequence, so a partial one is held here
+/// until the byte that ends it turns up. Anything that stops looking like a
+/// sequence is passed through exactly as it came, which is the only safe
+/// thing to do with bytes we do not understand.
+#[derive(Default)]
+struct Hvp {
+    /// The `ESC [ …` seen so far, when a sequence is still arriving.
+    partial: Vec<u8>,
+}
+
+/// Longer than any real CSI sequence. Past this we are not looking at one,
+/// so it goes to the parser untouched rather than being buffered for ever.
+const MAX_CSI: usize = 64;
+
+impl Hvp {
+    fn rewrite(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len() + self.partial.len());
+        for &byte in input {
+            if self.partial.is_empty() {
+                if byte == 0x1b {
+                    self.partial.push(byte);
+                } else {
+                    out.push(byte);
+                }
+                continue;
+            }
+            // One byte in: only `ESC [` opens a sequence we care about.
+            if self.partial.len() == 1 {
+                if byte == b'[' {
+                    self.partial.push(byte);
+                } else {
+                    out.append(&mut self.partial);
+                    out.push(byte);
+                }
+                continue;
+            }
+            match byte {
+                // Parameter and intermediate bytes: still arriving.
+                0x20..=0x3f if self.partial.len() < MAX_CSI => {
+                    self.partial.push(byte);
+                }
+                // The final byte, which says what the sequence was.
+                0x40..=0x7e => {
+                    out.append(&mut self.partial);
+                    out.push(if byte == b'f' { b'H' } else { byte });
+                }
+                // Not a sequence after all, or an implausibly long one.
+                _ => {
+                    out.append(&mut self.partial);
+                    out.push(byte);
+                }
+            }
+        }
+        out
+    }
 }
 
 // ---- local ----------------------------------------------------------------
@@ -299,10 +399,11 @@ fn run_local(
         .name("local-shell-reader".into())
         .spawn(move || {
             let mut buf = [0u8; 8192];
+            let mut hvp = Hvp::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => feed(&reader_parser, &buf[..n]),
+                    Ok(n) => feed(&mut hvp, &reader_parser, &buf[..n]),
                 }
             }
             reader_alive.store(false, Ordering::Relaxed);
@@ -378,6 +479,9 @@ fn run_remote(
     sess.set_blocking(false);
 
     let mut buf = [0u8; 8192];
+    // One per stream: they land on the same screen, but a sequence split
+    // across reads is only ever split within the stream carrying it.
+    let (mut hvp_out, mut hvp_err) = (Hvp::default(), Hvp::default());
     let mut pending: Vec<u8> = Vec::new();
 
     loop {
@@ -417,7 +521,7 @@ fn run_remote(
                 }
             }
             Ok(n) => {
-                feed(parser, &buf[..n]);
+                feed(&mut hvp_out, parser, &buf[..n]);
                 idle = false;
                 // The prompt is up; now it is safe to change directory.
                 if let Some(command) = startup_cd.take() {
@@ -430,7 +534,7 @@ fn run_remote(
 
         match channel.stderr().read(&mut buf) {
             Ok(n) if n > 0 => {
-                feed(parser, &buf[..n]);
+                feed(&mut hvp_err, parser, &buf[..n]);
                 idle = false;
             }
             _ => {}
@@ -448,6 +552,110 @@ fn run_remote(
 
     let _ = channel.close();
     Ok(())
+}
+
+// ---- mouse encoding --------------------------------------------------------
+
+/// Turn a mouse event into the bytes the program inside the shell is waiting
+/// for, or `None` when it wants nothing of the sort.
+///
+/// `col` and `row` are zero-based and relative to the shell's own area, since
+/// the program has no idea it is sitting in a pane. Which events are wanted,
+/// and how they are spelled, are both the program's choice: it asked for a
+/// mode and an encoding, and the parser has been keeping track.
+pub fn encode_mouse(
+    event: &MouseEvent,
+    col: u16,
+    row: u16,
+    mode: MouseProtocolMode,
+    encoding: MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    if mode == MouseProtocolMode::None {
+        return None;
+    }
+    // The wheel and a press are reported in every mode; the rest depends on
+    // how much the program asked to hear about.
+    let wanted = match event.kind {
+        MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight
+        | MouseEventKind::Down(_) => true,
+        MouseEventKind::Up(_) => mode != MouseProtocolMode::Press,
+        MouseEventKind::Drag(_) => matches!(
+            mode,
+            MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+        ),
+        MouseEventKind::Moved => mode == MouseProtocolMode::AnyMotion,
+    };
+    if !wanted {
+        return None;
+    }
+
+    let button = match event.kind {
+        MouseEventKind::Down(b) | MouseEventKind::Up(b) | MouseEventKind::Drag(b) => match b {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+        },
+        // The wheel is reported as buttons 4 to 7, which carry the 64 bit.
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::ScrollLeft => 66,
+        MouseEventKind::ScrollRight => 67,
+        // No button is down while merely moving: 3 is the "none" slot.
+        MouseEventKind::Moved => 3,
+    };
+    let motion = matches!(event.kind, MouseEventKind::Drag(_) | MouseEventKind::Moved);
+    let mut code = button + if motion { 32 } else { 0 };
+    let mods = event.modifiers;
+    if mods.contains(KeyModifiers::SHIFT) {
+        code += 4;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        code += 8;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        code += 16;
+    }
+    let release = matches!(event.kind, MouseEventKind::Up(_));
+
+    // Terminals count from one.
+    let (col, row) = (col as u32 + 1, row as u32 + 1);
+    match encoding {
+        // The only encoding that can say which button was released, and the
+        // only one without a limit on how far right a click can be.
+        MouseProtocolEncoding::Sgr => Some(
+            format!(
+                "\x1b[<{code};{col};{row}{}",
+                if release { 'm' } else { 'M' }
+            )
+            .into_bytes(),
+        ),
+        // The original encoding: three bytes, each offset by 32, so nothing
+        // past column 223 can be described at all. A release is button 3.
+        MouseProtocolEncoding::Default => {
+            let code = if release { 3 + (code & !3) } else { code };
+            let (a, b, c) = (code + 32, col + 32, row + 32);
+            if a > 255 || b > 255 || c > 255 {
+                return None;
+            }
+            Some(vec![0x1b, b'[', b'M', a as u8, b as u8, c as u8])
+        }
+        // As above, but each number is a character, which buys a few more
+        // columns at the cost of being ambiguous past 2015.
+        MouseProtocolEncoding::Utf8 => {
+            let code = if release { 3 + (code & !3) } else { code };
+            let mut out = vec![0x1b, b'[', b'M'];
+            for value in [code + 32, col + 32, row + 32] {
+                match char::from_u32(value) {
+                    Some(c) => out.extend_from_slice(c.to_string().as_bytes()),
+                    None => return None,
+                }
+            }
+            Some(out)
+        }
+    }
 }
 
 // ---- key encoding ----------------------------------------------------------
@@ -546,6 +754,242 @@ fn modifier_code(ctrl: bool, alt: bool, shift: bool) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feed a stream in one go.
+    fn fixed(input: &[u8]) -> Vec<u8> {
+        Hvp::default().rewrite(input)
+    }
+
+    fn mouse(kind: MouseEventKind, mods: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: mods,
+        }
+    }
+
+    fn sgr(kind: MouseEventKind, col: u16, row: u16) -> Option<String> {
+        encode_mouse(
+            &mouse(kind, KeyModifiers::NONE),
+            col,
+            row,
+            MouseProtocolMode::AnyMotion,
+            MouseProtocolEncoding::Sgr,
+        )
+        .map(|b| String::from_utf8(b).unwrap())
+    }
+
+    #[test]
+    fn a_click_is_reported_where_the_program_thinks_it_happened() {
+        // Zero-based inside the pane, one-based on the wire.
+        assert_eq!(
+            sgr(MouseEventKind::Down(MouseButton::Left), 0, 0).as_deref(),
+            Some("\x1b[<0;1;1M")
+        );
+        assert_eq!(
+            sgr(MouseEventKind::Down(MouseButton::Right), 11, 4).as_deref(),
+            Some("\x1b[<2;12;5M")
+        );
+        // Only SGR can say which button came up; the final letter says which.
+        assert_eq!(
+            sgr(MouseEventKind::Up(MouseButton::Left), 3, 3).as_deref(),
+            Some("\x1b[<0;4;4m")
+        );
+    }
+
+    #[test]
+    fn the_wheel_and_motion_carry_their_own_button_numbers() {
+        assert_eq!(
+            sgr(MouseEventKind::ScrollUp, 0, 0).as_deref(),
+            Some("\x1b[<64;1;1M")
+        );
+        assert_eq!(
+            sgr(MouseEventKind::ScrollDown, 0, 0).as_deref(),
+            Some("\x1b[<65;1;1M")
+        );
+        // Dragging is the button plus the motion bit.
+        assert_eq!(
+            sgr(MouseEventKind::Drag(MouseButton::Left), 0, 0).as_deref(),
+            Some("\x1b[<32;1;1M")
+        );
+        // Moving with nothing held is the empty button slot plus that bit.
+        assert_eq!(
+            sgr(MouseEventKind::Moved, 0, 0).as_deref(),
+            Some("\x1b[<35;1;1M")
+        );
+    }
+
+    #[test]
+    fn modifiers_are_added_to_the_button() {
+        let event = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let out = encode_mouse(
+            &event,
+            0,
+            0,
+            MouseProtocolMode::PressRelease,
+            MouseProtocolEncoding::Sgr,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[<24;1;1M", "8 + 16");
+    }
+
+    #[test]
+    fn a_program_only_hears_about_what_it_asked_for() {
+        let cases = [
+            (MouseProtocolMode::None, false, false, false),
+            (MouseProtocolMode::Press, false, false, false),
+            (MouseProtocolMode::PressRelease, true, false, false),
+            (MouseProtocolMode::ButtonMotion, true, true, false),
+            (MouseProtocolMode::AnyMotion, true, true, true),
+        ];
+        for (mode, release, drag, moved) in cases {
+            let sent = |kind| {
+                encode_mouse(
+                    &mouse(kind, KeyModifiers::NONE),
+                    0,
+                    0,
+                    mode,
+                    MouseProtocolEncoding::Sgr,
+                )
+                .is_some()
+            };
+            assert_eq!(
+                sent(MouseEventKind::Up(MouseButton::Left)),
+                release,
+                "{mode:?}"
+            );
+            assert_eq!(
+                sent(MouseEventKind::Drag(MouseButton::Left)),
+                drag,
+                "{mode:?}"
+            );
+            assert_eq!(sent(MouseEventKind::Moved), moved, "{mode:?}");
+            // A press and the wheel are reported by every mode that is on.
+            let on = mode != MouseProtocolMode::None;
+            assert_eq!(
+                sent(MouseEventKind::Down(MouseButton::Left)),
+                on,
+                "{mode:?}"
+            );
+            assert_eq!(sent(MouseEventKind::ScrollUp), on, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_original_encoding_offsets_every_byte_by_thirty_two() {
+        let out = encode_mouse(
+            &mouse(
+                MouseEventKind::Down(MouseButton::Middle),
+                KeyModifiers::NONE,
+            ),
+            9,
+            4,
+            MouseProtocolMode::PressRelease,
+            MouseProtocolEncoding::Default,
+        )
+        .unwrap();
+        assert_eq!(out, b"\x1b[M\x21\x2a\x25", "button 1, column 10, row 5");
+
+        // It cannot say which button was released, so it says "some button".
+        let up = encode_mouse(
+            &mouse(MouseEventKind::Up(MouseButton::Middle), KeyModifiers::NONE),
+            0,
+            0,
+            MouseProtocolMode::PressRelease,
+            MouseProtocolEncoding::Default,
+        )
+        .unwrap();
+        assert_eq!(up[3], 32 + 3);
+    }
+
+    #[test]
+    fn a_click_too_far_right_for_the_original_encoding_is_dropped() {
+        // Three bytes, each offset by 32: past 223 there is nothing to send.
+        let far = encode_mouse(
+            &mouse(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE),
+            400,
+            0,
+            MouseProtocolMode::PressRelease,
+            MouseProtocolEncoding::Default,
+        );
+        assert_eq!(far, None, "better nothing than a click somewhere else");
+        // SGR has no such limit.
+        assert_eq!(
+            sgr(MouseEventKind::Down(MouseButton::Left), 400, 0).as_deref(),
+            Some("\x1b[<0;401;1M")
+        );
+    }
+
+    #[test]
+    fn absolute_positioning_reaches_the_parser_however_it_is_spelled() {
+        // What btop sends, and what vt100 needs to see instead.
+        assert_eq!(fixed(b"\x1b[12;40f"), b"\x1b[12;40H");
+        // The other spelling is already right, and must not be touched.
+        assert_eq!(fixed(b"\x1b[12;40H"), b"\x1b[12;40H");
+    }
+
+    #[test]
+    fn nothing_else_is_disturbed() {
+        for seq in [
+            &b"\x1b[1C"[..],           // cursor forward
+            b"\x1b[38;2;204;204;204m", // 24-bit colour
+            b"\x1b[?2026h",            // synchronised output
+            b"\x1b[2J",
+            b"plain text with an f in it",
+            b"\x1b]0;a title\x07",
+            b"",
+        ] {
+            assert_eq!(fixed(seq), seq, "{:?} must arrive as it was sent", seq);
+        }
+    }
+
+    #[test]
+    fn a_sequence_split_across_reads_is_still_rewritten() {
+        // A read can end anywhere, including between the ESC and the [.
+        for cut in 1..9 {
+            let whole = b"\x1b[12;40fXY";
+            let (a, b) = whole.split_at(cut);
+            let mut hvp = Hvp::default();
+            let mut out = hvp.rewrite(a);
+            out.extend(hvp.rewrite(b));
+            assert_eq!(
+                out, b"\x1b[12;40HXY",
+                "split after {cut} byte(s) lost the sequence"
+            );
+        }
+    }
+
+    #[test]
+    fn an_escape_that_leads_nowhere_is_handed_over_untouched() {
+        // ESC on its own, then something that is not a sequence at all.
+        assert_eq!(fixed(b"\x1bXhello"), b"\x1bXhello");
+        // A CSI interrupted by a control byte: not ours to interpret.
+        assert_eq!(fixed(b"\x1b[12;\x07f"), b"\x1b[12;\x07f");
+    }
+
+    #[test]
+    fn an_implausibly_long_sequence_is_not_buffered_for_ever() {
+        let mut input = b"\x1b[".to_vec();
+        input.extend(std::iter::repeat_n(b'1', MAX_CSI * 2));
+        input.push(b'f');
+        let out = fixed(&input);
+        assert_eq!(out.len(), input.len(), "everything comes back out");
+        assert!(
+            out.ends_with(b"1f"),
+            "and untouched, since this is not a sequence we know"
+        );
+    }
+
+    #[test]
+    fn the_stream_around_a_rewrite_is_intact() {
+        let input = b"before\x1b[3;9fmiddle\x1b[1Cafter\x1b[2;2f";
+        assert_eq!(fixed(input), b"before\x1b[3;9Hmiddle\x1b[1Cafter\x1b[2;2H");
+    }
+
     use ratatui::crossterm::event::KeyEventKind;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {

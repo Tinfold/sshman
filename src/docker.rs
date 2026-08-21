@@ -462,10 +462,19 @@ impl DockerConn {
 ///
 /// Minimal images often have no bash, so it picks whichever shell is actually
 /// there rather than failing on a missing `/bin/bash`.
-pub fn interactive_shell_command(runtime: &str, container: &str) -> String {
+///
+/// `cwd` is where to start: the directory being browsed, for the shell that
+/// takes over the terminal, or `None` for the image's own working directory,
+/// which is where a pane's embedded shell opens.
+pub fn interactive_shell_command(runtime: &str, container: &str, cwd: Option<&str>) -> String {
+    let workdir = match cwd.filter(|p| !p.is_empty()) {
+        Some(path) => format!("-w {} ", sh_quote(path)),
+        None => String::new(),
+    };
     format!(
-        "{} exec -it {} /bin/sh -c {}",
+        "{} exec -it {}{} /bin/sh -c {}",
         sh_quote(runtime),
+        workdir,
         sh_quote(container),
         sh_quote("exec $(command -v bash || command -v ash || command -v sh)")
     )
@@ -562,8 +571,17 @@ mod runtime_tests {
 
     #[test]
     fn shell_command_uses_the_chosen_runtime() {
-        let cmd = interactive_shell_command("podman", "my-app");
+        let cmd = interactive_shell_command("podman", "my-app", None);
         assert!(cmd.starts_with("'podman' exec -it 'my-app'"), "{cmd}");
+    }
+
+    #[test]
+    fn a_shell_can_start_where_the_pane_is() {
+        let cmd = interactive_shell_command("docker", "my-app", Some("/etc/nginx"));
+        assert!(cmd.contains("-w '/etc/nginx' 'my-app'"), "{cmd}");
+        // An empty path is no path at all, not a `-w ''` that would fail.
+        let cmd = interactive_shell_command("docker", "my-app", Some(""));
+        assert!(!cmd.contains("-w"), "{cmd}");
     }
 }
 

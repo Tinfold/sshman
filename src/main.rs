@@ -12,6 +12,7 @@ mod fileops;
 mod forward;
 mod history;
 mod input;
+mod layout;
 mod local;
 mod shell;
 mod sshcfg;
@@ -32,7 +33,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, MouseButton, MouseEventKind,
+    Event, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -41,6 +42,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::Position;
 
 use app::{App, Drag, Mode, Region, Side, UiAction};
+use backend::Target;
 use sshconn::ConnectOpts;
 use types::sh_quote;
 
@@ -87,6 +89,10 @@ struct Args {
     /// Skip the connection screen and pick a container on this machine
     #[arg(short = 'd', long)]
     docker: bool,
+
+    /// Skip the connection screen and open a tab on this machine
+    #[arg(short = 'L', long)]
+    local: bool,
 
     /// Container runtime to use: docker, podman, or a path. Detected when
     /// not given, preferring docker.
@@ -151,6 +157,9 @@ fn main() -> Result<()> {
     }
     if args.docker {
         app.browse_local_containers();
+    }
+    if args.local {
+        app.open_local_tab();
     }
 
     let mut terminal = setup_terminal().context("cannot set up the terminal")?;
@@ -340,6 +349,19 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         return;
     }
 
+    // The zoom buttons sit on the border, so they are tested before the
+    // resize zones underneath them.
+    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some((_, side, region)) = app
+            .zoom_buttons
+            .iter()
+            .find(|(rect, _, _)| rect.contains(at))
+            .copied()
+    {
+        app.click_zoom_button(side, region);
+        return;
+    }
+
     // Pressing on a border starts a resize rather than reaching the pane
     // underneath. Both borders are two columns or rows wide to grab: the two
     // panes each draw their own edge, and they sit against each other.
@@ -397,6 +419,30 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         if !area.contains(at) {
             continue;
         }
+        // Clicking in a shell puts the keyboard there, the same as clicking
+        // in a file list does — whether or not the program inside then gets
+        // the click as well.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.focus = side;
+            app.region = Region::Shell;
+        }
+
+        // A program that has asked for the mouse gets it: btop's clicks, a
+        // pager's wheel. Shift is the way past that to the pane's own
+        // scrollback, the same escape hatch a terminal gives you.
+        if !m.modifiers.contains(KeyModifiers::SHIFT)
+            && let Some(inner) = app.shell_inner[side.index()]
+            && inner.contains(at)
+        {
+            let (col, row) = (m.column - inner.x, m.row - inner.y);
+            if app
+                .shell_mut(side)
+                .is_some_and(|shell| shell.send_mouse(&m, col, row))
+            {
+                return;
+            }
+        }
+
         match m.kind {
             // Positive scrolls back into the shell's history.
             MouseEventKind::ScrollUp => {
@@ -408,10 +454,6 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 if let Some(shell) = app.shell_mut(side) {
                     shell.scroll(-3);
                 }
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                app.focus = side;
-                app.region = Region::Shell;
             }
             _ => {}
         }
@@ -511,7 +553,30 @@ fn run_shell(cmd: &str) -> Result<()> {
 /// The `ssh` invocation for an interactive shell, starting in the directory
 /// the remote pane is showing.
 fn shell_command(app: &App) -> Option<String> {
-    let conn = &app.tab()?.conn;
+    let tab = app.tab()?;
+    // A tab on this machine needs no ssh to reach it: just a login shell,
+    // where its pane is pointed.
+    if tab.is_local() {
+        let cwd = app.remote_cwd();
+        return Some(format!(
+            "cd {} 2>/dev/null; exec \"$SHELL\" -l",
+            sh_quote(&cwd)
+        ));
+    }
+    // A container is entered by running its runtime, not by dialling it. On a
+    // server that means an ssh whose payload is the `exec`, so the two nest
+    // rather than one replacing the other.
+    if let Target::Docker {
+        container, runtime, ..
+    } = &tab.target
+    {
+        let inner = docker::interactive_shell_command(runtime, container, Some(&app.remote_cwd()));
+        return Some(match tab.ssh_opts() {
+            None => inner,
+            Some(opts) => format!("{} {}", ssh_prefix(opts), sh_quote(&inner)),
+        });
+    }
+    let conn = &tab.conn;
     let mut cmd = String::from("ssh -t");
     if conn.port != 22 {
         cmd.push_str(&format!(" -p {}", conn.port));
@@ -528,6 +593,20 @@ fn shell_command(app: &App) -> Option<String> {
         cmd.push_str(&sh_quote(&inner));
     }
     Some(cmd)
+}
+
+/// `ssh -t` with the details needed to reach `opts`, for a command that runs
+/// on the far end.
+fn ssh_prefix(opts: &ConnectOpts) -> String {
+    let mut cmd = String::from("ssh -t");
+    if opts.port != 22 {
+        cmd.push_str(&format!(" -p {}", opts.port));
+    }
+    if let Some(key) = &opts.key_path {
+        cmd.push_str(&format!(" -i {}", sh_quote(&key.to_string_lossy())));
+    }
+    cmd.push_str(&format!(" {}@{}", opts.user, opts.host));
+    cmd
 }
 
 fn shell() -> String {

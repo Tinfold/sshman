@@ -4,7 +4,7 @@
 //! network is sent to the worker thread and answered asynchronously.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -15,6 +15,7 @@ use crate::backend::{BackendKind, Target};
 use crate::forward::{Forward, Spec as ForwardSpec};
 use crate::history::History;
 use crate::input::TextInput;
+use crate::layout::Layout;
 use crate::local;
 use crate::shell::Shell;
 use crate::sshconn::ConnectOpts;
@@ -447,6 +448,14 @@ pub struct RemoteTab {
     pub pane: Pane,
     pub cwd: String,
     pub shell: Option<Shell>,
+    /// Whether the keyboard was on this tab's files or in its shell when you
+    /// last left it, so coming back puts you where you were. It matters most
+    /// zoomed, where the region decides which of the two you can see at all.
+    pub region: Region,
+    /// The pane sizes this tab was last drawn with. A server you set up wide
+    /// is still wide when you come back to it, and a workspace writes these
+    /// down along with everything else about the tab.
+    pub layout: Layout,
     /// Ports carried from this server to this machine.
     pub forwards: Vec<Forward>,
     tx: Sender<Req>,
@@ -471,8 +480,10 @@ impl RemoteTab {
     /// The address, regardless of any name.
     pub fn address(&self) -> String {
         match self.kind {
-            // A container's host field already reads `name` or `name@server`.
-            BackendKind::Container => self.conn.host.clone(),
+            // A container's host field already reads `name` or `name@server`,
+            // and this machine's is its hostname — neither wants a user@ in
+            // front of it.
+            BackendKind::Container | BackendKind::Local => self.conn.host.clone(),
             BackendKind::Ssh if self.conn.port == 22 => {
                 format!("{}@{}", self.conn.user, self.conn.host)
             }
@@ -484,6 +495,11 @@ impl RemoteTab {
 
     pub fn is_container(&self) -> bool {
         self.kind == BackendKind::Container
+    }
+
+    /// A tab pointed at the machine sshman is running on.
+    pub fn is_local(&self) -> bool {
+        self.kind == BackendKind::Local
     }
 
     /// The SSH details behind this tab, if it has any.
@@ -507,16 +523,15 @@ pub struct PendingConnect {
     pub name: Option<String>,
     /// Ports to start forwarding once this connection is up, from a workspace.
     pub forwards: Vec<String>,
+    /// Sizes for the tab this becomes: a workspace's, or the ones on screen,
+    /// so opening a server does not throw away the split you just set up.
+    pub layout: Layout,
     tx: Sender<Req>,
     pub rx: Receiver<Resp>,
     initial_dir: Option<String>,
     /// Install the public key once this connection succeeds.
     install_key: bool,
 }
-
-/// How far the divider between the two sides can be pushed either way.
-const MIN_SPLIT: i16 = 20;
-const MAX_SPLIT: i16 = 80;
 
 pub struct App {
     pub mode: Mode,
@@ -526,6 +541,11 @@ pub struct App {
     /// can be matched to a region exactly instead of by recomputing layout.
     pub files_area: [Rect; 2],
     pub shell_area: [Option<Rect>; 2],
+    /// The area inside a shell pane's border: what the program running in it
+    /// thinks the screen is, and so what a mouse event is measured against.
+    pub shell_inner: [Option<Rect>; 2],
+    /// Where each pane's zoom button was drawn, and which pane it belongs to.
+    pub zoom_buttons: Vec<(Rect, Side, Region)>,
     /// Screen span of each tab chip, recorded by the renderer so a click can
     /// be matched to a tab.
     pub tab_spans: Vec<(u16, u16, usize)>,
@@ -534,10 +554,10 @@ pub struct App {
     /// stop at the end of the content instead of running into blank space.
     pub output_view_height: u16,
     pub help_view_height: u16,
-    /// Rows given to a shell pane, including its border.
-    pub shell_height: u16,
-    /// Share of the width the local side gets, as a percentage.
-    pub split_pct: u16,
+    /// Pane sizes for what is on screen. Each tab keeps its own copy, and
+    /// this is the one being drawn — the tab you are looking at hands its
+    /// sizes over here, and takes them back when you leave it.
+    pub layout: Layout,
     /// Only the focused pane is drawn, filling the space both sides usually
     /// share. It follows the focus rather than remembering a pane of its own:
     /// whatever you are looking at is what is zoomed.
@@ -626,12 +646,13 @@ impl App {
             region: Region::Files,
             files_area: [Rect::ZERO; 2],
             shell_area: [None, None],
+            shell_inner: [None, None],
+            zoom_buttons: Vec::new(),
             tab_spans: Vec::new(),
             tab_bar_row: None,
             output_view_height: 1,
             help_view_height: 1,
-            shell_height: 12,
-            split_pct: 50,
+            layout: Layout::default(),
             zoomed: false,
             panes_area: Rect::ZERO,
             divider_x: None,
@@ -711,6 +732,36 @@ impl App {
 
     pub fn connected(&self) -> bool {
         self.tab().is_some()
+    }
+
+    /// A tab pointed at the machine sshman is running on.
+    pub fn on_local_tab(&self) -> bool {
+        self.tab().is_some_and(|t| t.is_local())
+    }
+
+    /// Would zooming change what is on screen?
+    ///
+    /// It would not on a one-pane tab with no shell open: there is only the
+    /// one pane, and it already has everything.
+    pub fn zoom_has_anything_to_hide(&self) -> bool {
+        !self.on_local_tab() || self.has_shell(Side::Remote)
+    }
+
+    /// Is there only one pane on screen?
+    ///
+    /// Two ways to get there: zoom, or a tab on this machine, which has no
+    /// far side to put beside its own. Either way the keys that act across
+    /// the middle have nothing to act on.
+    pub fn one_pane(&self) -> bool {
+        self.zoomed || self.on_local_tab()
+    }
+
+    /// Keep the keyboard on a pane that is actually drawn. A tab on this
+    /// machine shows only its own, so the focus cannot sit on the local half.
+    fn settle_focus(&mut self) {
+        if self.on_local_tab() {
+            self.focus = Side::Remote;
+        }
     }
 
     /// Is sudo mode on for the tab on screen?
@@ -859,6 +910,7 @@ impl App {
                 .then(|| self.form.name.value.trim().to_string())
                 .filter(|n| !n.is_empty()),
             forwards: Vec::new(),
+            layout: self.layout,
             tx,
             rx,
             // Copied, not taken: an attempt can be retried — after accepting a
@@ -1220,7 +1272,7 @@ impl App {
                     self.opts = opts.clone();
                 }
 
-                self.tabs.push(RemoteTab {
+                self.show_new_tab(RemoteTab {
                     target,
                     kind,
                     name: tab_name,
@@ -1235,13 +1287,14 @@ impl App {
                     pane: Pane::default(),
                     cwd: String::new(),
                     shell: None,
+                    region: Region::Files,
+                    layout: pending.layout,
                     forwards: Vec::new(),
                     tx: pending.tx,
                     rx: pending.rx,
                     seq: 0,
                     pending_select: None,
                 });
-                self.active = self.tabs.len() - 1;
 
                 self.form.connecting = false;
                 self.host_key_issue = None;
@@ -1255,8 +1308,16 @@ impl App {
                 self.mode = Mode::Browse;
                 self.focus = Side::Local;
                 self.region = Region::Files;
+                // Unless the tab that just opened has no local half to focus.
+                self.settle_focus();
                 let title = self.tab().map(|t| t.title()).unwrap_or_default();
-                self.set_status(format!("Connected to {title}{note}"), Level::Good);
+                // Nothing was connected to for a local tab, so saying so
+                // would be nonsense. Point at what it can do instead.
+                let msg = match self.tab().is_some_and(|t| t.is_local()) {
+                    true => format!("{title}: a tab on this machine — S opens a shell in it"),
+                    false => format!("Connected to {title}{note}"),
+                };
+                self.set_status(msg, Level::Good);
                 self.goto_remote(start);
 
                 // Ports a workspace recorded for this connection.
@@ -1949,7 +2010,16 @@ impl App {
                     self.set_status("press q to quit", Level::Info);
                 }
             }
-            KeyCode::Tab | KeyCode::BackTab => self.focus = self.focus.other(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                if self.on_local_tab() {
+                    self.set_status(
+                        "this tab is only this machine — T or C adds a server",
+                        Level::Info,
+                    );
+                } else {
+                    self.focus = self.focus.other();
+                }
+            }
 
             KeyCode::Down | KeyCode::Char('j') => self.pane_mut(side).move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.pane_mut(side).move_by(-1),
@@ -1981,7 +2051,7 @@ impl App {
             // With one filling the screen there is no across, so it picks the
             // selection up for a paste elsewhere on the same filesystem.
             KeyCode::Char('c') | KeyCode::F(5) => {
-                if self.zoomed {
+                if self.one_pane() {
                     self.yank(false);
                 } else {
                     self.copy_to_other_side();
@@ -2098,6 +2168,8 @@ impl App {
             // Both open the connection screen; a successful connection always
             // arrives as a new tab, leaving the ones you have alone.
             KeyCode::Char('C') | KeyCode::Char('T') => self.open_connect_screen(),
+            // A tab that needs no server at all.
+            KeyCode::Char('L') => self.open_local_tab(),
             KeyCode::Char('W') => self.close_tab(),
             KeyCode::Char('?') | KeyCode::F(1) => {
                 self.help_scroll = 0;
@@ -3058,11 +3130,17 @@ impl App {
             self.initial_remote = item.path().map(String::from);
             let name = item.name().map(String::from);
             let target = item.to_target();
+            let layout = item.layout();
             self.connect_to(target, String::new());
             // `connect_to` copies `initial_remote`, so hand the rest over too.
             if let Some(pending) = self.pending.last_mut() {
                 pending.name = name;
                 pending.forwards = item.forwards().to_vec();
+                // A workspace saved before sizes were remembered has none, and
+                // opens with whatever is on screen.
+                if let Some(layout) = layout {
+                    pending.layout = layout;
+                }
             }
         }
         self.initial_remote = None;
@@ -3074,6 +3152,21 @@ impl App {
             ),
             Level::Info,
         );
+    }
+
+    /// Open a tab on the machine sshman is running on.
+    ///
+    /// It behaves like every other tab — two panes, transfers, archives, its
+    /// own shell, sudo — with the far side being here. Useful on its own for
+    /// moving things about locally, and useful as somewhere to stand when
+    /// nothing is worth connecting to.
+    pub fn open_local_tab(&mut self) {
+        self.mode = Mode::Browse;
+        // Your filetree as it is on screen, rather than a home directory you
+        // have already navigated away from.
+        self.initial_remote = Some(self.local_cwd.display().to_string());
+        self.connect_to(Target::Local, String::new());
+        self.initial_remote = None;
     }
 
     // ---- containers ---------------------------------------------------------
@@ -3212,7 +3305,7 @@ impl App {
         self.mode = Mode::Browse;
         if self.tabs.is_empty() {
             self.set_status(
-                "no server connected — C connects, D opens a local container, q quits",
+                "nothing connected — C connects, L opens a tab on this machine, q quits",
                 Level::Info,
             );
         }
@@ -3265,12 +3358,45 @@ impl App {
         if index >= self.tabs.len() || index == self.active {
             return;
         }
-        self.active = index;
-        // The new tab may not have a shell open, so do not leave the keyboard
-        // pointing at one that is not there.
-        if self.focus == Side::Remote && !self.has_shell(Side::Remote) {
-            self.region = Region::Files;
+        self.stash_layout();
+        // The clipboard holds names relative to a directory on one machine.
+        // Carried to another tab they would mean a different machine's files,
+        // or nothing at all, so it does not travel.
+        if self.clip.as_ref().is_some_and(|c| c.side == Side::Remote) {
+            self.clip = None;
         }
+        // Tabs are the remote side, so none of this applies while the
+        // keyboard is on the local one.
+        if self.focus == Side::Remote {
+            let leaving = self.region;
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.region = leaving;
+            }
+            self.active = index;
+            self.region = if !self.has_shell(Side::Remote) {
+                // Nothing to point at: the new tab has no shell open. What
+                // this tab remembers is left alone, so a shell that is still
+                // running is waiting where it was when we come back.
+                Region::Files
+            } else if leaving == Region::Shell {
+                // A shell carries over to a tab that has one — otherwise
+                // switching tabs zoomed into a shell would show a file list.
+                Region::Shell
+            } else if self.zoomed {
+                // Zoomed, the region is the only thing deciding what can be
+                // seen, so a tab left in its shell has to come back to it.
+                self.tab().map(|t| t.region).unwrap_or(Region::Files)
+            } else {
+                // Unzoomed the shell is on screen either way, so the keyboard
+                // stays on the files. Landing in a shell here would be a trap:
+                // it swallows the Ctrl-arrows that were cycling the tabs.
+                Region::Files
+            };
+        } else {
+            self.active = index;
+        }
+        self.adopt_layout();
+        self.settle_focus();
         // Keep the connection form in step with what is on screen.
         if let Some(opts) = self.tab().and_then(|t| t.ssh_opts()) {
             self.opts = opts.clone();
@@ -3304,6 +3430,8 @@ impl App {
             if self.focus == Side::Remote && !self.has_shell(Side::Remote) {
                 self.region = Region::Files;
             }
+            self.adopt_layout();
+            self.settle_focus();
             if let Some(opts) = self.tab().and_then(|t| t.ssh_opts()) {
                 self.opts = opts.clone();
             }
@@ -3354,6 +3482,11 @@ impl App {
                 // This tab's own credentials, and its own connection, so a
                 // busy shell never stalls transfers — on this tab or any other.
                 match (&tab.target, tab.ssh_opts()) {
+                    // Already here: the same shell the local pane opens, in
+                    // this tab's directory.
+                    (Target::Local, _) => {
+                        Shell::spawn_local(Path::new(&tab.cwd.clone()), ROWS, COLS)
+                    }
                     // A container is entered with `docker exec -it`, run
                     // either here or on the server that hosts it.
                     (
@@ -3362,7 +3495,8 @@ impl App {
                         },
                         ssh,
                     ) => {
-                        let cmdline = crate::docker::interactive_shell_command(runtime, container);
+                        let cmdline =
+                            crate::docker::interactive_shell_command(runtime, container, None);
                         let label = tab.title();
                         match ssh {
                             None => Shell::spawn_local_command(label, cmdline, ROWS, COLS),
@@ -3380,14 +3514,27 @@ impl App {
         self.set_shell(side, Some(shell));
         self.focus = side;
         self.region = Region::Shell;
+        let whose = match side {
+            Side::Remote if self.tab().is_some_and(|t| t.is_local()) => "tab",
+            _ => side_name(side),
+        };
         self.set_status(
             format!(
-                "{} shell open in {} — F6 or Ctrl-] returns to the files",
-                side_name(side),
+                "{whose} shell open in {} — F6 or Ctrl-] returns to the files",
                 self.path_of(side)
             ),
             Level::Good,
         );
+    }
+
+    /// Change the sizes on screen, keeping the tab that owns them in step.
+    ///
+    /// Every resize goes through here, so the tab's copy is never behind what
+    /// is drawn — a workspace saved without switching tabs first would
+    /// otherwise write down the sizes from before you dragged anything.
+    fn edit_layout(&mut self, edit: impl FnOnce(&mut Layout)) {
+        edit(&mut self.layout);
+        self.stash_layout();
     }
 
     /// Grow (positive) or shrink the shell pane on the focused side.
@@ -3396,54 +3543,83 @@ impl App {
             self.set_status("no shell on this side — S opens one", Level::Info);
             return;
         }
-        let next = (self.shell_height as i16 + delta).clamp(3, 60);
-        self.shell_height = next as u16;
+        self.edit_layout(|l| l.nudge_shell(delta));
     }
 
     /// Move the divider between the two sides. Positive widens the local side.
-    ///
-    /// Both ends are capped well short of nothing: a pane narrow enough to
-    /// show only a border is not a pane, and getting back out of one with the
-    /// mouse would be fiddly.
     fn resize_split(&mut self, delta: i16) {
-        if self.zoomed {
-            self.set_status(
-                "one pane fills the screen — m brings the other back",
-                Level::Info,
-            );
+        if self.one_pane() {
+            let why = match self.zoomed {
+                true => "one pane fills the screen — m brings the other back",
+                false => "this tab is only this machine, so there is no divider",
+            };
+            self.set_status(why, Level::Info);
             return;
         }
-        self.split_pct = (self.split_pct as i16 + delta).clamp(MIN_SPLIT, MAX_SPLIT) as u16;
+        self.edit_layout(|l| l.nudge_split(delta));
     }
 
     /// Put the divider under the mouse, from a drag.
     pub fn drag_split_to(&mut self, x: u16) {
         let area = self.panes_area;
-        if area.width == 0 {
-            return;
-        }
-        let offset = x.saturating_sub(area.x).min(area.width) as u32;
-        let pct = (offset * 100 / area.width as u32) as i16;
-        self.split_pct = pct.clamp(MIN_SPLIT, MAX_SPLIT) as u16;
+        self.edit_layout(|l| l.split_at(area, x));
     }
 
-    /// Put the top edge of the shell pane under the mouse, from a drag. The
-    /// shell sits against the bottom of the panes, so the row it starts on is
-    /// all its height amounts to.
+    /// Put the top edge of the shell pane under the mouse, from a drag.
     pub fn drag_shell_top_to(&mut self, row: u16) {
-        let height = self.panes_area.bottom().saturating_sub(row);
-        // Never more than the panes have between them: the drawing keeps
-        // three rows for the file list on top of that.
-        let ceiling = self.panes_area.height.clamp(3, 60);
-        self.shell_height = height.clamp(3, ceiling);
+        let area = self.panes_area;
+        self.edit_layout(|l| l.shell_top_at(area, row));
+    }
+
+    /// Hand the sizes on screen back to the tab that owns them. Anything
+    /// that changes which tab is active does this first, or the tab being
+    /// left behind would forget whatever you had just done to it.
+    fn stash_layout(&mut self) {
+        let live = self.layout;
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.layout = live;
+        }
+    }
+
+    /// Put a tab that has just been made on screen.
+    ///
+    /// The sizes it was built with are its own — a workspace's, or the ones
+    /// that were on screen — so the tab being left behind has to be handed
+    /// its own back first, while `active` still points at it. Stashing after
+    /// the push would write them over the new tab instead, since with no tabs
+    /// yet open `active` is already the index the new one lands on.
+    fn show_new_tab(&mut self, tab: RemoteTab) {
+        self.stash_layout();
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        self.adopt_layout();
+    }
+
+    /// Draw with the active tab's sizes from here on.
+    fn adopt_layout(&mut self) {
+        if let Some(tab) = self.tab() {
+            self.layout = tab.layout;
+        }
     }
 
     /// Back to an even split with a shell of the height we started with.
+    ///
+    /// Only for the tab on screen: the others keep the sizes you gave them.
     fn reset_layout(&mut self) {
-        self.split_pct = 50;
-        self.shell_height = 12;
+        self.edit_layout(|l| *l = Layout::default());
         self.zoomed = false;
         self.set_status("layout reset", Level::Info);
+    }
+
+    /// A click on a pane's zoom button.
+    ///
+    /// The zoom follows the focus, so the focus goes to the pane whose button
+    /// was clicked before anything is zoomed — clicking the far pane's button
+    /// blows up that pane, which is the only thing the click could mean.
+    pub fn click_zoom_button(&mut self, side: Side, region: Region) {
+        self.focus = side;
+        self.region = region;
+        self.toggle_zoom();
     }
 
     /// Give the whole area to the focused pane, or hand it back.
@@ -3452,11 +3628,25 @@ impl App {
     /// way they do at any other size — you stay zoomed, on whatever you moved
     /// to — and there is nothing to remember about which pane was blown up.
     fn toggle_zoom(&mut self) {
+        // On a tab that is one pane already, with no shell under it, there is
+        // nothing for a zoom to hide. Un-zooming is always allowed, so a shell
+        // closed while zoomed cannot strand anyone.
+        if !self.zoomed && !self.zoom_has_anything_to_hide() {
+            self.set_status(
+                "this tab is a single pane — S opens a shell to zoom past",
+                Level::Info,
+            );
+            return;
+        }
         self.zoomed = !self.zoomed;
         if self.zoomed {
+            let side = match self.on_local_tab() {
+                true => "this tab".to_string(),
+                false => side_name(self.focus).to_string(),
+            };
             let what = match self.region {
-                Region::Files => side_name(self.focus).to_string(),
-                Region::Shell => format!("{} shell", side_name(self.focus)),
+                Region::Files => side,
+                Region::Shell => format!("{side} shell"),
             };
             self.set_status(
                 format!("{what} fills the screen — m or F3 brings the other panes back"),
@@ -3530,6 +3720,10 @@ impl App {
 
     /// Point the other pane at the same path as the focused one.
     fn mirror_path(&mut self) {
+        if self.on_local_tab() {
+            self.set_status("this tab has no other pane to point", Level::Info);
+            return;
+        }
         match self.focus {
             Side::Local => {
                 let path = self.local_cwd.display().to_string();
@@ -3607,6 +3801,11 @@ fn scroll_limit(lines: usize, view_height: u16) -> u16 {
 fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
     let path = Some(tab.cwd.clone()).filter(|p| !p.is_empty());
     match &tab.target {
+        Target::Local => Some(WorkspaceItem::Local {
+            path,
+            name: tab.name.clone(),
+            layout: Some(tab.layout),
+        }),
         Target::Ssh(opts) => Some(WorkspaceItem::Ssh {
             user: opts.user.clone(),
             host: opts.host.clone(),
@@ -3615,6 +3814,7 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
             name: tab.name.clone(),
             path,
             forwards: saved_forwards(tab),
+            layout: Some(tab.layout),
         }),
         Target::Docker {
             via,
@@ -3634,10 +3834,14 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
                     name: None,
                     path: None,
                     forwards: Vec::new(),
+                    // Not a tab of its own: it is how the container is
+                    // reached, so it has no panes and no sizes.
+                    layout: None,
                 })
             }),
             path,
             forwards: saved_forwards(tab),
+            layout: Some(tab.layout),
         }),
     }
 }
@@ -3688,6 +3892,7 @@ fn file_signature(path: &std::path::Path) -> Option<(i64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::EntryKind;
     use ratatui::crossterm::event::KeyEventState;
     use std::path::Path;
 
@@ -3865,6 +4070,152 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A tab that is connected as far as the UI is concerned. The worker at
+    /// the other end of the channel is nobody, which is all these need: the
+    /// keys under test never send a request.
+    fn fake_tab(app: &mut App, host: &str, shell: Option<Shell>) {
+        fake_tab_with(app, host, shell, Layout::default());
+    }
+
+    /// A tab on this machine, the kind `L` opens.
+    fn fake_local_tab(app: &mut App, cwd: &str) {
+        fake_tab_with(app, "here", None, Layout::default());
+        let tab = app.tabs.last_mut().unwrap();
+        tab.kind = BackendKind::Local;
+        tab.target = Target::Local;
+        tab.cwd = cwd.to_string();
+        tab.pane.set_entries(vec![FileEntry {
+            name: "one.txt".into(),
+            kind: EntryKind::File,
+            size: 4,
+            mtime: 0,
+            perms: "-rw-r--r--".into(),
+            link_target: None,
+            points_to_dir: false,
+        }]);
+        app.settle_focus();
+    }
+
+    fn fake_tab_with(app: &mut App, host: &str, shell: Option<Shell>, layout: Layout) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (_, resp_rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        app.show_new_tab(RemoteTab {
+            target: Target::Ssh(ConnectOpts::default()),
+            kind: BackendKind::Ssh,
+            name: None,
+            conn: ConnInfo {
+                user: "me".into(),
+                host: host.into(),
+                port: 22,
+                home: "/home/me".into(),
+            },
+            link: LinkState::Live,
+            sudo: false,
+            pane: Pane::default(),
+            cwd: "/home/me".into(),
+            shell,
+            region: Region::Files,
+            layout,
+            forwards: Vec::new(),
+            tx,
+            rx: resp_rx,
+            seq: 0,
+            pending_select: None,
+        });
+    }
+
+    #[test]
+    fn a_tab_you_left_in_its_shell_comes_back_to_its_shell() {
+        let dir = scratch("tab-shell");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", Some(Shell::spawn_local(&dir, 24, 80)));
+        fake_tab(&mut app, "two", None);
+        app.active = 0;
+        app.focus = Side::Remote;
+        app.region = Region::Shell;
+        app.zoomed = true;
+
+        // The second tab has no shell, so there is none to show.
+        app.goto_tab(1);
+        assert_eq!(app.region, Region::Files);
+        assert!(app.zoomed, "the zoom itself stays put");
+
+        // Going back must land where we left off, not on the file list.
+        app.goto_tab(0);
+        assert_eq!(
+            app.region,
+            Region::Shell,
+            "the shell we were in has to come back"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cycling_tabs_unzoomed_never_lands_in_a_shell() {
+        let dir = scratch("tab-cycle");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        fake_tab(&mut app, "two", Some(Shell::spawn_local(&dir, 24, 80)));
+        app.tabs[1].region = Region::Shell;
+        app.active = 0;
+        app.focus = Side::Remote;
+        app.region = Region::Files;
+
+        app.goto_tab(1);
+        assert_eq!(
+            app.region,
+            Region::Files,
+            "the shell is on screen anyway, and it would swallow the \
+             Ctrl-arrows that got us here"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_shell_carries_over_to_a_tab_that_has_one() {
+        let dir = scratch("tab-carry");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", Some(Shell::spawn_local(&dir, 24, 80)));
+        fake_tab(&mut app, "two", Some(Shell::spawn_local(&dir, 24, 80)));
+        app.active = 0;
+        app.focus = Side::Remote;
+        app.region = Region::Shell;
+        app.zoomed = true;
+
+        app.goto_tab(1);
+        assert_eq!(
+            app.region,
+            Region::Shell,
+            "the other tab has a shell, so a zoomed shell must show it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn switching_tabs_leaves_the_local_side_alone() {
+        let dir = scratch("tab-local");
+        let mut app = app_in(&dir);
+        app.local_shell = Some(Shell::spawn_local(&dir, 24, 80));
+        fake_tab(&mut app, "one", None);
+        fake_tab(&mut app, "two", None);
+        app.active = 0;
+        app.focus = Side::Local;
+        app.region = Region::Shell;
+
+        app.goto_tab(1);
+        assert_eq!(
+            app.region,
+            Region::Shell,
+            "the keyboard is in the local shell; tabs are the other side"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn zoom_follows_the_focus_and_esc_undoes_it() {
         let dir = scratch("zoom");
@@ -3884,37 +4235,206 @@ mod tests {
     }
 
     #[test]
-    fn the_divider_follows_the_mouse_but_leaves_both_sides_usable() {
-        let dir = scratch("divider");
+    fn a_tab_on_this_machine_is_a_single_pane() {
+        let dir = scratch("local-tab");
         let mut app = app_in(&dir);
-        app.panes_area = Rect::new(0, 2, 100, 20);
+        fake_local_tab(&mut app, "/etc");
 
-        app.drag_split_to(70);
-        assert_eq!(app.split_pct, 70);
-        // Dragged off either end, both panes stay wide enough to use.
-        app.drag_split_to(0);
-        assert_eq!(app.split_pct, MIN_SPLIT as u16);
-        app.drag_split_to(100);
-        assert_eq!(app.split_pct, MAX_SPLIT as u16);
+        assert!(app.one_pane(), "there is no other side to it");
+        assert_eq!(
+            app.focus,
+            Side::Remote,
+            "the keyboard cannot sit on a pane that is not drawn"
+        );
+
+        // Tab has nowhere to go, and must not park the keyboard off screen.
+        app.on_key(KeyEvent {
+            code: KeyCode::Tab,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(app.focus, Side::Remote);
+        assert!(app.status.contains("only this machine"), "{}", app.status);
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn the_shell_edge_follows_the_mouse_within_its_limits() {
-        let dir = scratch("shell-edge");
+    fn zoom_is_only_offered_where_it_would_change_something() {
+        let dir = scratch("zoom-useful");
         let mut app = app_in(&dir);
+        fake_local_tab(&mut app, "/etc");
+
+        // One pane, no shell: there is nothing a zoom could hide.
+        assert!(!app.zoom_has_anything_to_hide());
+        press(&mut app, 'm');
+        assert!(!app.zoomed, "and pressing for one must not pretend");
+        assert!(app.status.contains("single pane"), "{}", app.status);
+
+        // A shell under it is something to zoom past.
+        app.tabs[0].shell = Some(Shell::spawn_local(&dir, 24, 80));
+        assert!(app.zoom_has_anything_to_hide());
+        press(&mut app, 'm');
+        assert!(app.zoomed);
+
+        // A shell closed while zoomed must not strand anyone.
+        app.tabs[0].shell = None;
+        press(&mut app, 'm');
+        assert!(!app.zoomed, "un-zooming is always allowed");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_picks_files_up_on_a_local_tab_without_zooming() {
+        let dir = scratch("local-yank");
+        let mut app = app_in(&dir);
+        fake_local_tab(&mut app, "/etc");
+        app.tabs[0].pane.select_index(0);
+
+        press(&mut app, 'c');
+        let clip = app.clip.as_ref().expect("c picked it up");
+        assert_eq!(clip.names, ["one.txt"]);
+        assert_eq!(clip.dir, "/etc", "relative to the tab's own directory");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_clipboard_does_not_follow_you_to_another_tab() {
+        let dir = scratch("clip-tab");
+        let mut app = app_in(&dir);
+        fake_local_tab(&mut app, "/etc");
+        fake_tab(&mut app, "server", None);
+        app.goto_tab(0);
+        app.tabs[0].pane.select_index(0);
+        press(&mut app, 'c');
+        assert!(app.clip.is_some());
+
+        // Those names mean a directory on the tab they came from. On another
+        // tab they would mean another machine's files, or nothing.
+        app.goto_tab(1);
+        assert!(app.clip.is_none(), "it stays where it was picked up");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn each_tab_keeps_its_own_pane_sizes() {
+        let dir = scratch("tab-sizes");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        fake_tab(&mut app, "two", None);
+        app.active = 0;
+        app.adopt_layout();
+
+        // Set the first tab up wide with a tall shell.
+        app.layout = Layout {
+            split_pct: 30,
+            shell_height: 20,
+        };
+        app.goto_tab(1);
+        assert_eq!(
+            app.layout,
+            Layout::default(),
+            "a tab that was never resized is still the default"
+        );
+
+        // The second tab gets sizes of its own.
+        app.layout.nudge_split(6);
+        let second = app.layout;
+        app.goto_tab(0);
+        assert_eq!(
+            app.layout,
+            Layout {
+                split_pct: 30,
+                shell_height: 20,
+            },
+            "the first tab's sizes come back with it"
+        );
+        app.goto_tab(1);
+        assert_eq!(app.layout, second, "and so do the second's");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_first_tab_opens_with_the_sizes_it_was_given() {
+        let dir = scratch("first-tab");
+        let mut app = app_in(&dir);
+        let saved = Layout {
+            split_pct: 40,
+            shell_height: 18,
+        };
+        // Nothing is open, so `active` already points at where this one
+        // lands. Its own sizes have to survive that.
+        fake_tab_with(&mut app, "one", None, saved);
+        assert_eq!(app.layout, saved);
+        assert_eq!(app.tabs[0].layout, saved);
+
+        // And the tab already on screen keeps what it had when a second
+        // arrives with sizes of its own.
+        app.edit_layout(|l| l.nudge_split(-4));
+        let first = app.layout;
+        fake_tab_with(&mut app, "two", None, Layout::default());
+        assert_eq!(app.layout, Layout::default(), "the new tab is on screen");
+        assert_eq!(app.tabs[0].layout, first, "the old one is unharmed");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_workspace_records_the_sizes_on_screen_not_the_ones_from_before() {
+        let dir = scratch("ws-sizes");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        app.active = 0;
+        app.focus = Side::Remote;
         app.panes_area = Rect::new(0, 2, 100, 30);
 
-        // The shell runs from the row under the cursor to the bottom.
-        app.drag_shell_top_to(22);
-        assert_eq!(app.shell_height, 10);
-        // Dragged past the top, it stops rather than swallowing the screen.
-        app.drag_shell_top_to(0);
-        assert_eq!(app.shell_height, 30);
-        // And it never shrinks to nothing.
-        app.drag_shell_top_to(99);
-        assert_eq!(app.shell_height, 3);
+        // Resize, then save without switching tabs first — the tab's own copy
+        // has to be up to date by then.
+        app.on_key(KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::ALT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        let live = app.layout;
+        assert_ne!(live, Layout::default(), "the key did something");
+
+        let items = app.workspace_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].layout(), Some(live));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resetting_only_touches_the_tab_on_screen() {
+        let dir = scratch("reset-one");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        fake_tab(&mut app, "two", None);
+        app.active = 0;
+        app.layout = Layout {
+            split_pct: 35,
+            shell_height: 25,
+        };
+        app.goto_tab(1);
+        press(&mut app, '=');
+        assert_eq!(app.layout, Layout::default());
+
+        app.goto_tab(0);
+        assert_eq!(
+            app.layout,
+            Layout {
+                split_pct: 35,
+                shell_height: 25,
+            },
+            "the other tab keeps what it was given"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3923,14 +4443,14 @@ mod tests {
     fn resetting_puts_the_layout_back() {
         let dir = scratch("reset");
         let mut app = app_in(&dir);
-        app.split_pct = 75;
-        app.shell_height = 30;
+        app.layout = Layout {
+            split_pct: 75,
+            shell_height: 30,
+        };
         app.zoomed = true;
         press(&mut app, '=');
-        assert_eq!(
-            (app.split_pct, app.shell_height, app.zoomed),
-            (50, 12, false)
-        );
+        assert_eq!(app.layout, Layout::default());
+        assert!(!app.zoomed);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
