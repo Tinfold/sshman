@@ -39,6 +39,8 @@ pub enum Mode {
     Settings,
     /// Choosing how this tab's panes are arranged.
     Arrange,
+    /// Choosing the colours to draw in.
+    Themes,
     Browse,
     Prompt,
     Confirm,
@@ -741,6 +743,12 @@ pub struct App {
     pub workspace_sel: usize,
     pub settings_sel: usize,
     pub arrangement_sel: usize,
+    pub theme_sel: usize,
+    /// The theme that was on when the chooser opened, so `Esc` can put it
+    /// back: the list draws in the theme under the cursor as you move through
+    /// it, which means the screen has already changed by the time you decide
+    /// against it.
+    theme_before: Option<(String, Theme)>,
     pub forward_sel: usize,
     /// Connections from a workspace that could not be made without a
     /// password. Kept so the user is told, and so `C` can offer them.
@@ -887,6 +895,8 @@ impl App {
             workspace_sel: 0,
             settings_sel: 0,
             arrangement_sel: 0,
+            theme_sel: 0,
+            theme_before: None,
             forward_sel: 0,
             needs_password: Vec::new(),
             output: Vec::new(),
@@ -2374,6 +2384,7 @@ impl App {
             Mode::Workspaces => self.workspace_key(key),
             Mode::Settings => self.settings_key(key),
             Mode::Arrange => self.arrange_key(key),
+            Mode::Themes => self.theme_key(key),
             Mode::Forwards => self.forward_key(key),
             Mode::Browse => self.browse_key(key),
             Mode::Prompt => self.prompt_key(key),
@@ -3335,7 +3346,10 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.settings_sel = self.settings_sel.saturating_sub(1);
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            // Enter opens a setting; the arrows step through it in place, for
+            // when you know which way you are going.
+            KeyCode::Enter => self.open_setting(self.selected_setting()),
+            KeyCode::Right | KeyCode::Char('l') => {
                 self.change_setting(self.selected_setting(), 1);
             }
             KeyCode::Left | KeyCode::Char('h') => {
@@ -3355,6 +3369,74 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Open a setting: a chooser for the ones with a list to look through, a
+    /// prompt for the ones you type an answer to.
+    fn open_setting(&mut self, setting: Setting) {
+        match setting {
+            Setting::Theme => self.open_themes(),
+            Setting::Editor | Setting::EditorOpen => self.ask_for_setting(setting),
+        }
+    }
+
+    // ---- choosing a theme ---------------------------------------------------
+
+    pub fn open_themes(&mut self) {
+        if self.themes.entries.is_empty() {
+            self.set_status("there are no themes to choose from", Level::Bad);
+            return;
+        }
+        self.theme_before = Some((self.theme_name.clone(), self.theme));
+        self.theme_sel = self
+            .themes
+            .entries
+            .iter()
+            .position(|named| named.name == self.theme_name)
+            .unwrap_or(0);
+        self.mode = Mode::Themes;
+    }
+
+    fn theme_key(&mut self, key: KeyEvent) {
+        let last = self.themes.entries.len().saturating_sub(1);
+        let step = |at: usize, by: isize| (at as isize + by).clamp(0, last as isize) as usize;
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.theme_sel = step(self.theme_sel, 1),
+            KeyCode::Up | KeyCode::Char('k') => self.theme_sel = step(self.theme_sel, -1),
+            KeyCode::PageDown => self.theme_sel = step(self.theme_sel, 8),
+            KeyCode::PageUp => self.theme_sel = step(self.theme_sel, -8),
+            KeyCode::Home => self.theme_sel = 0,
+            KeyCode::End => self.theme_sel = last,
+            // Keep the one on screen. It is already what you are looking at,
+            // so this only writes it down.
+            KeyCode::Enter => {
+                let named = self.themes.entries[self.theme_sel.min(last)].clone();
+                self.theme_before = None;
+                self.mode = Mode::Settings;
+                self.set_theme(named);
+                return;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                if let Some((name, theme)) = self.theme_before.take() {
+                    self.theme_name = name;
+                    self.theme = theme;
+                }
+                self.mode = Mode::Settings;
+                self.set_status("theme unchanged", Level::Info);
+                return;
+            }
+            _ => return,
+        }
+        self.preview_theme();
+    }
+
+    /// Draw in the theme the cursor is on without writing it down: choosing by
+    /// looking is the whole point of a list of colours.
+    fn preview_theme(&mut self) {
+        if let Some(named) = self.themes.entries.get(self.theme_sel) {
+            self.theme = named.theme;
+            self.theme_name = named.name.clone();
         }
     }
 
@@ -6646,6 +6728,92 @@ mod tests {
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.focus, Slot::files(Side::Remote));
         assert!(app.status.contains("one file list"), "{}", app.status);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_theme_chooser_shows_each_one_as_you_look_at_it() {
+        let dir = scratch("themes");
+        let mut app = app_in(&dir);
+        // Pointed at a scratch file: a test must never write over the
+        // settings of whoever is running it.
+        app.config = Config::at(dir.join("config.json"));
+        app.set_theme(app.themes.entries[0].clone());
+        let before = app.theme;
+
+        press(&mut app, ',');
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_setting(), Setting::Theme);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Themes);
+        assert_eq!(app.theme_sel, 0, "opening on the one you are using");
+
+        // Moving through the list draws in each theme, without writing any of
+        // them down: choosing by looking is the whole point.
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.theme_sel, 1);
+        assert_eq!(app.theme, app.themes.entries[1].theme, "the screen changed");
+        assert_eq!(
+            app.config.theme_name(),
+            Some(app.themes.entries[0].name.as_str()),
+            "but nothing was saved"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert_ne!(before, app.theme);
+    }
+
+    #[test]
+    fn a_theme_is_kept_by_choosing_it_and_dropped_by_backing_out() {
+        let dir = scratch("themes-keep");
+        let mut app = app_in(&dir);
+        app.config = Config::at(dir.join("config.json"));
+        app.set_theme(app.themes.entries[0].clone());
+        let (was, was_name) = (app.theme, app.theme_name.clone());
+
+        // Backing out puts the one you had back, on the screen and in the file.
+        app.open_themes();
+        key(&mut app, KeyCode::End);
+        assert_ne!(app.theme, was, "the last one is on screen");
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Settings, "back to where it was opened from");
+        assert_eq!(app.theme, was);
+        assert_eq!(app.theme_name, was_name);
+        assert_eq!(app.config.theme_name(), Some(was_name.as_str()));
+
+        // Choosing keeps it, and writes it down.
+        app.open_themes();
+        key(&mut app, KeyCode::End);
+        let last = app.themes.entries.last().expect("there are themes").clone();
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Settings);
+        assert_eq!(app.theme, last.theme);
+        assert_eq!(app.config.theme_name(), Some(last.name.as_str()));
+
+        // And it is in the file, not just in this session.
+        let saved = std::fs::read_to_string(dir.join("config.json")).expect("written");
+        assert!(saved.contains(&last.name), "{saved}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_theme_chooser_stops_at_both_ends_of_the_list() {
+        let dir = scratch("themes-ends");
+        let mut app = app_in(&dir);
+        app.config = Config::at(dir.join("config.json"));
+
+        app.open_themes();
+        for _ in 0..100 {
+            key(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.theme_sel, app.themes.entries.len() - 1);
+        for _ in 0..100 {
+            key(&mut app, KeyCode::Up);
+        }
+        assert_eq!(app.theme_sel, 0);
 
         std::fs::remove_dir_all(&dir).ok();
     }

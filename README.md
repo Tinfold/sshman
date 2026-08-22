@@ -643,25 +643,65 @@ link drops, and its pane says `[exited]`. `S` twice starts a new one.
 
 ## Themes
 
-Press `,`, pick **Theme**, and `↵` (or `←`/`→`) steps through them — the seven
-below, and any of your own. The screen redraws as you go, so you are choosing
-by looking rather than by guessing.
+Press `,`, pick **Theme**, and `↵` opens the chooser:
+
+```
+╭ Themes ─────────────────────────────────────────────────────────────────╮
+│    gruvbox      ██████████  Gruvbox dark, from morhetz/gruvbox.          │
+│    everforest   ██████████  Everforest dark medium, from sainnhe/…       │
+│  ▸ solarized    ██████████  Solarized Dark, from Ethan Schoonover's…     │
+│    onedark      ██████████  One Dark, as Atom drew it and half the…      │
+│    monokai      ██████████  Monokai, as everyone remembers it.           │
+╰──────── ↑↓ look · ↵ keeps it · Esc puts the old one back · 17 themes ────╯
+```
+
+Each row carries its own palette as a row of blocks, so you can scan the list
+without visiting every theme — and **the whole screen draws in whichever one
+the cursor is on**, because a palette is only worth judging at the size you are
+going to read it at. `↵` keeps the one you are looking at and writes it down;
+`Esc` puts back the one you had, on the screen and in the file. The list
+scrolls, so there can be as many themes as you like.
+
+`←`/`→` on the **Theme** row still steps through them in place, for when you
+know which way you are going. These are the sixteen it ships with, and any of
+your own:
 
 | | |
 |---|---|
 | `terminal` | the default: the terminal's own sixteen colours, so sshman matches whatever the rest of your setup is |
 | `catppuccin` | Catppuccin Mocha |
-| `monokai` | Monokai |
+| `dracula` | Dracula |
+| `nord` | Nord |
+| `tokyonight` | Tokyo Night |
 | `gruvbox` | Gruvbox dark |
+| `everforest` | Everforest dark, the green one |
+| `solarized` | Solarized Dark |
+| `onedark` | One Dark, as Atom drew it |
+| `monokai` | Monokai |
+| `kanagawa` | Kanagawa, ink and paper |
+| `rosepine` | Rosé Pine |
 | `mariana` | Mariana, the one Sublime Text ships |
 | `afterglow` | Afterglow |
 | `darcula` | Darcula, as IntelliJ draws it |
+| `solarized-light` | **Solarized Light** |
+| `latte` | **Catppuccin Latte** |
+
+The last two are for a terminal with a **light background**. sshman paints no
+background of its own, so a dark theme on a light terminal is white text on
+white — these are the way round that works, and they are last in the cycle
+because most terminals are dark.
 
 Each palette is taken from the theme's own source rather than from memory:
-gruvbox from `morhetz/gruvbox`, Mariana from the scheme in Sublime's own
-packages (its values are HSL there, converted here), Afterglow from
+Nord from `nordtheme.com`, Dracula from the specification at
+`draculatheme.com`, Tokyo Night from `folke/tokyonight.nvim`, Solarized from
+Ethan Schoonover's sixteen values, Everforest from `sainnhe/everforest`, Rosé
+Pine from `rose-pine/palette`, Kanagawa from `rebelot/kanagawa.nvim`, gruvbox
+from `morhetz/gruvbox`, Mariana from the scheme in Sublime's own packages (its
+values are HSL there, converted here), Afterglow from
 `YabataDesign/afterglow-theme`, Darcula from the colour scheme in
-`JetBrains/intellij-community`.
+`JetBrains/intellij-community`. Where a theme names no secondary text colour,
+`muted` is a blend of its comment and foreground; where a role is a judgement
+call rather than a value, the file's `about` line says so.
 
 Themes set foregrounds only. sshman never paints a background of its own, so
 your terminal's shows through — which is what lets it sit inside a setup you
@@ -670,13 +710,17 @@ the program running in it paints its own colours anyway.
 
 Every colour in the interface is one of twelve roles — accent, dim, text,
 muted, good, warn, bad, dir, link, exec, info, and the text drawn on a coloured
-chip. There is a test that walks every screen in every theme and fails if a
-single cell is painted a colour the theme did not choose, so a hard-coded
-colour cannot creep back in.
+chip. Two tests hold them to it: one walks every screen in every theme and
+fails if a single cell is painted a colour the theme did not choose, and one
+checks that the text on a coloured chip can actually be read against it —
+that being the one pairing sshman puts together itself, everything else being
+drawn against a background it does not own. A hard-coded colour cannot creep
+back in, and a palette that looked fine in the file but not on the screen is
+caught before it ships.
 
 ### Themes of your own
 
-A theme is a file, not a table in the source. The seven above live in
+A theme is a file, not a table in the source. The sixteen above live in
 `themes/` and are built into the binary, so there is nothing to install; drop
 any `.json` file in `~/.config/sshman/themes/` and it is loaded beside them.
 A file that takes a name sshman already uses replaces it, which is how you
@@ -736,10 +780,12 @@ instead:
 │               the program e opens files with                   │
 │    Opens with \e:o {file}\r  (for your editor)                  │
 │               the keys that open {file} in an editor pane      │
-╰──────────────────────── ↵ change · Del clears · Esc closes ────╯
+╰────────── ↵ opens it · ←→ steps it · Del clears · Esc closes ──╯
 ```
 
-Each setting shows what it is set to and where that came from, so you can tell
+`↵` opens a setting: a prompt for the ones you type an answer to, and for
+**Theme** the [chooser](#themes). Each setting shows what it is set to and
+where that came from, so you can tell
 an answer of your own from one inherited from the environment. `Del` clears one
 back to whatever it would have been. They live in one file:
 

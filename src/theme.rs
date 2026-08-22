@@ -106,11 +106,26 @@ pub struct Themes {
 const BUILT_IN: &[(&str, &str)] = &[
     ("terminal.json", include_str!("../themes/terminal.json")),
     ("catppuccin.json", include_str!("../themes/catppuccin.json")),
-    ("monokai.json", include_str!("../themes/monokai.json")),
+    ("dracula.json", include_str!("../themes/dracula.json")),
+    ("nord.json", include_str!("../themes/nord.json")),
+    ("tokyonight.json", include_str!("../themes/tokyonight.json")),
     ("gruvbox.json", include_str!("../themes/gruvbox.json")),
+    ("everforest.json", include_str!("../themes/everforest.json")),
+    ("solarized.json", include_str!("../themes/solarized.json")),
+    ("onedark.json", include_str!("../themes/onedark.json")),
+    ("monokai.json", include_str!("../themes/monokai.json")),
+    ("kanagawa.json", include_str!("../themes/kanagawa.json")),
+    ("rosepine.json", include_str!("../themes/rosepine.json")),
     ("mariana.json", include_str!("../themes/mariana.json")),
     ("afterglow.json", include_str!("../themes/afterglow.json")),
     ("darcula.json", include_str!("../themes/darcula.json")),
+    // The light ones last, since sshman paints no background of its own and
+    // most terminals have a dark one.
+    (
+        "solarized-light.json",
+        include_str!("../themes/solarized-light.json"),
+    ),
+    ("latte.json", include_str!("../themes/latte.json")),
 ];
 
 impl Themes {
@@ -591,6 +606,51 @@ mod tests {
                 named.name.to_lowercase(),
                 named.name,
                 "names are matched in lower case: {}",
+                named.name
+            );
+        }
+    }
+
+    /// How far apart two colours are, as WCAG counts it. `None` for a colour
+    /// whose value cannot be known here — one of the terminal's own sixteen,
+    /// which is whatever that terminal has been set to.
+    fn contrast(a: Color, b: Color) -> Option<f32> {
+        fn luminance(c: Color) -> Option<f32> {
+            let Color::Rgb(r, g, b) = c else {
+                return None;
+            };
+            let channel = |v: u8| {
+                let v = f32::from(v) / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            Some(0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b))
+        }
+        let (a, b) = (luminance(a)?, luminance(b)?);
+        Some((a.max(b) + 0.05) / (a.min(b) + 0.05))
+    }
+
+    #[test]
+    fn the_text_on_a_chip_can_be_read_against_it() {
+        // The one pairing sshman puts together itself. Everything else is
+        // drawn against the terminal's own background, which is not ours to
+        // know — but a chip is our colour on our colour, so if it cannot be
+        // read that is nobody's fault but this file's.
+        //
+        // Three to one is the bar for bold text on a solid colour, which is
+        // what a chip is. Several of these palettes pair their accent with
+        // their own background exactly as their authors do, and land not far
+        // above it; what this catches is a pairing nobody chose.
+        for named in &Themes::built_in().entries {
+            let Some(ratio) = contrast(named.theme.on_accent, named.theme.accent) else {
+                continue;
+            };
+            assert!(
+                ratio >= 3.0,
+                "{}: text on the accent chip is {ratio:.1}:1, which is not readable",
                 named.name
             );
         }

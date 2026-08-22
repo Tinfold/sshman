@@ -77,6 +77,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Workspaces => draw_workspaces(f, app, area),
         Mode::Settings => draw_settings(f, app, area),
         Mode::Arrange => draw_arrange(f, app, area),
+        Mode::Themes => draw_themes(f, app, area),
         Mode::Forwards => draw_forwards(f, app, area),
         Mode::Prompt => draw_prompt(f, app, area),
         Mode::Confirm => draw_confirm(f, app, area),
@@ -1128,6 +1129,11 @@ const SETTINGS: &[Hint] = &[
     ("Esc", "close"),
 ];
 const ARRANGE: &[Hint] = &[("↑↓", "choose"), ("↵", "arrange"), ("Esc", "close")];
+const THEMES: &[Hint] = &[
+    ("↑↓", "look through them"),
+    ("↵", "keep this one"),
+    ("Esc", "put the old one back"),
+];
 const OUTPUT: &[Hint] = &[("↑↓", "scroll"), ("Esc", "close")];
 const HELP_HINTS: &[Hint] = &[("↑↓", "scroll"), ("any key", "close")];
 
@@ -1150,6 +1156,7 @@ const ALL_HINTS: &[&[Hint]] = &[
     WORKSPACES,
     SETTINGS,
     ARRANGE,
+    THEMES,
     OUTPUT,
     HELP_HINTS,
 ];
@@ -1184,6 +1191,7 @@ fn hints_for(app: &App) -> &'static [Hint<'static>] {
         Mode::Workspaces => WORKSPACES,
         Mode::Settings => SETTINGS,
         Mode::Arrange => ARRANGE,
+        Mode::Themes => THEMES,
         Mode::Output => OUTPUT,
         Mode::Help => HELP_HINTS,
     }
@@ -1503,7 +1511,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         )))
         .title_bottom(
             Line::from(Span::styled(
-                " ↵ change · Del clears · Esc closes ",
+                " ↵ opens it · ←→ steps it · Del clears · Esc closes ",
                 Style::new().fg(theme.dim),
             ))
             .right_aligned(),
@@ -1565,6 +1573,95 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     }
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The themes there are, each drawn in its own colours — and the one under
+/// the cursor already on the screen behind the list, since a palette is only
+/// worth judging at the size you are going to read it at.
+fn draw_themes(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
+    let count = app.themes.entries.len();
+    let height = (count as u16 + 4).min(area.height.saturating_sub(4));
+    let rect = centered(area, 88, height.max(7));
+    f.render_widget(Clear, rect);
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme.accent))
+        .title_top(Line::from(Span::styled(
+            " Themes ",
+            Style::new().fg(theme.accent).bold(),
+        )))
+        .title_bottom(
+            Line::from(Span::styled(
+                format!(" ↑↓ look · ↵ keeps it · Esc puts the old one back · {count} themes "),
+                Style::new().fg(theme.dim),
+            ))
+            .right_aligned(),
+        );
+    let inner = block.inner(rect).inner(Margin::new(1, 0));
+    f.render_widget(block, rect);
+
+    const NAME: usize = 16;
+    let about_room = (inner.width as usize).saturating_sub(NAME + SWATCH + 6);
+    let items: Vec<ListItem> = app
+        .themes
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, named)| {
+            let chosen = index == app.theme_sel;
+            let name = Style::new().fg(if chosen { theme.text } else { theme.muted });
+            let mut spans = vec![
+                Span::styled(
+                    if chosen { " ▸ " } else { "   " },
+                    Style::new().fg(theme.accent),
+                ),
+                Span::styled(
+                    format!("{:<NAME$}", ellipsize(&named.name, NAME)),
+                    if chosen { name.bold() } else { name },
+                ),
+            ];
+            spans.extend(swatch(named.theme));
+            spans.push(Span::styled(
+                format!(
+                    "  {}",
+                    ellipsize(named.about.as_deref().unwrap_or(""), about_room)
+                ),
+                Style::new().fg(theme.dim),
+            ));
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    // The list widget scrolls to keep the selection on screen, which is what
+    // this is for: there are more themes than a box this size can hold.
+    let mut state = ListState::default();
+    state.select(Some(app.theme_sel.min(count.saturating_sub(1))));
+    f.render_stateful_widget(List::new(items), inner, &mut state);
+}
+
+/// How many cells a swatch takes.
+const SWATCH: usize = 10;
+
+/// A theme's palette at a glance: one block per role that carries a colour of
+/// its own, drawn in that theme's colours rather than the one that is on.
+fn swatch(theme: Theme) -> Vec<Span<'static>> {
+    [
+        theme.accent,
+        theme.dir,
+        theme.link,
+        theme.good,
+        theme.warn,
+        theme.bad,
+        theme.info,
+        theme.text,
+        theme.muted,
+        theme.dim,
+    ]
+    .into_iter()
+    .map(|colour| Span::styled("█", Style::new().fg(colour)))
+    .collect()
 }
 
 /// The list of ready-made arrangements, in the shape of the settings pane:
@@ -2298,12 +2395,25 @@ pub const HELP: &[(&str, &str)] = &[
     (",", "settings: what sshman remembers between sessions"),
     (
         "",
-        "  ↵ changes the one under the cursor — for a setting with a",
+        "  ↵ opens the one under the cursor: a prompt for the ones you",
     ),
     (
         "",
-        "  list to walk, like the theme, ↵ and ←/→ step through it.",
+        "  type an answer to, and for the theme a list of every one",
     ),
+    (
+        "",
+        "  there is, each drawn in its own colours, with the whole",
+    ),
+    (
+        "",
+        "  screen in whichever the cursor is on. ↵ keeps it, Esc puts",
+    ),
+    (
+        "",
+        "  the old one back. ←/→ step a setting in place without",
+    ),
+    ("", "  opening anything."),
     (
         "",
         "  Del clears one back to whatever it would have been. Kept in",
@@ -2688,6 +2798,7 @@ mod tests {
             Mode::Connect,
             Mode::Settings,
             Mode::Arrange,
+            Mode::Themes,
             Mode::Workspaces,
             Mode::Help,
             Mode::Output,
@@ -2702,11 +2813,11 @@ mod tests {
             .flat_map(|t| screens.map(|m| (t.clone(), m)))
         {
             let theme = named.theme;
-            let (_, buffer) = painted(110, 30, |app| {
+            let (app, buffer) = painted(110, 30, |app| {
                 app.theme = theme;
                 app.mode = mode;
             });
-            let known = [
+            let mut known = vec![
                 theme.accent,
                 theme.dim,
                 theme.text,
@@ -2722,6 +2833,26 @@ mod tests {
                 // Cells nobody styled keep the terminal's own colour.
                 Color::Reset,
             ];
+            // The theme chooser draws every theme in its own colours: that is
+            // the screen, not a colour that escaped.
+            if mode == Mode::Themes {
+                for other in &app.themes.entries {
+                    known.extend([
+                        other.theme.accent,
+                        other.theme.dim,
+                        other.theme.text,
+                        other.theme.muted,
+                        other.theme.good,
+                        other.theme.warn,
+                        other.theme.bad,
+                        other.theme.dir,
+                        other.theme.link,
+                        other.theme.exec,
+                        other.theme.info,
+                        other.theme.on_accent,
+                    ]);
+                }
+            }
             for colour in palette(&buffer) {
                 assert!(
                     known.contains(&colour),
@@ -2921,6 +3052,26 @@ mod tests {
         assert!(!reversed(6), "just after it");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_theme_chooser_draws_each_theme_in_its_own_colours() {
+        // The swatches are the point of the list: a row of blocks that are
+        // the theme's colours, not the colours of the theme that is on.
+        // Tall enough that the list does not have to scroll, so every theme
+        // is on the screen to look for.
+        let (app, buffer) = painted(110, 60, |app| {
+            app.open_themes();
+            app.theme_sel = 0;
+        });
+        let painted: Vec<Color> = palette(&buffer);
+        for named in &app.themes.entries {
+            assert!(
+                painted.contains(&named.theme.accent),
+                "{}'s accent is not on the screen",
+                named.name
+            );
+        }
     }
 
     #[test]
