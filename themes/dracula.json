@@ -13,5 +13,6 @@
   "link": "#ff79c6",
   "exec": "#50fa7b",
   "info": "#ffb86c",
+  "bg": "#282a36",
   "on_accent": "#282a36"
 }

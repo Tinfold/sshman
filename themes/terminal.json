@@ -13,5 +13,6 @@
   "link": "magenta",
   "exec": "green",
   "info": "blue",
+  "bg": "default",
   "on_accent": "black"
 }

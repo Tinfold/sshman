@@ -683,13 +683,12 @@ your own:
 | `mariana` | Mariana, the one Sublime Text ships |
 | `afterglow` | Afterglow |
 | `darcula` | Darcula, as IntelliJ draws it |
-| `solarized-light` | **Solarized Light** |
-| `latte` | **Catppuccin Latte** |
+| `solarized-light` | **Solarized Light**, a light one |
+| `latte` | **Catppuccin Latte**, a light one |
 
-The last two are for a terminal with a **light background**. sshman paints no
-background of its own, so a dark theme on a light terminal is white text on
-white — these are the way round that works, and they are last in the cycle
-because most terminals are dark.
+The last two are **light**: they paint a light background and dark text, so
+they work on any terminal rather than only a light one. They are last in the
+list because most terminals are dark.
 
 Each palette is taken from the theme's own source rather than from memory:
 Nord from `nordtheme.com`, Dracula from the specification at
@@ -703,10 +702,28 @@ values are HSL there, converted here), Afterglow from
 `muted` is a blend of its comment and foreground; where a role is a judgement
 call rather than a value, the file's `about` line says so.
 
-Themes set foregrounds only. sshman never paints a background of its own, so
-your terminal's shows through — which is what lets it sit inside a setup you
-have already themed, and the only honest thing to do beside a shell pane, where
-the program running in it paints its own colours anyway.
+### Backgrounds
+
+Most themes name a background as well, and sshman paints it — including behind
+a shell pane, wherever the program running in it has not painted its own. For
+those panes sshman *is* the terminal emulator, so its background is the default
+one, and `vim`'s or `btop`'s own colours sit on top of it exactly as they would
+anywhere else.
+
+This is ordinary cell painting inside the alternate screen — the same thing any
+full-screen program does. **Nothing about the terminal itself is changed**: no
+escape sequence sets its colours, so there is nothing to restore, nothing left
+behind if sshman is killed, and no other pane or tab of the same window is
+touched. Leaving sshman puts the screen back the way `nvim` does.
+
+`,` → **Background** switches between the theme's own and the terminal's, and
+the change is instant, so you can look at both. The `terminal` theme names no
+background at all, being the theme whose whole point is matching what you have
+already set up — pick it and the terminal's shows through whatever this setting
+says.
+
+A theme that paints its own background has taken responsibility for the pairing,
+so there is a test that its text can actually be read against it.
 
 Every colour in the interface is one of twelve roles — accent, dim, text,
 muted, good, warn, bad, dir, link, exec, info, and the text drawn on a coloured

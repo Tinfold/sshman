@@ -10,10 +10,12 @@
 //! sshman already uses replaces it, which is how you rewrite one of ours
 //! without forking anything.
 //!
-//! Only foregrounds are themed. sshman never paints a background of its own:
-//! the terminal's shows through, which is what makes it sit properly inside
-//! whatever you have already set up — and it is the only honest thing to do
-//! next to a shell pane, where the program running in it paints its own.
+//! A theme may name a background as well. Painting one is ordinary cell
+//! painting, the same thing `nvim` and `btop` do inside the alternate screen —
+//! leaving sshman puts the terminal back exactly as it was, because nothing
+//! about the terminal was ever changed. A theme that names none leaves the
+//! terminal's own showing through, which is what makes sshman sit inside a
+//! setup you have already themed; `terminal` is that theme by definition.
 
 use std::path::PathBuf;
 
@@ -50,6 +52,12 @@ pub struct Theme {
     /// Text drawn *on* a coloured chip, so it has to contrast with the
     /// colours above rather than with the terminal.
     pub on_accent: Color,
+    /// What to paint behind everything, including behind a shell pane
+    /// wherever the program running in it has not painted its own.
+    ///
+    /// [`Color::Reset`] means the terminal's own, which is what a theme that
+    /// names no background gets.
+    pub bg: Color,
 }
 
 /// The theme to fall back on. It is the one colours file that is also written
@@ -69,6 +77,8 @@ pub const FALLBACK: Theme = Theme {
     exec: Color::Green,
     info: Color::Blue,
     on_accent: Color::Black,
+    // The point of this theme: whatever the terminal is already set to.
+    bg: Color::Reset,
 };
 
 /// What [`FALLBACK`] is called, and so what a config file with nothing in it
@@ -300,6 +310,8 @@ struct FileTheme {
     info: Option<Colour>,
     #[serde(default)]
     on_accent: Option<Colour>,
+    #[serde(default)]
+    bg: Option<Colour>,
 }
 
 impl FileTheme {
@@ -318,6 +330,7 @@ impl FileTheme {
             exec: or(self.exec, base.exec),
             info: or(self.info, base.info),
             on_accent: or(self.on_accent, base.on_accent),
+            bg: or(self.bg, base.bg),
         }
     }
 }
@@ -387,6 +400,10 @@ fn parse(text: &str) -> Option<Color> {
         "lightmagenta" | "brightmagenta" => Color::LightMagenta,
         "lightcyan" | "brightcyan" => Color::LightCyan,
         "white" | "brightwhite" => Color::White,
+        // Not a colour so much as the absence of one: whatever the terminal
+        // is already using. The only thing a background can be that is not a
+        // colour at all.
+        "default" | "none" | "terminal" => Color::Reset,
         _ => return None,
     })
 }
@@ -651,6 +668,23 @@ mod tests {
             assert!(
                 ratio >= 3.0,
                 "{}: text on the accent chip is {ratio:.1}:1, which is not readable",
+                named.name
+            );
+        }
+    }
+
+    #[test]
+    fn text_can_be_read_on_the_background_its_theme_paints() {
+        // A theme that names a background has taken responsibility for the
+        // pairing, so it has to hold up. One that names none is drawn on
+        // whatever the terminal is set to, which is not ours to answer for.
+        for named in &Themes::built_in().entries {
+            let Some(ratio) = contrast(named.theme.text, named.theme.bg) else {
+                continue;
+            };
+            assert!(
+                ratio >= 4.5,
+                "{}: text on its own background is {ratio:.1}:1",
                 named.name
             );
         }

@@ -25,6 +25,7 @@ use crate::theme::{self, Theme, Themes};
 use crate::types::{FileEntry, rbasename, rjoin, rparent};
 use crate::worker::{HostKeyIssue, Req, Resp};
 use crate::workspace::{Item as WorkspaceItem, Workspaces};
+use ratatui::style::Color;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -3377,6 +3378,9 @@ impl App {
     fn open_setting(&mut self, setting: Setting) {
         match setting {
             Setting::Theme => self.open_themes(),
+            // There are only two answers, so opening it is the same as
+            // stepping it: a list of two would be a list for its own sake.
+            Setting::Background => self.change_setting(setting, 1),
             Setting::Editor | Setting::EditorOpen => self.ask_for_setting(setting),
         }
     }
@@ -3449,6 +3453,7 @@ impl App {
             Kind::Text => self.ask_for_setting(setting),
             Kind::Choice => match setting {
                 Setting::Theme => self.set_theme(self.themes.cycle(&self.theme_name, step)),
+                Setting::Background => self.toggle_background(),
                 Setting::Editor | Setting::EditorOpen => {}
             },
         }
@@ -3467,8 +3472,8 @@ impl App {
                 "Keys that open {file} — empty asks your editor's own".to_string(),
                 self.config.editor_open.clone().unwrap_or_default(),
             ),
-            // Nothing to type: it is chosen from a list.
-            Setting::Theme => return,
+            // Nothing to type: they are chosen from a list.
+            Setting::Theme | Setting::Background => return,
         };
         self.open_prompt(kind, title, current);
     }
@@ -3477,12 +3482,49 @@ impl App {
         match setting {
             Setting::Editor => self.set_editor(String::new()),
             Setting::EditorOpen => self.set_editor_open(String::new()),
+            Setting::Background => {
+                self.config.background = None;
+                self.save_config("background: the theme's own again".into());
+            }
             Setting::Theme => {
                 self.config.theme = None;
                 self.theme_name = theme::DEFAULT.to_string();
                 self.theme = self.themes.by_name(&self.theme_name).unwrap_or_default();
                 self.save_config(format!("theme cleared — back to {}", self.theme_name));
             }
+        }
+    }
+
+    /// Paint the theme's background, or leave the terminal's own showing
+    /// through.
+    ///
+    /// Painting one is ordinary cell painting inside the alternate screen —
+    /// what any full-screen program does — so this is only ever about what is
+    /// on the screen now. Nothing about the terminal is changed, and leaving
+    /// sshman puts it back whichever way this is set.
+    fn toggle_background(&mut self) {
+        let paint = !self.config.paint_background();
+        self.config.background = Some(match paint {
+            true => "theme".into(),
+            false => "terminal".into(),
+        });
+        let done = match (paint, self.theme.bg) {
+            (false, _) => "background: whatever the terminal is set to".to_string(),
+            (true, Color::Reset) => format!(
+                "background: the theme's own — though {} names none, being the theme that does not",
+                self.theme_name
+            ),
+            (true, _) => format!("background: {}'s own", self.theme_name),
+        };
+        self.save_config(done);
+    }
+
+    /// What to paint behind everything, or [`Color::Reset`] for whatever the
+    /// terminal is already set to.
+    pub fn background(&self) -> Color {
+        match self.config.paint_background() {
+            true => self.theme.bg,
+            false => Color::Reset,
         }
     }
 

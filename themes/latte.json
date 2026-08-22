@@ -1,6 +1,6 @@
 {
   "name": "latte",
-  "about": "Catppuccin Latte, the light one — the same palette as catppuccin, read the other way up.",
+  "about": "Catppuccin Latte, the light one — the same palette as catppuccin, the other way up.",
 
   "accent": "#8839ef",
   "dim": "#9ca0b0",
@@ -13,5 +13,6 @@
   "link": "#ea76cb",
   "exec": "#40a02b",
   "info": "#179299",
+  "bg": "#eff1f5",
   "on_accent": "#eff1f5"
 }

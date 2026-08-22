@@ -38,6 +38,15 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_open: Option<String>,
 
+    /// Whether to paint the background a theme names, or leave the terminal's
+    /// own showing through. Absent means paint it.
+    ///
+    /// Painting one is ordinary cell painting inside the alternate screen, the
+    /// same thing a full-screen editor does; nothing about the terminal itself
+    /// is changed, and leaving sshman puts it back either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+
     /// The file this came from, and where it goes back to. Not part of the
     /// file itself, and `None` when there is nowhere to write — which is also
     /// how the tests keep their hands off the real one.
@@ -91,6 +100,16 @@ impl Config {
             .unwrap_or_else(default_editor)
     }
 
+    /// Whether to paint the background a theme names. Anything but the word
+    /// `terminal` means paint it, so a file written by a later version that
+    /// knows more answers than this one still does something sensible.
+    pub fn paint_background(&self) -> bool {
+        !matches!(
+            self.background.as_deref().map(str::trim),
+            Some("terminal") | Some("none")
+        )
+    }
+
     /// The keystrokes that open a file in `program`, ready to have `{file}`
     /// put in them. Empty when there is nothing known about that editor, in
     /// which case the pane is a shell prompt and the editor is run as a
@@ -133,6 +152,7 @@ pub enum Setting {
     Editor,
     EditorOpen,
     Theme,
+    Background,
 }
 
 /// How a setting is changed: by typing a value, or by stepping through the
@@ -144,13 +164,19 @@ pub enum Kind {
 }
 
 impl Setting {
-    pub const ALL: &'static [Setting] = &[Setting::Editor, Setting::EditorOpen, Setting::Theme];
+    pub const ALL: &'static [Setting] = &[
+        Setting::Editor,
+        Setting::EditorOpen,
+        Setting::Theme,
+        Setting::Background,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Editor => "Editor",
             Self::EditorOpen => "Opens with",
             Self::Theme => "Theme",
+            Self::Background => "Background",
         }
     }
 
@@ -160,13 +186,14 @@ impl Setting {
             Self::Editor => "the program e opens files with",
             Self::EditorOpen => "the keys that open {file} in an editor pane",
             Self::Theme => "the colours to draw in",
+            Self::Background => "the theme's own, or whatever the terminal is set to",
         }
     }
 
     pub fn kind(self) -> Kind {
         match self {
             Self::Editor | Self::EditorOpen => Kind::Text,
-            Self::Theme => Kind::Choice,
+            Self::Theme | Self::Background => Kind::Choice,
         }
     }
 }
@@ -184,6 +211,10 @@ impl Config {
                 },
             },
             Setting::Theme => self.theme_name().unwrap_or(theme::DEFAULT).to_string(),
+            Setting::Background => match self.paint_background() {
+                true => "the theme's own".into(),
+                false => "the terminal's".into(),
+            },
         }
     }
 
@@ -198,6 +229,10 @@ impl Config {
             Setting::EditorOpen => match self.editor_open.is_some() {
                 true => "set here",
                 false => "for your editor",
+            },
+            Setting::Background => match self.background.is_some() {
+                true => "set here",
+                false => "the default",
             },
             Setting::Editor => {
                 if self.editor.as_deref().is_some_and(|e| !e.trim().is_empty()) {
@@ -219,6 +254,7 @@ impl Config {
         match setting {
             Setting::Editor => self.editor.is_some(),
             Setting::EditorOpen => self.editor_open.is_some(),
+            Setting::Background => self.background.is_some(),
             Setting::Theme => self.theme_name().is_some(),
         }
     }

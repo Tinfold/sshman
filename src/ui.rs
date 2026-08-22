@@ -3,7 +3,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
@@ -20,6 +20,12 @@ use crate::types::{EntryKind, FileEntry, ellipsize, fmt_time, human_size};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    // Behind everything, before anything: widgets that name no background of
+    // their own leave this one showing, and the ones that do — the chips —
+    // paint over it. A theme naming none leaves `Reset` here, which is the
+    // terminal's own and so no change at all.
+    f.buffer_mut()
+        .set_style(area, Style::new().bg(app.background()));
     let gauge_h = if app.progress.is_some() { 1 } else { 0 };
     // One connection needs no tab bar — the title bar already names it.
     let tabs_h = if app.tabs.len() > 1 { 1 } else { 0 };
@@ -524,6 +530,7 @@ fn draw_shell(
     app.term_inner.push((slot, inner));
 
     let selection = app.shell(slot).and_then(Shell::selection);
+    let background = app.background();
     let Some(shell) = app.shell_mut(slot) else {
         return;
     };
@@ -533,6 +540,21 @@ fn draw_shell(
     shell.with_screen(|screen| {
         f.render_widget(PseudoTerminal::new(screen), inner);
     });
+
+    // A terminal's own default background is whatever its emulator is set to,
+    // and for these panes sshman *is* the emulator. So cells the program
+    // inside left unpainted take the theme's background, and the ones it
+    // painted keep what it chose.
+    if background != Color::Reset {
+        let buffer = f.buffer_mut();
+        for y in inner.y..inner.bottom() {
+            for x in inner.x..inner.right() {
+                if buffer[(x, y)].bg == Color::Reset {
+                    buffer[(x, y)].bg = background;
+                }
+            }
+        }
+    }
 
     // Text picked out with the mouse, marked by turning the cells inside out
     // rather than by painting a colour over them — sshman has no background
@@ -665,6 +687,16 @@ fn place_buttons(app: &mut App, slot: Slot, area: Rect) -> Buttons {
             .push((button_area(area, from_right), slot));
     }
     buttons
+}
+
+/// Make room for an overlay.
+///
+/// `Clear` puts the cells back to the terminal's own colours, which is exactly
+/// wrong when the theme has painted a background: the box would be a hole in
+/// it. So the background goes back down behind the box.
+fn clear_under(f: &mut Frame, rect: Rect, bg: Color) {
+    f.render_widget(Clear, rect);
+    f.buffer_mut().set_style(rect, Style::new().bg(bg));
 }
 
 /// `[⤢]`, in cells.
@@ -1230,7 +1262,7 @@ fn draw_connect(f: &mut Frame, app: &App, area: Rect) {
         + usize::from(app.form.connecting);
     let height = (ConnectForm::FIELDS + recent_height + extra + 4) as u16;
     let rect = centered(area, 78, height);
-    f.render_widget(Clear, rect);
+    clear_under(f, rect, app.background());
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1435,7 +1467,7 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
 
     let height = (picker.items.len() as u16 + 4).min(area.height.saturating_sub(4));
     let rect = centered(area, 92, height.max(7));
-    f.render_widget(Clear, rect);
+    clear_under(f, rect, app.background());
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1500,7 +1532,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         74,
         (rows + 4).min(area.height.saturating_sub(4)).max(7),
     );
-    f.render_widget(Clear, rect);
+    clear_under(f, rect, app.background());
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1583,7 +1615,7 @@ fn draw_themes(f: &mut Frame, app: &App, area: Rect) {
     let count = app.themes.entries.len();
     let height = (count as u16 + 4).min(area.height.saturating_sub(4));
     let rect = centered(area, 88, height.max(7));
-    f.render_widget(Clear, rect);
+    clear_under(f, rect, app.background());
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1674,7 +1706,7 @@ fn draw_arrange(f: &mut Frame, app: &App, area: Rect) {
         74,
         (rows + 4).min(area.height.saturating_sub(4)).max(7),
     );
-    f.render_widget(Clear, rect);
+    clear_under(f, rect, app.background());
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1731,7 +1763,7 @@ fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
         84,
         (rows + 4).min(area.height.saturating_sub(4)).max(7),
     );
-    f.render_widget(Clear, rect);
+    clear_under(f, rect, app.background());
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1823,7 +1855,7 @@ fn draw_forwards(f: &mut Frame, app: &App, area: Rect) {
             .min(area.height.saturating_sub(4))
             .max(8),
     );
-    f.render_widget(Clear, rect);
+    clear_under(f, rect, app.background());
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1910,7 +1942,7 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
     let Some(prompt) = &app.prompt else { return };
     let rect = centered(area, 78, 5);
-    f.render_widget(Clear, rect);
+    clear_under(f, rect, app.background());
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1951,7 +1983,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     let extra = if state.require_phrase.is_some() { 3 } else { 0 };
     let height = (state.body.len() as u16 + 5 + extra).min(area.height.saturating_sub(2));
     let rect = centered(area, 74, height.max(7));
-    f.render_widget(Clear, rect);
+    clear_under(f, rect, app.background());
 
     let color = if state.danger { theme.bad } else { theme.warn };
     let block = Block::bordered()
@@ -2029,7 +2061,7 @@ fn draw_output(f: &mut Frame, app: &mut App, area: Rect) {
         area.width.saturating_sub(8),
         area.height.saturating_sub(4),
     );
-    f.render_widget(Clear, rect);
+    clear_under(f, rect, app.background());
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -2063,7 +2095,7 @@ fn draw_output(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     let rect = centered(area, 76, area.height.saturating_sub(4).min(34));
-    f.render_widget(Clear, rect);
+    clear_under(f, rect, app.background());
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -2393,6 +2425,23 @@ pub const HELP: &[(&str, &str)] = &[
     ("", ""),
     ("", "Editing and running things"),
     (",", "settings: what sshman remembers between sessions"),
+    (
+        "",
+        "  Background says whether a theme's own is painted, or the",
+    ),
+    (
+        "",
+        "  terminal's is left showing. Painting one is cell painting",
+    ),
+    (
+        "",
+        "  inside the alternate screen, the same thing a full-screen",
+    ),
+    (
+        "",
+        "  editor does — nothing about the terminal itself changes,",
+    ),
+    ("", "  and leaving sshman puts it back either way."),
     (
         "",
         "  ↵ opens the one under the cursor: a prompt for the ones you",
@@ -3052,6 +3101,58 @@ mod tests {
         assert!(!reversed(6), "just after it");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every background on the screen, cell by cell.
+    fn backgrounds(buffer: &Buffer) -> Vec<Color> {
+        buffer.content().iter().map(|cell| cell.bg).collect()
+    }
+
+    #[test]
+    fn a_theme_that_names_a_background_paints_every_cell() {
+        // Including behind the shell panes, where the cells the program
+        // inside left unpainted are ours to colour: for those panes sshman is
+        // the terminal emulator, and this is what its default background is.
+        let dir = std::env::temp_dir().join(format!("sshman-bg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let painted_in = |name: &str| {
+            let theme = Themes::built_in().by_name(name).expect("a theme we ship");
+            painted(110, 30, |app| {
+                app.theme = theme;
+                let slot = app.open_test_term(&dir);
+                app.focus = slot;
+            })
+        };
+
+        let (app, buffer) = painted_in("catppuccin");
+        assert_ne!(app.background(), Color::Reset, "this theme names one");
+        for (at, bg) in backgrounds(&buffer).into_iter().enumerate() {
+            assert_ne!(
+                bg,
+                Color::Reset,
+                "cell {at} is still the terminal's own colour"
+            );
+        }
+
+        // And the theme that names none leaves every one of them alone.
+        let (app, buffer) = painted_in("terminal");
+        assert_eq!(app.background(), Color::Reset);
+        assert!(
+            backgrounds(&buffer).contains(&Color::Reset),
+            "the terminal's own background has to show through"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_terminals_own_background_comes_back_when_it_is_asked_for() {
+        let (app, buffer) = painted(110, 30, |app| {
+            app.theme = Themes::built_in().by_name("catppuccin").expect("shipped");
+            app.config.background = Some("terminal".into());
+        });
+        assert_eq!(app.background(), Color::Reset);
+        assert!(backgrounds(&buffer).contains(&Color::Reset));
     }
 
     #[test]
