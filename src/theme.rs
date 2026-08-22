@@ -58,6 +58,12 @@ pub struct Theme {
     /// [`Color::Reset`] means the terminal's own, which is what a theme that
     /// names no background gets.
     pub bg: Color,
+    /// The sixteen colours a program running in a shell pane asks for by
+    /// number — what `ls`, a prompt and `git` are actually coloured with.
+    ///
+    /// A theme may set these itself; otherwise they are worked out from the
+    /// roles above, since a role is what each of them means.
+    pub ansi: [Color; 16],
 }
 
 /// The theme to fall back on. It is the one colours file that is also written
@@ -79,6 +85,24 @@ pub const FALLBACK: Theme = Theme {
     on_accent: Color::Black,
     // The point of this theme: whatever the terminal is already set to.
     bg: Color::Reset,
+    ansi: [
+        Color::Black,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Gray,
+        Color::DarkGray,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::White,
+    ],
 };
 
 /// What [`FALLBACK`] is called, and so what a config file with nothing in it
@@ -209,6 +233,12 @@ impl Themes {
             self.problems.push(format!("{from}: a theme needs a name"));
             return;
         }
+        if !file.ansi_is_whole() {
+            self.problems.push(format!(
+                "{from}: a terminal has sixteen colours, no other number"
+            ));
+            return;
+        }
         // Anything left out comes from the theme it is based on, so a file
         // that only wants to change the accent only has to say the accent.
         let base = match &file.base {
@@ -312,12 +342,22 @@ struct FileTheme {
     on_accent: Option<Colour>,
     #[serde(default)]
     bg: Option<Colour>,
+    /// The sixteen a program asks for by number, in the usual order: black,
+    /// red, green, yellow, blue, magenta, cyan, white, then the bright eight.
+    /// Absent means work them out from the roles.
+    #[serde(default)]
+    ansi: Option<Vec<Colour>>,
 }
 
 impl FileTheme {
+    /// Whether the sixteen it gives, if it gives any, are sixteen.
+    fn ansi_is_whole(&self) -> bool {
+        self.ansi.as_ref().is_none_or(|given| given.len() == 16)
+    }
+
     fn resolve(&self, base: Theme) -> Theme {
         let or = |c: Option<Colour>, fallback: Color| c.map(|c| c.0).unwrap_or(fallback);
-        Theme {
+        let mut theme = Theme {
             accent: or(self.accent, base.accent),
             dim: or(self.dim, base.dim),
             text: or(self.text, base.text),
@@ -331,7 +371,34 @@ impl FileTheme {
             info: or(self.info, base.info),
             on_accent: or(self.on_accent, base.on_accent),
             bg: or(self.bg, base.bg),
-        }
+            ansi: base.ansi,
+        };
+        theme.ansi = match &self.ansi {
+            Some(given) if given.len() == 16 => std::array::from_fn(|i| given[i].0),
+            // What each of the sixteen means is what the roles are for, so a
+            // theme that has not spelled them out has still said them. The
+            // bright eight are the same hues: brightening a colour the theme
+            // chose would be inventing one it did not.
+            _ => [
+                theme.bg,
+                theme.bad,
+                theme.good,
+                theme.warn,
+                theme.dir,
+                theme.link,
+                theme.info,
+                theme.muted,
+                theme.dim,
+                theme.bad,
+                theme.good,
+                theme.warn,
+                theme.dir,
+                theme.link,
+                theme.info,
+                theme.text,
+            ],
+        };
+        theme
     }
 }
 

@@ -3380,7 +3380,7 @@ impl App {
             Setting::Theme => self.open_themes(),
             // There are only two answers, so opening it is the same as
             // stepping it: a list of two would be a list for its own sake.
-            Setting::Background => self.change_setting(setting, 1),
+            Setting::Background | Setting::ShellColours => self.change_setting(setting, 1),
             Setting::Editor | Setting::EditorOpen => self.ask_for_setting(setting),
         }
     }
@@ -3454,6 +3454,7 @@ impl App {
             Kind::Choice => match setting {
                 Setting::Theme => self.set_theme(self.themes.cycle(&self.theme_name, step)),
                 Setting::Background => self.toggle_background(),
+                Setting::ShellColours => self.toggle_shell_colours(),
                 Setting::Editor | Setting::EditorOpen => {}
             },
         }
@@ -3473,7 +3474,7 @@ impl App {
                 self.config.editor_open.clone().unwrap_or_default(),
             ),
             // Nothing to type: they are chosen from a list.
-            Setting::Theme | Setting::Background => return,
+            Setting::Theme | Setting::Background | Setting::ShellColours => return,
         };
         self.open_prompt(kind, title, current);
     }
@@ -3485,6 +3486,10 @@ impl App {
             Setting::Background => {
                 self.config.background = None;
                 self.save_config("background: the theme's own again".into());
+            }
+            Setting::ShellColours => {
+                self.config.shell_colours = None;
+                self.save_config("shell colours: the theme's own again".into());
             }
             Setting::Theme => {
                 self.config.theme = None;
@@ -3519,6 +3524,30 @@ impl App {
         self.save_config(done);
     }
 
+    /// Colour a shell pane's own output from the theme, or leave the
+    /// terminal's palette to it.
+    ///
+    /// The same idea as the background, and for the same reason: for those
+    /// panes sshman is the terminal emulator, so the colour scheme is its to
+    /// set. Only the sixteen a program asks for by number are touched — a
+    /// program that named an exact colour gets the colour it named.
+    fn toggle_shell_colours(&mut self) {
+        let theirs = !self.config.theme_the_shell();
+        self.config.shell_colours = Some(match theirs {
+            true => "theme".into(),
+            false => "terminal".into(),
+        });
+        let done = match (theirs, self.theme.bg) {
+            (false, _) => "shell colours: the terminal's own palette".to_string(),
+            (true, Color::Reset) => format!(
+                "shell colours: the theme's — though {} has none of its own, being the theme that has not",
+                self.theme_name
+            ),
+            (true, _) => format!("shell colours: {}'s own", self.theme_name),
+        };
+        self.save_config(done);
+    }
+
     /// What to paint behind everything, or [`Color::Reset`] for whatever the
     /// terminal is already set to.
     pub fn background(&self) -> Color {
@@ -3526,6 +3555,17 @@ impl App {
             true => self.theme.bg,
             false => Color::Reset,
         }
+    }
+
+    /// The sixteen a shell pane's output is coloured from, or `None` to leave
+    /// the terminal's own palette to it.
+    ///
+    /// A theme that paints no background is not offered: it has not taken the
+    /// screen over, so the pairing of its colours with whatever is behind them
+    /// is not one it chose.
+    pub fn shell_palette(&self) -> Option<[Color; 16]> {
+        let owns_the_screen = self.theme.bg != Color::Reset;
+        (self.config.theme_the_shell() && owns_the_screen).then_some(self.theme.ansi)
     }
 
     /// Draw in these colours from now on, and next time.

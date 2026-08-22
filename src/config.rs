@@ -47,6 +47,14 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<String>,
 
+    /// Whether a shell pane's colours come from the theme or from the
+    /// terminal's own palette. Absent means the theme's.
+    ///
+    /// It is the same idea as the background: for those panes sshman is the
+    /// terminal emulator, and this is the colour scheme it is set to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_colours: Option<String>,
+
     /// The file this came from, and where it goes back to. Not part of the
     /// file itself, and `None` when there is nowhere to write — which is also
     /// how the tests keep their hands off the real one.
@@ -103,6 +111,14 @@ impl Config {
     /// Whether to paint the background a theme names. Anything but the word
     /// `terminal` means paint it, so a file written by a later version that
     /// knows more answers than this one still does something sensible.
+    /// Whether to colour a shell pane's text from the theme.
+    pub fn theme_the_shell(&self) -> bool {
+        !matches!(
+            self.shell_colours.as_deref().map(str::trim),
+            Some("terminal") | Some("none")
+        )
+    }
+
     pub fn paint_background(&self) -> bool {
         !matches!(
             self.background.as_deref().map(str::trim),
@@ -153,6 +169,7 @@ pub enum Setting {
     EditorOpen,
     Theme,
     Background,
+    ShellColours,
 }
 
 /// How a setting is changed: by typing a value, or by stepping through the
@@ -169,6 +186,7 @@ impl Setting {
         Setting::EditorOpen,
         Setting::Theme,
         Setting::Background,
+        Setting::ShellColours,
     ];
 
     pub fn label(self) -> &'static str {
@@ -177,6 +195,7 @@ impl Setting {
             Self::EditorOpen => "Opens with",
             Self::Theme => "Theme",
             Self::Background => "Background",
+            Self::ShellColours => "Shell colours",
         }
     }
 
@@ -187,13 +206,14 @@ impl Setting {
             Self::EditorOpen => "the keys that open {file} in an editor pane",
             Self::Theme => "the colours to draw in",
             Self::Background => "the theme's own, or whatever the terminal is set to",
+            Self::ShellColours => "what a shell pane's own output is coloured from",
         }
     }
 
     pub fn kind(self) -> Kind {
         match self {
             Self::Editor | Self::EditorOpen => Kind::Text,
-            Self::Theme | Self::Background => Kind::Choice,
+            Self::Theme | Self::Background | Self::ShellColours => Kind::Choice,
         }
     }
 }
@@ -215,6 +235,10 @@ impl Config {
                 true => "the theme's own".into(),
                 false => "the terminal's".into(),
             },
+            Setting::ShellColours => match self.theme_the_shell() {
+                true => "the theme's own".into(),
+                false => "the terminal's".into(),
+            },
         }
     }
 
@@ -231,6 +255,10 @@ impl Config {
                 false => "for your editor",
             },
             Setting::Background => match self.background.is_some() {
+                true => "set here",
+                false => "the default",
+            },
+            Setting::ShellColours => match self.shell_colours.is_some() {
                 true => "set here",
                 false => "the default",
             },
@@ -255,6 +283,7 @@ impl Config {
             Setting::Editor => self.editor.is_some(),
             Setting::EditorOpen => self.editor_open.is_some(),
             Setting::Background => self.background.is_some(),
+            Setting::ShellColours => self.shell_colours.is_some(),
             Setting::Theme => self.theme_name().is_some(),
         }
     }

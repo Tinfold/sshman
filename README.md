@@ -549,6 +549,8 @@ whenever a shell is focused.
 - Full-screen programs work: `vim`, `top`, `btop`. One that asks for the mouse
   is given it — clicks, drags and the wheel all reach it — and `Shift` with the
   wheel scrolls the pane's own history regardless.
+- The colours are the theme's, or the terminal's — see
+  [the colours a shell pane draws in](#the-colours-a-shell-pane-draws-in).
 - Pasting into a focused shell works, and is handed on as a bracketed paste
   when the program inside has asked for one — so a multi-line paste lands in
   the shell's line editor instead of running line by line before you have read
@@ -724,6 +726,39 @@ says.
 
 A theme that paints its own background has taken responsibility for the pairing,
 so there is a test that its text can actually be read against it.
+
+### The colours a shell pane draws in
+
+The same idea, carried through: `,` → **Shell colours** decides whether a shell
+pane's *own output* — `ls`, a prompt, `git diff` — is coloured from the theme or
+from the terminal's palette. The theme's, by default.
+
+Only the sixteen a program can ask for **by number** are touched, because those
+are names for roles rather than colours: "red" is whatever red means here, and
+the theme is what it means. So `ls` shows directories in the theme's `dir` and
+`git` shows a deletion in its `bad`. The rest of the 256, and any exact colour a
+program named, are what it meant literally and are passed through untouched —
+`btop`'s gradients and a truecolor editor scheme come out exactly as written.
+
+A theme can spell the sixteen out itself:
+
+```json
+{
+  "name": "mine",
+  "ansi": [
+    "#21222c", "#ff5555", "#50fa7b", "#f1fa8c",
+    "#bd93f9", "#ff79c6", "#8be9fd", "#f8f8f2",
+    "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5",
+    "#d6acff", "#ff92df", "#a4ffff", "#ffffff"
+  ]
+}
+```
+
+Left out, they are worked out from the roles it already has — red from `bad`,
+green from `good`, blue from `dir`, and so on, since that is what those roles
+mean. A theme that paints no background is never asked: it has not taken the
+screen over, so the pairing of its colours with whatever is behind them is not
+one it chose. That is why `terminal` leaves a shell pane entirely alone.
 
 Every colour in the interface is one of twelve roles — accent, dim, text,
 muted, good, warn, bad, dir, link, exec, info, and the text drawn on a coloured

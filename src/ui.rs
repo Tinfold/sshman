@@ -531,6 +531,8 @@ fn draw_shell(
 
     let selection = app.shell(slot).and_then(Shell::selection);
     let background = app.background();
+    let palette = app.shell_palette();
+    let text = theme.text;
     let Some(shell) = app.shell_mut(slot) else {
         return;
     };
@@ -541,16 +543,22 @@ fn draw_shell(
         f.render_widget(PseudoTerminal::new(screen), inner);
     });
 
-    // A terminal's own default background is whatever its emulator is set to,
-    // and for these panes sshman *is* the emulator. So cells the program
-    // inside left unpainted take the theme's background, and the ones it
-    // painted keep what it chose.
-    if background != Color::Reset {
+    // A terminal's colours are whatever its emulator is set to, and for these
+    // panes sshman *is* the emulator. So the cells the program inside left to
+    // the default take the theme's, and the sixteen it asked for by number are
+    // looked up in the theme rather than in the terminal behind us — while an
+    // exact colour it named is the colour it gets.
+    if background != Color::Reset || palette.is_some() {
         let buffer = f.buffer_mut();
         for y in inner.y..inner.bottom() {
             for x in inner.x..inner.right() {
-                if buffer[(x, y)].bg == Color::Reset {
-                    buffer[(x, y)].bg = background;
+                let cell = &mut buffer[(x, y)];
+                if cell.bg == Color::Reset && background != Color::Reset {
+                    cell.bg = background;
+                }
+                if let Some(palette) = palette {
+                    cell.fg = themed(cell.fg, palette, text);
+                    cell.bg = themed(cell.bg, palette, background);
                 }
             }
         }
@@ -687,6 +695,36 @@ fn place_buttons(app: &mut App, slot: Slot, area: Rect) -> Buttons {
             .push((button_area(area, from_right), slot));
     }
     buttons
+}
+
+/// A colour a program in a shell pane asked for, in the theme's terms.
+///
+/// Only the sixteen it can ask for *by number* are the emulator's to answer —
+/// those are names for roles, and the theme is what those names mean here. The
+/// rest of the 256 and any exact colour are what the program meant literally,
+/// and are left alone.
+fn themed(colour: Color, palette: [Color; 16], default: Color) -> Color {
+    match colour {
+        Color::Reset if default != Color::Reset => default,
+        Color::Indexed(i) if (i as usize) < palette.len() => palette[i as usize],
+        Color::Black => palette[0],
+        Color::Red => palette[1],
+        Color::Green => palette[2],
+        Color::Yellow => palette[3],
+        Color::Blue => palette[4],
+        Color::Magenta => palette[5],
+        Color::Cyan => palette[6],
+        Color::Gray => palette[7],
+        Color::DarkGray => palette[8],
+        Color::LightRed => palette[9],
+        Color::LightGreen => palette[10],
+        Color::LightYellow => palette[11],
+        Color::LightBlue => palette[12],
+        Color::LightMagenta => palette[13],
+        Color::LightCyan => palette[14],
+        Color::White => palette[15],
+        other => other,
+    }
 }
 
 /// Make room for an overlay.
@@ -1566,7 +1604,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(theme.accent),
             ),
             Span::styled(
-                format!("{:<12}", setting.label()),
+                format!("{:<14}", setting.label()),
                 if chosen { name.bold() } else { name },
             ),
             Span::styled(ellipsize(&app.config.value(*setting), 32), value_style),
@@ -1576,7 +1614,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            format!("   {:<12}{}", "", setting.blurb()),
+            format!("   {:<14}{}", "", setting.blurb()),
             Style::new().fg(theme.dim),
         )));
     }
@@ -1584,7 +1622,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     // Where the colours come from, since a theme is now a file you can copy
     // and edit rather than something only a new binary could change.
     lines.push(Line::from(vec![
-        Span::styled(format!("   {:<12}", ""), Style::new().fg(theme.dim)),
+        Span::styled(format!("   {:<14}", ""), Style::new().fg(theme.dim)),
         Span::styled(
             format!("{} themes", app.themes.entries.len()),
             Style::new().fg(theme.muted),
@@ -2444,6 +2482,19 @@ pub const HELP: &[(&str, &str)] = &[
     ("", "  and leaving sshman puts it back either way."),
     (
         "",
+        "  Shell colours says the same about a shell pane's own output:",
+    ),
+    (
+        "",
+        "  the sixteen a program asks for by number are names for roles,",
+    ),
+    (
+        "",
+        "  and the theme is what they mean here. An exact colour it",
+    ),
+    ("", "  named is passed on as it named it."),
+    (
+        "",
         "  ↵ opens the one under the cursor: a prompt for the ones you",
     ),
     (
@@ -3140,6 +3191,82 @@ mod tests {
         assert!(
             backgrounds(&buffer).contains(&Color::Reset),
             "the terminal's own background has to show through"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_shell_pane_is_coloured_from_the_theme() {
+        let dir = std::env::temp_dir().join(format!("sshman-ansi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let catppuccin = Themes::built_in().by_name("catppuccin").expect("shipped");
+
+        // A shell that has printed something in ANSI red — the number one, as
+        // ls and git and every prompt ask for it.
+        let run = |shell_colours: Option<&str>| {
+            painted(110, 30, |app| {
+                app.theme = catppuccin;
+                app.config.shell_colours = shell_colours.map(String::from);
+                let slot = app.open_test_term(&dir);
+                app.focus = slot;
+                let Some(shell) = app.shell_mut(slot) else {
+                    return;
+                };
+                shell.type_in("printf '\\033[31mRED\\033[0m\\n'\n");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !shell
+                    .with_screen(|s| s.rows(0, 80).any(|row| row.trim_end().ends_with("RED")))
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the shell said nothing"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+        };
+
+        let inner_of = |app: &App| app.term_inner.first().map(|(_, r)| *r).expect("drawn");
+        let colours = |app: &App, buffer: &Buffer| {
+            let inner = inner_of(app);
+            let mut seen = Vec::new();
+            for y in inner.y..inner.bottom() {
+                for x in inner.x..inner.right() {
+                    seen.push((buffer[(x, y)].fg, buffer[(x, y)].bg));
+                }
+            }
+            seen
+        };
+
+        let (app, buffer) = run(None);
+        let seen = colours(&app, &buffer);
+        assert!(
+            seen.iter().any(|(fg, _)| *fg == catppuccin.ansi[1]),
+            "the shell's red is not the theme's red"
+        );
+        assert!(
+            !seen.iter().any(|(fg, _)| *fg == Color::Indexed(1)),
+            "the terminal's own red reached the screen"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|(fg, bg)| *fg == Color::Reset || *bg == Color::Reset),
+            "nothing in the pane is left to the terminal to colour"
+        );
+
+        // And with the setting the other way, the terminal's palette is left
+        // to answer for its own numbers.
+        let (app, buffer) = run(Some("terminal"));
+        let seen = colours(&app, &buffer);
+        assert!(
+            seen.iter().any(|(fg, _)| *fg == Color::Indexed(1)),
+            "the number should have been passed on untouched"
+        );
+        assert!(
+            !seen.iter().any(|(fg, _)| *fg == catppuccin.ansi[1]),
+            "the theme coloured it anyway"
         );
 
         std::fs::remove_dir_all(&dir).ok();
