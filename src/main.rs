@@ -22,6 +22,7 @@ mod sshconn;
 mod theme;
 mod types;
 mod ui;
+mod watch;
 mod worker;
 mod workspace;
 
@@ -262,7 +263,11 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
         //    channel, plus the connection currently being attempted.
         app.drain_workers();
 
-        // 2. Anything that needs the terminal to itself.
+        // 2. Notice anything that changed in a directory on screen without
+        //    sshman being the one to change it.
+        app.watch_dirs();
+
+        // 3. Anything that needs the terminal to itself.
         if let Some(action) = app.pending_action.take() {
             match action {
                 UiAction::Quit => return Ok(()),
@@ -307,10 +312,10 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
             continue;
         }
 
-        // 3. Draw.
+        // 4. Draw.
         terminal.draw(|f| ui::draw(f, app))?;
 
-        // 4. Wait briefly for input. The timeout is what lets worker messages
+        // 5. Wait briefly for input. The timeout is what lets worker messages
         //    and progress updates surface without any input at all.
         if event::poll(Duration::from_millis(60))? {
             match event::read()? {

@@ -27,6 +27,22 @@ pub enum Req {
         tree: TreeId,
         seq: u64,
     },
+    /// Has this directory changed since the listing that hashes to `sig`?
+    ///
+    /// The UI asks this of the directories on screen every few seconds,
+    /// unbidden, so it is the one request that is never allowed to be heard:
+    /// it reports no progress, raises no error, and answers with nothing at
+    /// all when the answer is no.
+    Poll {
+        path: String,
+        sudo: bool,
+        tree: TreeId,
+        /// The listing this tab had asked for when the poll was sent. A
+        /// different one by the time it comes back means the pane has moved
+        /// on and the answer is about somewhere else.
+        seq: u64,
+        sig: u64,
+    },
     /// Resolve a user-typed path (`~`, `..`) and then list it.
     GoTo {
         path: String,
@@ -133,6 +149,15 @@ pub enum Resp {
         path: String,
         msg: String,
         tree: TreeId,
+    },
+    /// The answer to a [`Req::Poll`]. `entries` is `None` when the directory
+    /// looks exactly as it did — and also when it could not be read at all,
+    /// since a poll nobody asked for has no business emptying a pane or
+    /// putting a complaint on the status line.
+    Polled {
+        tree: TreeId,
+        seq: u64,
+        entries: Option<Vec<FileEntry>>,
     },
     ExecDone {
         cmd: String,
@@ -355,8 +380,28 @@ fn worker_loop(rx: Receiver<Req>, tx: Sender<Resp>) {
             continue;
         }
 
+        // A poll is the UI wondering, in the background, whether a directory
+        // has moved on. Nobody is waiting for it, so it never announces
+        // itself and never complains: anything that would have been an error
+        // is answered with "nothing to report", which also releases the pane
+        // to poll again later.
+        let quiet = match &req {
+            Req::Poll { tree, seq, .. } => Some((*tree, *seq)),
+            _ => None,
+        };
+        let refuse = |tx: &Sender<Resp>, msg: &str| {
+            let _ = tx.send(match quiet {
+                Some((tree, seq)) => Resp::Polled {
+                    tree,
+                    seq,
+                    entries: None,
+                },
+                None => Resp::Failed(msg.into()),
+            });
+        };
+
         if conn.is_none() {
-            let _ = tx.send(Resp::Failed("not connected".into()));
+            refuse(&tx, "not connected");
             continue;
         }
 
@@ -364,19 +409,20 @@ fn worker_loop(rx: Receiver<Req>, tx: Sender<Resp>) {
         // never checked out, refuse rather than silently listing as the login
         // user and showing a misleading view.
         if req_wants_sudo(&req) && !sudo_ready {
-            let _ = tx.send(Resp::Failed(
-                "sudo mode is not active (press s to enable it)".into(),
-            ));
+            refuse(&tx, "sudo mode is not active (press s to enable it)");
             continue;
         }
 
-        let label = describe(&req);
-        let _ = tx.send(Resp::TaskStart(label));
+        if quiet.is_none() {
+            let _ = tx.send(Resp::TaskStart(describe(&req)));
+        }
         let failed = {
             let c = conn.as_mut().expect("checked above");
             handle(c.as_mut(), req, &tx, &mut sudo_ready, &mut elevation_secret)
         };
-        let _ = tx.send(Resp::TaskEnd);
+        if quiet.is_none() {
+            let _ = tx.send(Resp::TaskEnd);
+        }
 
         // An operation can fail for ordinary reasons — no such file, no
         // permission — so only a failure *plus* a dead link means the
@@ -451,6 +497,7 @@ fn recover(
 fn req_wants_sudo(req: &Req) -> bool {
     match req {
         Req::List { sudo, .. }
+        | Req::Poll { sudo, .. }
         | Req::GoTo { sudo, .. }
         | Req::Exec { sudo, .. }
         | Req::Upload { sudo, .. }
@@ -488,7 +535,8 @@ fn describe(req: &Req) -> String {
             names.len()
         ),
         Req::SetSudo(_) => "checking sudo…".into(),
-        Req::Connect(_) | Req::Quit => String::new(),
+        // Never shown: a poll is not work the user started.
+        Req::Poll { .. } | Req::Connect(_) | Req::Quit => String::new(),
     }
 }
 
@@ -509,6 +557,13 @@ impl<'a> Reply<'a> {
     /// The bare channel, for helpers that only ever report progress.
     fn tx(&self) -> &'a Sender<Resp> {
         self.tx
+    }
+
+    /// Record a failure without putting it on the channel. A poll's errors
+    /// are nobody's business — but whether it failed is still the loop's cue
+    /// to go and look at the connection.
+    fn note_failure(&mut self) {
+        self.failed = true;
     }
 }
 
@@ -584,6 +639,28 @@ fn handle_inner(
                 });
             }
         },
+
+        Req::Poll {
+            path,
+            sudo,
+            tree,
+            seq,
+            sig,
+        } => {
+            // A failed listing answers the same as an unchanged one: the
+            // directory may have gone, or a mount may be wedged, and either
+            // way the pane keeps what it has until the user asks for
+            // themselves. The loop is still told, quietly, so that a poll
+            // failing because the link died gets the connection rebuilt.
+            let entries = match c.list(&path, sudo) {
+                Ok(entries) => Some(entries).filter(|e| crate::watch::signature(e) != sig),
+                Err(_) => {
+                    reply.note_failure();
+                    None
+                }
+            };
+            reply.send(Resp::Polled { tree, seq, entries });
+        }
 
         Req::GoTo {
             path,

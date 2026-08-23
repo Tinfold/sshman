@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
@@ -24,6 +25,7 @@ use crate::shell::Shell;
 use crate::sshconn::ConnectOpts;
 use crate::theme::{self, Theme, Themes};
 use crate::types::{FileEntry, rbasename, rjoin, rparent};
+use crate::watch;
 use crate::worker::{HostKeyIssue, Req, Resp};
 use crate::workspace::{Item as WorkspaceItem, Workspaces};
 use ratatui::style::Color;
@@ -291,6 +293,28 @@ impl Pane {
         self.refresh_view(keep.as_deref());
     }
 
+    /// Fold in a listing nobody asked for.
+    ///
+    /// Two things separate this from [`set_entries`](Self::set_entries), both
+    /// following from the user not having asked and quite possibly being in
+    /// the middle of something: a listing that turns out to be identical is
+    /// dropped rather than rebuilt, and when the file under the cursor has
+    /// gone the cursor stays on that row rather than springing back to the
+    /// top of the list.
+    pub fn absorb_entries(&mut self, entries: Vec<FileEntry>) {
+        if watch::signature(&entries) == watch::signature(&self.all) {
+            return;
+        }
+        let row = self.state.selected();
+        let was = self.selected_name();
+        self.set_entries(entries);
+        if let (Some(name), Some(row)) = (was, row)
+            && !self.view.iter().any(|e| e.name == name)
+        {
+            self.select_index(row);
+        }
+    }
+
     pub fn refresh_view(&mut self, keep: Option<&str>) {
         let needle = self.filter.to_lowercase();
         self.view = self
@@ -371,6 +395,43 @@ pub struct LocalTree {
     pub id: TreeId,
     pub pane: Pane,
     pub cwd: PathBuf,
+    /// How the directory itself looked when it was last read, so a change to
+    /// what is in it can be noticed without reading it again. See
+    /// [`crate::watch`].
+    stamp: Option<watch::Stamp>,
+}
+
+impl LocalTree {
+    fn new(id: TreeId, cwd: PathBuf) -> Self {
+        Self {
+            id,
+            pane: Pane::default(),
+            cwd,
+            stamp: None,
+        }
+    }
+
+    /// Read the directory again.
+    ///
+    /// `quiet` marks a re-read nobody asked for, which is gentler with the
+    /// cursor — see [`Pane::absorb_entries`].
+    fn load(&mut self, quiet: bool) {
+        // Stamped before the read rather than after, so a change landing
+        // between the two is seen next time round instead of being taken as
+        // already accounted for.
+        self.stamp = watch::stamp(&self.cwd);
+        match local::list_dir(&self.cwd) {
+            Ok(entries) if quiet => self.pane.absorb_entries(entries),
+            Ok(entries) => self.pane.set_entries(entries),
+            Err(e) => {
+                self.pane.all.clear();
+                self.pane.view.clear();
+                self.pane.state.select(None);
+                self.pane.loading = false;
+                self.pane.error = Some(e.to_string());
+            }
+        }
+    }
 }
 
 /// The same on the far end of a connection, where a listing is a round trip
@@ -383,6 +444,9 @@ pub struct RemoteTree {
     seq: u64,
     /// Name to put the cursor on once the next listing arrives.
     pending_select: Option<String>,
+    /// A "has this changed?" question is out with the worker. Only one at a
+    /// time, so a slow link cannot build a queue of them.
+    polling: bool,
 }
 
 impl RemoteTree {
@@ -393,6 +457,7 @@ impl RemoteTree {
             cwd,
             seq: 0,
             pending_select: None,
+            polling: false,
         }
     }
 }
@@ -842,6 +907,14 @@ pub struct App {
     initial_remote: Option<String>,
     local_tx: Sender<LocalOutcome>,
     local_rx: Receiver<LocalOutcome>,
+
+    /// When the file lists were last looked at for changes nobody told us
+    /// about: the directories on this machine, the full read of one of them
+    /// that catches a file changing in place, and the question put to the
+    /// server. See [`crate::watch`].
+    watched_local: Instant,
+    watched_deep: Instant,
+    watched_remote: Instant,
 }
 
 impl App {
@@ -893,11 +966,7 @@ impl App {
             panes_area: Rect::ZERO,
             drag: None,
             clip: None,
-            local: vec![LocalTree {
-                id: layout::MAIN,
-                pane: Pane::default(),
-                cwd: local_start,
-            }],
+            local: vec![LocalTree::new(layout::MAIN, local_start)],
             local_terms: Vec::new(),
             wants_editor: Vec::new(),
             next_term_id: 0,
@@ -962,6 +1031,9 @@ impl App {
             initial_remote: remote_start,
             local_tx,
             local_rx,
+            watched_local: Instant::now(),
+            watched_deep: Instant::now(),
+            watched_remote: Instant::now(),
         };
         app.reload_local();
         if auto_connect {
@@ -1065,11 +1137,7 @@ impl App {
                 Side::Local => {
                     if !self.local.iter().any(|t| t.id == id) {
                         let cwd = self.local_cwd();
-                        self.local.push(LocalTree {
-                            id,
-                            pane: Pane::default(),
-                            cwd,
-                        });
+                        self.local.push(LocalTree::new(id, cwd));
                         self.reload_local();
                     }
                 }
@@ -1412,24 +1480,92 @@ impl App {
     /// looking at the same directory, and a copy that lands in one has to
     /// show up in the other.
     pub fn reload_local(&mut self) {
-        for index in 0..self.local.len() {
-            let cwd = self.local[index].cwd.clone();
-            match local::list_dir(&cwd) {
-                Ok(entries) => self.local[index].pane.set_entries(entries),
-                Err(e) => {
-                    let pane = &mut self.local[index].pane;
-                    pane.all.clear();
-                    pane.view.clear();
-                    pane.state.select(None);
-                    pane.loading = false;
-                    pane.error = Some(e.to_string());
-                }
-            }
+        for tree in &mut self.local {
+            tree.load(false);
         }
     }
 
     pub fn reload_remote(&mut self) {
         self.reload_tab(self.active);
+    }
+
+    // ---- keeping up with changes nobody told us about ---------------------
+
+    /// Look for changes to the directories on screen that sshman had no hand
+    /// in: a build dropping files into one, the shell in the pane below
+    /// deleting some, someone else's `mv` on the server.
+    ///
+    /// Called from the main loop between frames, and cheap to call that
+    /// often: each side decides for itself whether enough time has passed to
+    /// be worth another look. [`crate::watch`] has the reasoning behind the
+    /// two sides being watched in quite different ways.
+    pub fn watch_dirs(&mut self) {
+        if !self.config.watching() {
+            return;
+        }
+        self.watch_here();
+        self.watch_there();
+    }
+
+    /// The directories on this machine, by their own timestamps.
+    fn watch_here(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.watched_local) < watch::LOCAL {
+            return;
+        }
+        self.watched_local = now;
+        // Now and then a list short enough to afford it is read in full as
+        // well, since a file being written to moves nothing about the
+        // directory holding it.
+        let deep = now.duration_since(self.watched_deep) >= watch::LOCAL_DEEP;
+        if deep {
+            self.watched_deep = now;
+        }
+
+        for tree in &mut self.local {
+            let moved = watch::stamp(&tree.cwd) != tree.stamp;
+            let worth_reading = deep && tree.pane.all.len() <= watch::DEEP_LIMIT;
+            if moved || worth_reading {
+                tree.load(true);
+            }
+        }
+    }
+
+    /// The directories on the server you are looking at, by asking it.
+    ///
+    /// Only the tab on screen, and only one question per pane at a time: the
+    /// point is a list that keeps up, not a connection kept busy.
+    fn watch_there(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.watched_remote) < watch::REMOTE {
+            return;
+        }
+        self.watched_remote = now;
+
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if tab.link != LinkState::Live {
+            return;
+        }
+        let sudo = tab.sudo;
+        let mut reqs = Vec::new();
+        for tree in &mut tab.trees {
+            if tree.cwd.is_empty() || tree.pane.loading || tree.polling {
+                continue;
+            }
+            tree.polling = true;
+            reqs.push(Req::Poll {
+                path: tree.cwd.clone(),
+                sudo,
+                tree: tree.id,
+                seq: tree.seq,
+                sig: watch::signature(&tree.pane.all),
+            });
+        }
+        for req in reqs {
+            let _ = tab.tx.send(req);
+        }
     }
 
     fn goto_local(&mut self, slot: Slot, path: PathBuf) {
@@ -2244,6 +2380,22 @@ impl App {
                     && let Some(i) = tree.pane.view.iter().position(|e| e.name == name)
                 {
                     tree.pane.select_index(i);
+                }
+            }
+
+            Resp::Polled { tree, seq, entries } => {
+                let Some(tree) = self.tabs.get_mut(index).and_then(|t| t.tree_mut(tree)) else {
+                    return;
+                };
+                tree.polling = false;
+                // Anything the user asked for in the meantime has the last
+                // word: the answer is about the directory that pane *was*
+                // showing.
+                if seq != tree.seq {
+                    return;
+                }
+                if let Some(entries) = entries {
+                    tree.pane.absorb_entries(entries);
                 }
             }
 
@@ -3506,7 +3658,9 @@ impl App {
             Setting::Keys => self.open_keys(),
             // There are only two answers, so opening it is the same as
             // stepping it: a list of two would be a list for its own sake.
-            Setting::Background | Setting::ShellColours => self.change_setting(setting, 1),
+            Setting::Background | Setting::ShellColours | Setting::Watch => {
+                self.change_setting(setting, 1)
+            }
             Setting::Editor | Setting::EditorOpen => self.ask_for_setting(setting),
         }
     }
@@ -3657,6 +3811,7 @@ impl App {
                 Setting::Theme => self.set_theme(self.themes.cycle(&self.theme_name, step)),
                 Setting::Background => self.toggle_background(),
                 Setting::ShellColours => self.toggle_shell_colours(),
+                Setting::Watch => self.toggle_watch(),
                 Setting::Keys => self.open_keys(),
                 Setting::Editor | Setting::EditorOpen => {}
             },
@@ -3677,7 +3832,11 @@ impl App {
                 self.config.editor_open.clone().unwrap_or_default(),
             ),
             // Nothing to type: they are chosen from a list.
-            Setting::Theme | Setting::Background | Setting::ShellColours | Setting::Keys => {
+            Setting::Theme
+            | Setting::Background
+            | Setting::ShellColours
+            | Setting::Watch
+            | Setting::Keys => {
                 return;
             }
         };
@@ -3695,6 +3854,10 @@ impl App {
             Setting::ShellColours => {
                 self.config.shell_colours = None;
                 self.save_config("shell colours: the theme's own again".into());
+            }
+            Setting::Watch => {
+                self.config.watch = None;
+                self.save_config("the file lists follow their directories again".into());
             }
             Setting::Keys => {
                 self.keymap = Keymap::default();
@@ -3741,6 +3904,29 @@ impl App {
     /// panes sshman is the terminal emulator, so the colour scheme is its to
     /// set. Only the sixteen a program asks for by number are touched — a
     /// program that named an exact colour gets the colour it named.
+    /// Have the file lists follow their directories, or leave them showing
+    /// what they read when they read it.
+    ///
+    /// Off is for a directory that is expensive to look at — a network mount
+    /// that wakes a spinning disk, a server you are being careful with — and
+    /// for anyone who would rather a list held still while they worked in it.
+    /// The reload key is unaffected either way.
+    fn toggle_watch(&mut self) {
+        let follow = !self.config.watching();
+        self.config.watch = Some(match follow {
+            true => "on".into(),
+            false => "off".into(),
+        });
+        let done = match follow {
+            true => "the file lists keep up with their directories".to_string(),
+            false => format!(
+                "the file lists hold still — {} refreshes them",
+                self.keymap.shown(Action::Reload)
+            ),
+        };
+        self.save_config(done);
+    }
+
     fn toggle_shell_colours(&mut self) {
         let theirs = !self.config.theme_the_shell();
         self.config.shell_colours = Some(match theirs {
@@ -5148,11 +5334,7 @@ impl App {
             dir => dir,
         };
         match host {
-            Side::Local => self.local.push(LocalTree {
-                id,
-                pane: Pane::default(),
-                cwd: PathBuf::from(&cwd),
-            }),
+            Side::Local => self.local.push(LocalTree::new(id, PathBuf::from(&cwd))),
             Side::Remote => self
                 .tabs
                 .get_mut(self.active)?
@@ -6102,6 +6284,168 @@ mod tests {
         if let Some(shell) = shell {
             add_term(app, Side::Remote, shell);
         }
+    }
+
+    /// A file entry, for the tests that hand a pane a listing directly.
+    fn remote_entry(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.into(),
+            kind: EntryKind::File,
+            size: 1,
+            mtime: 0,
+            perms: "-rw-r--r--".into(),
+            link_target: None,
+            points_to_dir: false,
+        }
+    }
+
+    /// Wind the clocks back far enough that the next look is due.
+    fn due_for_a_look(app: &mut App) {
+        let ages = Instant::now() - watch::REMOTE * 4;
+        app.watched_local = ages;
+        app.watched_deep = ages;
+        app.watched_remote = ages;
+    }
+
+    #[test]
+    fn a_file_that_appears_shows_up_without_anyone_asking() {
+        let dir = scratch("watch-local");
+        let mut app = app_in(&dir);
+        let names = |app: &App| -> Vec<String> {
+            app.pane(here())
+                .view
+                .iter()
+                .map(|e| e.name.clone())
+                .collect()
+        };
+        assert!(!names(&app).contains(&"late.txt".to_string()));
+
+        std::fs::write(dir.join("late.txt"), b"hello\n").unwrap();
+        std::fs::remove_file(dir.join("one.txt")).unwrap();
+        due_for_a_look(&mut app);
+        app.watch_dirs();
+
+        let now = names(&app);
+        assert!(now.contains(&"late.txt".to_string()), "{now:?}");
+        assert!(!now.contains(&"one.txt".to_string()), "{now:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_taken_from_under_the_cursor_leaves_it_on_the_row_it_was_on() {
+        let dir = scratch("watch-cursor");
+        std::fs::write(dir.join("two.txt"), b"two\n").unwrap();
+        std::fs::write(dir.join("three.txt"), b"three\n").unwrap();
+        let mut app = app_in(&dir);
+
+        // dst/, then one.txt, three.txt, two.txt.
+        select(&mut app, "three.txt");
+        let row = app.pane(here()).state.selected();
+        std::fs::remove_file(dir.join("three.txt")).unwrap();
+        due_for_a_look(&mut app);
+        app.watch_dirs();
+
+        assert_eq!(app.pane(here()).state.selected(), row, "the cursor stayed");
+        assert_eq!(
+            app.pane(here()).selected_name().as_deref(),
+            Some("two.txt"),
+            "which is now the next file along, not the top of the list"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_list_that_holds_still_is_left_alone_when_that_is_what_you_asked_for() {
+        let dir = scratch("watch-off");
+        let mut app = app_in(&dir);
+        app.config = Config::at(dir.join("config.json"));
+        app.config.watch = Some("off".into());
+
+        std::fs::write(dir.join("late.txt"), b"hello\n").unwrap();
+        due_for_a_look(&mut app);
+        app.watch_dirs();
+        assert!(
+            !app.pane(here()).view.iter().any(|e| e.name == "late.txt"),
+            "nothing is watched with it off"
+        );
+
+        // The reload key still works, which is the whole of what "off" means.
+        press(&mut app, 'R');
+        assert!(app.pane(here()).view.iter().any(|e| e.name == "late.txt"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_server_is_asked_whether_its_directory_moved_on_and_the_answer_lands() {
+        let dir = scratch("watch-remote");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "server", None);
+        app.tabs[0].trees[0]
+            .pane
+            .set_entries(vec![remote_entry("one.txt")]);
+
+        due_for_a_look(&mut app);
+        app.watch_dirs();
+        assert!(app.tabs[0].trees[0].polling, "the question went out");
+
+        let seq = app.tabs[0].trees[0].seq;
+        app.handle_resp(
+            RespSource::Tab(0),
+            Resp::Polled {
+                tree: layout::MAIN,
+                seq,
+                entries: Some(vec![remote_entry("one.txt"), remote_entry("two.txt")]),
+            },
+        );
+        assert!(!app.tabs[0].trees[0].polling, "and was answered");
+        let names: Vec<String> = app.tabs[0].trees[0]
+            .pane
+            .view
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(names, ["one.txt", "two.txt"]);
+        assert!(app.status.is_empty(), "quietly: {}", app.status);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_answer_about_a_directory_the_pane_has_left_is_dropped() {
+        let dir = scratch("watch-stale");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "server", None);
+        app.tabs[0].trees[0]
+            .pane
+            .set_entries(vec![remote_entry("one.txt")]);
+
+        due_for_a_look(&mut app);
+        app.watch_dirs();
+        let asked = app.tabs[0].trees[0].seq;
+
+        // The user goes somewhere else while the question is out.
+        app.goto_remote(Slot::files(Side::Remote), "/etc".into());
+        app.handle_resp(
+            RespSource::Tab(0),
+            Resp::Polled {
+                tree: layout::MAIN,
+                seq: asked,
+                entries: Some(vec![remote_entry("stale.txt")]),
+            },
+        );
+        assert!(
+            !app.tabs[0].trees[0]
+                .pane
+                .view
+                .iter()
+                .any(|e| e.name == "stale.txt"),
+            "an answer about the old directory must not land in the new one"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -7247,7 +7591,7 @@ mod tests {
         app.config = Config::at(dir.join("config.json"));
 
         press(&mut app, ',');
-        for _ in 0..5 {
+        for _ in 0..Setting::ALL.len() - 1 {
             key(&mut app, KeyCode::Down);
         }
         assert_eq!(app.selected_setting(), Setting::Keys);

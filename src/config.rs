@@ -56,6 +56,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_colours: Option<String>,
 
+    /// Whether a file list keeps up with changes sshman had no hand in —
+    /// files appearing, going away or being renamed under it. Absent means it
+    /// does; `off` means it shows what it read when it read it, and nothing
+    /// changes until you ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<String>,
+
     /// Keys of your own, by what they do: `"quit": ["Q"]`.
     ///
     /// Only what you have changed is written here; everything else keeps the
@@ -128,6 +135,17 @@ impl Config {
         )
     }
 
+    /// Whether the file lists follow their directories. Anything but a word
+    /// meaning no leaves them following, on the same principle as the
+    /// background: a file from a later version that knows more answers than
+    /// this one still does something sensible.
+    pub fn watching(&self) -> bool {
+        !matches!(
+            self.watch.as_deref().map(str::trim),
+            Some("off") | Some("no") | Some("manual")
+        )
+    }
+
     pub fn paint_background(&self) -> bool {
         !matches!(
             self.background.as_deref().map(str::trim),
@@ -179,6 +197,7 @@ pub enum Setting {
     Theme,
     Background,
     ShellColours,
+    Watch,
     Keys,
 }
 
@@ -197,6 +216,7 @@ impl Setting {
         Setting::Theme,
         Setting::Background,
         Setting::ShellColours,
+        Setting::Watch,
         Setting::Keys,
     ];
 
@@ -207,6 +227,7 @@ impl Setting {
             Self::Theme => "Theme",
             Self::Background => "Background",
             Self::ShellColours => "Shell colours",
+            Self::Watch => "Keeping up",
             Self::Keys => "Keys",
         }
     }
@@ -219,6 +240,7 @@ impl Setting {
             Self::Theme => "the colours to draw in",
             Self::Background => "the theme's own, or whatever the terminal is set to",
             Self::ShellColours => "what a shell pane's own output is coloured from",
+            Self::Watch => "whether a list keeps up with changes from outside",
             Self::Keys => "which key asks for what",
         }
     }
@@ -226,7 +248,9 @@ impl Setting {
     pub fn kind(self) -> Kind {
         match self {
             Self::Editor | Self::EditorOpen => Kind::Text,
-            Self::Theme | Self::Background | Self::ShellColours | Self::Keys => Kind::Choice,
+            Self::Theme | Self::Background | Self::ShellColours | Self::Watch | Self::Keys => {
+                Kind::Choice
+            }
         }
     }
 }
@@ -251,6 +275,10 @@ impl Config {
             Setting::ShellColours => match self.theme_the_shell() {
                 true => "the theme's own".into(),
                 false => "the terminal's".into(),
+            },
+            Setting::Watch => match self.watching() {
+                true => "lists follow their directories".into(),
+                false => "only when you ask".into(),
             },
             Setting::Keys => match self.keys.len() {
                 0 => "the ones sshman ships".into(),
@@ -280,6 +308,10 @@ impl Config {
                 true => "set here",
                 false => "the default",
             },
+            Setting::Watch => match self.watch.is_some() {
+                true => "set here",
+                false => "the default",
+            },
             Setting::Keys => match self.keys.is_empty() {
                 true => "the default",
                 false => "set here",
@@ -306,6 +338,7 @@ impl Config {
             Setting::EditorOpen => self.editor_open.is_some(),
             Setting::Background => self.background.is_some(),
             Setting::ShellColours => self.shell_colours.is_some(),
+            Setting::Watch => self.watch.is_some(),
             Setting::Keys => !self.keys.is_empty(),
             Setting::Theme => self.theme_name().is_some(),
         }

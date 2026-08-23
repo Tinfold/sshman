@@ -84,7 +84,7 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `t` | point the other file list at this directory |
 | `/` | filter as you type (`Esc` clears it) |
 | `.` | show/hide dotfiles |
-| `R` | reload both panes |
+| `R` | reload both panes now (they keep up on their own — see below) |
 | `Space` | mark a file |
 | `a` | mark all / clear marks |
 | **`c`** / `F5` | **copy to the other machine's directory** (see below when there is no other side on screen) |
@@ -373,6 +373,43 @@ both are on screen either way, so switching tabs there leaves the keyboard on
 the file list rather than dropping it into a shell that would swallow the
 `Ctrl-←`/`Ctrl-→` you are cycling with. The local file list is the same pane on
 every tab, so being on it when you switch means staying on it.
+
+## Keeping up with changes
+
+A file list follows the directory it is showing. Files that appear, go away or
+are renamed under it show up on their own, whether it was a build writing them,
+a shell in the pane below, or somebody else on the server. `R` is still there
+to reload both panes on the spot; it is no longer the only way to see what
+happened.
+
+The cursor and your marks are kept across a refresh you did not ask for. When
+the file under the cursor is the one that went away, the cursor stays on that
+row — where the next file along now is — rather than springing back to the top
+of the list.
+
+The two sides are watched in the way that is cheap on each:
+
+- **This machine** by the directory's own timestamp, which moves whenever an
+  entry is added, removed or renamed. That is a single `stat` a couple of times
+  a second. Every few seconds a short list is also read in full, so a file
+  being written to shows its new size without anything about the directory
+  around it having changed. Lists longer than a couple of thousand entries skip
+  that second part, and are watched by the timestamp alone.
+- **A server** by asking it, every few seconds, for the listing of the
+  directory on screen — and only for the tab you are looking at. The worker
+  hashes the answer and says nothing at all when it matches what the pane
+  already has, so an unchanged directory costs a message and no redraw. A poll
+  never reports an error and never empties a pane: if the directory has gone or
+  the link is wedged, the pane keeps what it has until you ask for yourself.
+
+Neither side is a subscription, so a change is seen within a poll rather than
+the instant it lands. In exchange there is nothing to set up, nothing to leak,
+and a directory three networks away behaves like one on this machine.
+
+If you would rather a list held still — a network mount that wakes a disk every
+time it is looked at, a server you are being careful with — `,` → **Keeping up**
+turns it off, and `R` goes back to being how a pane is refreshed. It is written
+down as `"watch": "off"` in the config file.
 
 ## Moving files about within one side
 

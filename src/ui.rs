@@ -2323,7 +2323,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("~", "jump to the home directory"),
     ("/", "filter the listing as you type"),
     (".", "show or hide dotfiles"),
-    ("R", "reload both panes"),
+    (
+        "R",
+        "reload both panes now — they follow changes on their own",
+    ),
     ("", ""),
     ("", "Selecting and copying"),
     ("Space", "mark the file under the cursor"),
