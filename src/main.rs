@@ -13,6 +13,7 @@ mod fileops;
 mod forward;
 mod history;
 mod input;
+mod keys;
 mod layout;
 mod local;
 mod shell;

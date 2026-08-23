@@ -92,7 +92,7 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `P` | paste what `c` or `M` picked up into this directory |
 | `e` / `F4` | edit in `$EDITOR` |
 | `E` | edit with a program you name, just this once |
-| `,` | settings: theme, editor — what sshman remembers between sessions |
+| `,` | settings: theme, background, keys, editor — what sshman remembers |
 | `v` | view in `$PAGER` |
 | `:` | run a command in the remote pane's directory |
 | `!` | full-screen shell in that directory: `ssh` for a server, `exec` into a container, a login shell on this machine |
@@ -133,9 +133,69 @@ program that has asked for the mouse gets it instead — btop's clicks, a pager'
 wheel — and holding `Shift` is the way past that, to the pane's own scrollback
 and to selecting over it.
 
+Every one of these can be [something else](#keys-of-your-own).
+
 Copying acts on your marked files, or on the row under the cursor if you have
 not marked anything. Directories are copied recursively, and existing files at
 the destination are overwritten. Deleting always asks first.
+
+## Keys of your own
+
+Everything above is the scheme sshman ships with, and every one of those keys
+can be something else. Press `,`, pick **Keys**, and you get the list of
+everything sshman can be asked to do and which key asks for it:
+
+```
+╭ Keys ──────────────────────────────────────────────────────────────────────╮
+│    S                shell           Panes — a shell below this pane        │
+│    |                split           a shell beside this pane               │
+│  ▸ T                new-list        another file list beside this pane     │
+│    F9               close-pane      close the focused pane                 │
+│    m / F3           zoom            give the whole screen to this pane     │
+╰────────── ↑↓ choose · ↵ then press a key · Del resets it · Esc closes ──────╯
+```
+
+`↵` on a line and then the key you want. It is **taken off whatever had it**,
+so nothing ends up meaning two things, and the status line says what it was
+taken from. `Del` puts one back to the key it ships with, and clearing the
+whole **Keys** setting puts them all back.
+
+The hint bar at the bottom follows, so it shows the keys *you* have rather than
+the ones sshman ships with. (The help screen still lists the shipped scheme,
+and says so.)
+
+### In the config file
+
+Only what you changed is written down, so the file says what you decided rather
+than repeating fifty things you did not:
+
+```json
+// ~/.config/sshman/config.json
+{
+  "keys": {
+    "quit": ["Q"],
+    "zoom": ["z", "F3"]
+  }
+}
+```
+
+An action names its keys, rather than a key naming its action, so giving one
+two keys is a list — which is how `zoom` ships answering to both `m` and `F3`.
+An action the file does not name keeps what it had. A key a line asks for is
+taken off whatever else had it, exactly as pressing it in the list would.
+
+Keys are written the way you would say them: `q`, `S`, `F5`, `ctrl-]`,
+`alt-left`, `alt-shift-right`, `space`, `esc`, `enter`, `tab`, `del`. A capital
+letter carries its own shift, so `S` and `shift-s` are the same keystroke
+written two ways. A line sshman cannot read — a key it does not know, a name it
+has nothing for, or two actions asking for the same key — is reported in the
+settings pane rather than quietly doing nothing.
+
+**What cannot be rebound** is the modal set: the arrows that move between panes
+while `Ctrl-]` has the keyboard, `↵` to use a pane, `Esc` to back out of an
+overlay, `Alt-1`…`Alt-9` for tabs. Those are how you get *around* sshman rather
+than what you do with it, and a rebound one would be a way to lock yourself out
+of a box you had just opened.
 
 ## Command mode
 
@@ -850,7 +910,7 @@ instead:
 ```
 
 `↵` opens a setting: a prompt for the ones you type an answer to, and for
-**Theme** the [chooser](#themes). Each setting shows what it is set to and
+**Theme** and **Keys** their [choosers](#keys-of-your-own). Each setting shows what it is set to and
 where that came from, so you can tell
 an answer of your own from one inherited from the environment. `Del` clears one
 back to whatever it would have been. They live in one file:

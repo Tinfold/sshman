@@ -16,6 +16,7 @@ use crate::config::{Config, Kind, Setting};
 use crate::forward::{Forward, Spec as ForwardSpec};
 use crate::history::History;
 use crate::input::TextInput;
+use crate::keys::{Action, Keymap};
 pub use crate::layout::Side;
 use crate::layout::{self, Areas, Dir, Divider, Layout, Slot, TermId, TreeId};
 use crate::local;
@@ -42,6 +43,8 @@ pub enum Mode {
     Arrange,
     /// Choosing the colours to draw in.
     Themes,
+    /// Looking at which key asks for what, and changing one.
+    Keys,
     Browse,
     Prompt,
     Confirm,
@@ -767,6 +770,9 @@ pub struct App {
     pub workspace_sel: usize,
     pub settings_sel: usize,
     pub arrangement_sel: usize,
+    pub action_sel: usize,
+    /// The action waiting for a key to be pressed for it.
+    pub rebinding: Option<Action>,
     pub theme_sel: usize,
     /// The theme that was on when the chooser opened, so `Esc` can put it
     /// back: the list draws in the theme under the cursor as you move through
@@ -821,6 +827,9 @@ pub struct App {
     pub theme_name: String,
     /// Every theme there is: the ones sshman ships and any found on disk.
     pub themes: Themes,
+    /// Which keys ask for what: the scheme sshman ships, with whatever the
+    /// config file changed over the top.
+    pub keymap: Keymap,
     pub pager: String,
     /// The details the connection screen is working with — the active tab's
     /// once connected, or what the user is typing for a new one.
@@ -920,6 +929,8 @@ impl App {
             workspace_sel: 0,
             settings_sel: 0,
             arrangement_sel: 0,
+            action_sel: 0,
+            rebinding: None,
             theme_sel: 0,
             theme_before: None,
             forward_sel: 0,
@@ -937,6 +948,7 @@ impl App {
             clipboard_out: None,
             selecting: None,
             cmd_history: Vec::new(),
+            keymap: Keymap::with(&config.keys),
             config,
             editor,
             theme,
@@ -2487,11 +2499,15 @@ impl App {
         // to interrupt the running command, not quit sshman — so the escape
         // key is checked first and is the only way back out.
         if self.mode == Mode::Browse && self.in_term() {
-            if is_shell_escape(&key) {
+            // The two keys it is the shell's business to let go of, asked of
+            // the keymap like any other — so rebinding one rebinds it here as
+            // well as in a file list.
+            let asks_for = self.keymap.action(&key);
+            if asks_for == Some(Action::EnterShell) {
                 self.focus = self.files_pane(self.host());
                 self.settle_focus();
                 self.set_status("file list — F6 goes back to the shell", Level::Info);
-            } else if is_command_key(&key) {
+            } else if asks_for == Some(Action::Command) {
                 self.enter_command();
             } else if let Some(shell) = self.shell_mut(self.focus) {
                 shell.send_key(key);
@@ -2514,6 +2530,7 @@ impl App {
             Mode::Settings => self.settings_key(key),
             Mode::Arrange => self.arrange_key(key),
             Mode::Themes => self.theme_key(key),
+            Mode::Keys => self.keys_key(key),
             Mode::Forwards => self.forward_key(key),
             Mode::Browse => self.browse_key(key),
             Mode::Prompt => self.prompt_key(key),
@@ -2749,9 +2766,11 @@ impl App {
             KeyCode::Char('g') => return self.toggle_carry(),
             KeyCode::Enter => return self.leave_command(false),
             KeyCode::Esc => return self.leave_command(true),
-            _ if is_command_key(&key) => return self.leave_command(true),
-            // F6 means the shell, wherever it is said.
-            KeyCode::F(6) => {
+            _ if self.keymap.action(&key) == Some(Action::Command) => {
+                return self.leave_command(true);
+            }
+            // Whatever asks for the shell means the shell, wherever it is said.
+            _ if self.keymap.action(&key) == Some(Action::EnterShell) => {
                 self.enter_shell();
                 return self.leave_command(false);
             }
@@ -2962,44 +2981,10 @@ impl App {
         }
     }
 
+    /// A key while browsing: whatever the keymap says it asks for.
     fn browse_key(&mut self, key: KeyEvent) {
-        let at = self.focus;
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-        // Checked ahead of plain navigation, which would otherwise swallow
-        // these before the modifier is ever looked at.
-        //
-        // Alt says "the panes" where the arrows themselves are spoken for by
-        // the file list. The pair is the same one Ctrl-] uses without it:
-        // arrows move the keyboard, Shift-arrows move the border.
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-            match key.code {
-                KeyCode::Left | KeyCode::Char('h') if !shift => {
-                    return self.move_focus(Dir::Across, false);
-                }
-                KeyCode::Right | KeyCode::Char('l') if !shift => {
-                    return self.move_focus(Dir::Across, true);
-                }
-                KeyCode::Up | KeyCode::Char('k') if !shift => {
-                    return self.move_focus(Dir::Down, false);
-                }
-                KeyCode::Down | KeyCode::Char('j') if !shift => {
-                    return self.move_focus(Dir::Down, true);
-                }
-                KeyCode::Left => return self.resize_pane(Dir::Across, -2),
-                KeyCode::Right => return self.resize_pane(Dir::Across, 2),
-                KeyCode::Up => return self.resize_pane(Dir::Down, -3),
-                KeyCode::Down => return self.resize_pane(Dir::Down, 3),
-                _ => {}
-            }
-        }
-        if ctrl && matches!(key.code, KeyCode::Left | KeyCode::Right) {
-            let delta = if key.code == KeyCode::Right { 1 } else { -1 };
-            self.cycle_tab(delta);
-            return;
-        }
-        // Alt-1 … Alt-9 jump straight to a tab.
+        // Alt-1 … Alt-9 jump straight to a tab. Nine bindings for one idea,
+        // and the number is the whole of it, so they are not in the keymap.
         if key.modifiers.contains(KeyModifiers::ALT)
             && let KeyCode::Char(c) = key.code
             && let Some(n) = c.to_digit(10)
@@ -3008,12 +2993,20 @@ impl App {
             self.goto_tab(n as usize - 1);
             return;
         }
+        if let Some(action) = self.keymap.action(&key) {
+            self.run(action);
+        }
+    }
 
-        match key.code {
-            KeyCode::Char('q') => self.pending_action = Some(UiAction::Quit),
-            // Esc backs out of whatever narrowing is in effect. It deliberately
-            // does not quit: losing a session to a stray Esc is infuriating.
-            KeyCode::Esc => {
+    /// Do the thing itself, whichever key asked for it.
+    fn run(&mut self, action: Action) {
+        let at = self.focus;
+        match action {
+            Action::Quit => self.pending_action = Some(UiAction::Quit),
+            // Cancel backs out of whatever narrowing is in effect. It
+            // deliberately does not quit: losing a session to a stray Esc is
+            // infuriating.
+            Action::Cancel => {
                 let pane = self.pane_mut(at);
                 if !pane.filter.is_empty() {
                     let keep = pane.selected_name();
@@ -3032,12 +3025,12 @@ impl App {
                     self.set_status("press q to quit", Level::Info);
                 }
             }
-            // Tab steps through the file lists in the order they are drawn,
-            // so with the two sshman opens with it crosses the middle, and
-            // with more it reaches every one of them. Alt-h j k l is the way
-            // to a particular pane, terminals included.
-            KeyCode::Tab | KeyCode::BackTab => {
-                let back = key.code == KeyCode::BackTab;
+
+            // Stepping through the file lists in the order they are drawn: with
+            // the two sshman opens with it crosses the middle, and with more it
+            // reaches every one of them.
+            Action::NextList | Action::PreviousList => {
+                let back = action == Action::PreviousList;
                 match self.next_files_pane(at, back) {
                     Some(next) => self.focus_pane(next),
                     None => self.set_status(
@@ -3047,24 +3040,24 @@ impl App {
                 }
             }
 
-            KeyCode::Down | KeyCode::Char('j') => self.pane_mut(at).move_by(1),
-            KeyCode::Up | KeyCode::Char('k') => self.pane_mut(at).move_by(-1),
-            KeyCode::PageDown => self.pane_mut(at).move_by(15),
-            KeyCode::PageUp => self.pane_mut(at).move_by(-15),
-            KeyCode::Home | KeyCode::Char('g') => self.pane_mut(at).select_index(0),
-            KeyCode::End | KeyCode::Char('G') => {
+            Action::Down => self.pane_mut(at).move_by(1),
+            Action::Up => self.pane_mut(at).move_by(-1),
+            Action::PageDown => self.pane_mut(at).move_by(15),
+            Action::PageUp => self.pane_mut(at).move_by(-15),
+            Action::Top => self.pane_mut(at).select_index(0),
+            Action::Bottom => {
                 let last = self.pane(at).view.len().saturating_sub(1);
                 self.pane_mut(at).select_index(last);
             }
 
-            KeyCode::Left | KeyCode::Char('h') => self.go_up(at),
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => self.activate(at),
+            Action::Parent => self.go_up(at),
+            Action::Open => self.activate(at),
 
-            KeyCode::Char(' ') => {
+            Action::Mark => {
                 self.pane_mut(at).toggle_mark();
                 self.pane_mut(at).move_by(1);
             }
-            KeyCode::Char('a') => {
+            Action::MarkAll => {
                 let pane = self.pane_mut(at);
                 if pane.marked.is_empty() {
                     pane.marked = pane.view.iter().map(|e| e.name.clone()).collect();
@@ -3073,21 +3066,22 @@ impl App {
                 }
             }
 
-            // With both sides on screen this is the copy across the middle.
-            // With no other at to copy to — zoomed, or arranged without one
-            // — there is no across, so it picks the selection up for a paste
-            // elsewhere on the same filesystem.
-            KeyCode::Char('c') | KeyCode::F(5) => {
+            // With another list on screen this is the copy across to it. With
+            // none — zoomed, or arranged without one — there is no across, so
+            // it picks the selection up for a paste elsewhere on the same
+            // filesystem.
+            Action::Copy => {
                 if self.other_side_on_screen() {
                     self.copy_to_target();
                 } else {
                     self.yank(false);
                 }
             }
-            KeyCode::Char('M') => self.yank(true),
-            KeyCode::Char('P') => self.paste_clip(),
-            KeyCode::Char('e') | KeyCode::F(4) => self.edit_selected(at),
-            KeyCode::Char('E') => {
+            Action::Cut => self.yank(true),
+            Action::Paste => self.paste_clip(),
+
+            Action::Edit => self.edit_selected(at),
+            Action::EditWith => {
                 if let Some(name) = self.pane(at).selected_name() {
                     let mut input = TextInput::new(self.editor.clone());
                     input.cursor = input.value.chars().count();
@@ -3101,17 +3095,17 @@ impl App {
                     self.mode = Mode::Prompt;
                 }
             }
-            KeyCode::Char('v') => {
+            Action::View => {
                 let pager = self.pager.clone();
                 self.open_with(at, pager);
             }
 
-            KeyCode::Char('n') | KeyCode::F(7) => self.open_prompt(
+            Action::NewDirectory => self.open_prompt(
                 PromptKind::Mkdir(at),
                 format!("New directory in {}", self.path_of(at)),
                 String::new(),
             ),
-            KeyCode::Char('r') | KeyCode::F(2) => {
+            Action::Rename => {
                 if let Some(name) = self.pane(at).selected_name() {
                     self.open_prompt(
                         PromptKind::Rename(at, name.clone()),
@@ -3120,31 +3114,31 @@ impl App {
                     );
                 }
             }
-            KeyCode::Char('d') | KeyCode::Delete | KeyCode::F(8) => self.request_delete(at),
+            Action::Delete => self.request_delete(at),
 
-            KeyCode::Char('R') => {
+            Action::Reload => {
                 self.reload_local();
                 self.reload_remote();
                 self.set_status("refreshed", Level::Info);
             }
-            KeyCode::Char('.') => {
+            Action::Hidden => {
                 let keep = self.pane(at).selected_name();
                 let pane = self.pane_mut(at);
                 pane.show_hidden = !pane.show_hidden;
                 pane.refresh_view(keep.as_deref());
             }
-            KeyCode::Char('/') => self.open_prompt(
+            Action::Filter => self.open_prompt(
                 PromptKind::Filter(at),
                 "Filter".into(),
                 self.pane(at).filter.clone(),
             ),
-            KeyCode::Char('f') => self.open_prompt(
+            Action::GoTo => self.open_prompt(
                 PromptKind::GoTo(at),
                 format!("Go to directory ({})", self.pane_name(at)),
                 self.path_of(at),
             ),
 
-            KeyCode::Char(':') => {
+            Action::RemoteCommand => {
                 if !self.connected() {
                     self.set_status("not connected", Level::Bad);
                 } else {
@@ -3155,47 +3149,49 @@ impl App {
                     );
                 }
             }
-            KeyCode::Char('!') => {
+            Action::FullShell => {
                 if !self.connected() {
                     self.set_status("not connected", Level::Bad);
                 } else {
                     self.pending_action = Some(UiAction::Shell);
                 }
             }
-            KeyCode::Char(',') => self.open_settings(),
-            KeyCode::Char('~') => self.go_home(at),
-            KeyCode::Char('D') => self.find_containers(at),
-            KeyCode::Char('N') => self.start_rename_tab(),
-            KeyCode::Char('w') => self.open_workspaces(),
-            KeyCode::Char('p') => self.open_forwards(),
-            KeyCode::Char('z') => self.start_archive(at),
-            KeyCode::Char('x') => self.start_extract(at),
-            KeyCode::Char('X') => self.list_archive(at),
+            Action::Settings => self.open_settings(),
+            Action::Home => self.go_home(at),
+            Action::Containers => self.find_containers(at),
+            Action::NameTab => self.start_rename_tab(),
+            Action::Workspaces => self.open_workspaces(),
+            Action::Ports => self.open_forwards(),
+            Action::Archive => self.start_archive(at),
+            Action::Extract => self.start_extract(at),
+            Action::ListArchive => self.list_archive(at),
 
             // ---- panes ----
-            KeyCode::Char('m') => self.toggle_zoom(),
-            KeyCode::Char('=') => self.reset_layout(),
-            KeyCode::Char('A') => self.open_arrangements(),
-            // The pane you are on, cut in half sideways, with a terminal in
-            // the half that opens up. S does the same downwards.
-            KeyCode::Char('|') => self.split_with_term(Dir::Across, 50),
-            // And T puts another file list there instead, on the same machine
-            // and in the same directory, ready to be pointed somewhere else.
-            KeyCode::Char('T') => self.split_with_tree(Dir::Across, 50),
+            Action::Zoom => self.toggle_zoom(),
+            Action::Even => self.reset_layout(),
+            Action::Arrange => self.open_arrangements(),
+            Action::Split => self.split_with_term(Dir::Across, 50),
+            Action::NewList => self.split_with_tree(Dir::Across, 50),
+            Action::ClosePane => self.close_pane(self.focus),
+            Action::Command => self.enter_command(),
+            Action::FocusLeft => self.move_focus(Dir::Across, false),
+            Action::FocusRight => self.move_focus(Dir::Across, true),
+            Action::FocusUp => self.move_focus(Dir::Down, false),
+            Action::FocusDown => self.move_focus(Dir::Down, true),
+            Action::BorderLeft => self.resize_pane(Dir::Across, -2),
+            Action::BorderRight => self.resize_pane(Dir::Across, 2),
+            Action::BorderUp => self.resize_pane(Dir::Down, -3),
+            Action::BorderDown => self.resize_pane(Dir::Down, 3),
 
-            // ---- embedded shells ----
-            // What a drag in a shell picked out, and putting it back into
-            // one. The same two keys wherever they are pressed.
-            KeyCode::Char('y') => self.copy_selection(),
-            KeyCode::Char('Y') => self.paste_copied(),
+            // What a drag in a shell picked out, and putting it back into one.
+            Action::CopyText => self.copy_selection(),
+            Action::PasteText => self.paste_copied(),
 
-            KeyCode::Char('S') => self.toggle_shell(),
-            // One key to get into the shell, whether or not it is open yet.
-            KeyCode::F(6) => self.enter_shell(),
-            _ if is_command_key(&key) => self.enter_command(),
-            KeyCode::Char('s') => self.toggle_sudo(),
-            KeyCode::Char('t') => self.mirror_path(),
-            KeyCode::Char('o') => {
+            Action::Shell => self.toggle_shell(),
+            Action::EnterShell => self.enter_shell(),
+            Action::Sudo => self.toggle_sudo(),
+            Action::Mirror => self.mirror_path(),
+            Action::Output => {
                 if self.output.is_empty() {
                     self.set_status("no command output yet", Level::Info);
                 } else {
@@ -3205,15 +3201,16 @@ impl App {
             // The connection screen. Whatever it connects to arrives as a new
             // tab, leaving the ones you have alone, so there is one key for
             // both "connect" and "another server please".
-            KeyCode::Char('C') => self.open_connect_screen(),
+            Action::Connect => self.open_connect_screen(),
             // A tab that needs no server at all.
-            KeyCode::Char('L') => self.open_local_tab(),
-            KeyCode::Char('W') => self.close_tab(),
-            KeyCode::Char('?') | KeyCode::F(1) => {
+            Action::LocalTab => self.open_local_tab(),
+            Action::CloseTab => self.close_tab(),
+            Action::NextTab => self.cycle_tab(1),
+            Action::PreviousTab => self.cycle_tab(-1),
+            Action::Help => {
                 self.help_scroll = 0;
                 self.mode = Mode::Help;
             }
-            _ => {}
         }
     }
 
@@ -3506,6 +3503,7 @@ impl App {
     fn open_setting(&mut self, setting: Setting) {
         match setting {
             Setting::Theme => self.open_themes(),
+            Setting::Keys => self.open_keys(),
             // There are only two answers, so opening it is the same as
             // stepping it: a list of two would be a list for its own sake.
             Setting::Background | Setting::ShellColours => self.change_setting(setting, 1),
@@ -3572,6 +3570,82 @@ impl App {
         }
     }
 
+    // ---- which key asks for what --------------------------------------------
+
+    pub fn open_keys(&mut self) {
+        self.action_sel = self.action_sel.min(Action::ALL.len() - 1);
+        self.rebinding = None;
+        self.mode = Mode::Keys;
+    }
+
+    /// The action the cursor is on.
+    pub fn selected_action(&self) -> Action {
+        Action::ALL[self.action_sel.min(Action::ALL.len() - 1)]
+    }
+
+    fn keys_key(&mut self, key: KeyEvent) {
+        // Waiting on a key: whatever is pressed is the answer, so nothing else
+        // can be read out of it. Esc is the one way out, since a rebind you
+        // cannot get out of would be a trap.
+        if let Some(action) = self.rebinding {
+            self.rebinding = None;
+            if key.code == KeyCode::Esc {
+                self.set_status("left as it was", Level::Info);
+                return;
+            }
+            self.rebind(action, crate::keys::Chord::of(&key));
+            return;
+        }
+        let last = Action::ALL.len() - 1;
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.action_sel = (self.action_sel + 1).min(last);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.action_sel = self.action_sel.saturating_sub(1);
+            }
+            KeyCode::PageDown => self.action_sel = (self.action_sel + 10).min(last),
+            KeyCode::PageUp => self.action_sel = self.action_sel.saturating_sub(10),
+            KeyCode::Home => self.action_sel = 0,
+            KeyCode::End => self.action_sel = last,
+            KeyCode::Enter => {
+                self.rebinding = Some(self.selected_action());
+                let action = self.selected_action();
+                self.set_status(
+                    format!("press the key for {} — Esc leaves it", action.name()),
+                    Level::Info,
+                );
+            }
+            KeyCode::Delete | KeyCode::Backspace => {
+                let action = self.selected_action();
+                self.keymap.reset(action);
+                self.save_keys(format!("{}: back to the key it ships with", action.name()));
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Settings,
+            _ => {}
+        }
+    }
+
+    /// Give an action a key, taking it off whatever had it.
+    fn rebind(&mut self, action: Action, chord: crate::keys::Chord) {
+        let taken = self.keymap.bind(action, chord);
+        let done = match taken {
+            Some(from) => format!(
+                "{} is {chord} — taken from {}, which now has no key",
+                action.name(),
+                from.name()
+            ),
+            None => format!("{} is {chord}", action.name()),
+        };
+        self.save_keys(done);
+    }
+
+    /// Write the keys back, saying so either way.
+    fn save_keys(&mut self, done: String) {
+        self.config.keys = self.keymap.overrides();
+        self.save_config(done);
+    }
+
     /// Change a setting: ask for a value, or step to the next one there is.
     ///
     /// `step` only means anything to a setting with a list to walk; typing
@@ -3583,6 +3657,7 @@ impl App {
                 Setting::Theme => self.set_theme(self.themes.cycle(&self.theme_name, step)),
                 Setting::Background => self.toggle_background(),
                 Setting::ShellColours => self.toggle_shell_colours(),
+                Setting::Keys => self.open_keys(),
                 Setting::Editor | Setting::EditorOpen => {}
             },
         }
@@ -3602,7 +3677,9 @@ impl App {
                 self.config.editor_open.clone().unwrap_or_default(),
             ),
             // Nothing to type: they are chosen from a list.
-            Setting::Theme | Setting::Background | Setting::ShellColours => return,
+            Setting::Theme | Setting::Background | Setting::ShellColours | Setting::Keys => {
+                return;
+            }
         };
         self.open_prompt(kind, title, current);
     }
@@ -3618,6 +3695,11 @@ impl App {
             Setting::ShellColours => {
                 self.config.shell_colours = None;
                 self.save_config("shell colours: the theme's own again".into());
+            }
+            Setting::Keys => {
+                self.keymap = Keymap::default();
+                self.config.keys.clear();
+                self.save_config("keys: the ones sshman ships, all of them".into());
             }
             Setting::Theme => {
                 self.config.theme = None;
@@ -5625,28 +5707,6 @@ impl App {
     }
 }
 
-/// The one key that gets the keyboard back out of a focused shell in a single
-/// press. Everything else has to reach the shell, including Esc and Ctrl-C.
-fn is_shell_escape(key: &KeyEvent) -> bool {
-    key.code == KeyCode::F(6)
-}
-
-/// The chord that hands the keyboard to sshman rather than to the pane.
-///
-/// `Ctrl-]` is the telnet escape and readline's character-search, so it is
-/// both the least missed key on a shell's keyboard and the one people already
-/// expect to mean "out of here".
-///
-/// It is the byte `0x1d`, which a terminal reports as `Ctrl-5` unless it is
-/// speaking the newer keyboard protocol and can say which key was really
-/// pressed. They are the same keystroke, so both spellings are taken —
-/// otherwise the chord works on some terminals and silently does nothing on
-/// the rest.
-fn is_command_key(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
-}
-
 /// Find the public key to install: the companion of an explicitly chosen
 /// private key, otherwise the usual defaults in preference order.
 fn find_public_key(opts: &ConnectOpts) -> Result<(PathBuf, String), String> {
@@ -7176,6 +7236,118 @@ mod tests {
             key(&mut app, KeyCode::Up);
         }
         assert_eq!(app.theme_sel, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_key_can_be_given_to_something_else_and_put_back() {
+        let dir = scratch("keys");
+        let mut app = app_in(&dir);
+        app.config = Config::at(dir.join("config.json"));
+
+        press(&mut app, ',');
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.selected_setting(), Setting::Keys);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Keys);
+
+        // Down to quit, then the key you want.
+        key(&mut app, KeyCode::End);
+        assert_eq!(app.selected_action(), Action::Quit);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.rebinding, Some(Action::Quit), "waiting on a key");
+        press(&mut app, 'Q');
+        assert_eq!(app.rebinding, None);
+
+        // It is the key now, and the old one is not.
+        assert_eq!(app.keymap.shown(Action::Quit), "Q");
+        assert_eq!(app.config.keys["quit"], ["Q"], "and it is written down");
+        app.mode = Mode::Browse;
+        press(&mut app, 'q');
+        assert!(app.pending_action.is_none(), "q no longer quits");
+        press(&mut app, 'Q');
+        assert!(matches!(app.pending_action, Some(UiAction::Quit)));
+
+        // Del puts it back, and takes the line out of the file with it.
+        app.pending_action = None;
+        app.open_keys();
+        key(&mut app, KeyCode::End);
+        key(&mut app, KeyCode::Delete);
+        assert_eq!(app.keymap.shown(Action::Quit), "q");
+        assert!(app.config.keys.is_empty(), "nothing left to remember");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_key_taken_from_one_thing_is_taken_from_it() {
+        let dir = scratch("keys-steal");
+        let mut app = app_in(&dir);
+        app.config = Config::at(dir.join("config.json"));
+
+        app.open_keys();
+        app.action_sel = Action::ALL
+            .iter()
+            .position(|a| *a == Action::Help)
+            .expect("help is in the list");
+        key(&mut app, KeyCode::Enter);
+        press(&mut app, 'w');
+
+        assert_eq!(app.keymap.shown(Action::Help), "w");
+        assert_eq!(
+            app.keymap.shown(Action::Workspaces),
+            "—",
+            "it cannot be on both"
+        );
+        assert!(
+            app.status.contains("taken from workspaces"),
+            "{}",
+            app.status
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn waiting_on_a_key_can_be_backed_out_of() {
+        let dir = scratch("keys-esc");
+        let mut app = app_in(&dir);
+        app.config = Config::at(dir.join("config.json"));
+
+        app.open_keys();
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.rebinding, None);
+        assert_eq!(app.mode, Mode::Keys, "still in the list, nothing changed");
+        assert!(app.config.keys.is_empty());
+
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.mode,
+            Mode::Settings,
+            "and out to where it was opened from"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn keys_from_the_config_file_are_in_use_from_the_start() {
+        let dir = scratch("keys-config");
+        let mut app = app_in(&dir);
+        // What a hand-edited file says.
+        app.keymap = crate::keys::Keymap::with(&std::collections::BTreeMap::from([(
+            "zoom".to_string(),
+            vec!["z".to_string()],
+        )]));
+
+        press(&mut app, 'z');
+        assert!(app.zoomed, "z zooms");
+        press(&mut app, 'm');
+        assert!(app.zoomed, "and m does not");
 
         std::fs::remove_dir_all(&dir).ok();
     }

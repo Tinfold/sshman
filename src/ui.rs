@@ -13,6 +13,7 @@ use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, Arrangement, ConnectFocus, ConnectForm, Level, LinkState, Mode, Pane, Side};
 use crate::config::Setting;
+use crate::keys::Action;
 use crate::layout::{Areas, Slot};
 use crate::shell::Shell;
 use crate::theme::Theme;
@@ -84,6 +85,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Settings => draw_settings(f, app, area),
         Mode::Arrange => draw_arrange(f, app, area),
         Mode::Themes => draw_themes(f, app, area),
+        Mode::Keys => draw_keys(f, app, area),
         Mode::Forwards => draw_forwards(f, app, area),
         Mode::Prompt => draw_prompt(f, app, area),
         Mode::Confirm => draw_confirm(f, app, area),
@@ -1023,10 +1025,36 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// A key and what it does, as the bottom line lists them.
+/// One hint as its list writes it. A key beginning `@` names an action rather
+/// than a keystroke, and is shown as whatever that action answers to now —
+/// otherwise rebinding one would leave the bar advertising a key that no
+/// longer does anything.
 type Hint<'a> = (&'a str, &'a str);
 
+/// The same, with the keys filled in.
+type Shown = (String, &'static str);
+
 /// Shown in place of what did not fit.
-const MORE: Hint<'static> = ("", "…");
+fn more() -> Shown {
+    (String::new(), "…")
+}
+
+/// Every hint with its key as it is on this keyboard.
+fn shown_hints(app: &App, hints: &[Hint<'static>]) -> Vec<Shown> {
+    hints
+        .iter()
+        .map(|(key, text)| {
+            let key = match key.strip_prefix('@').and_then(Action::by_name) {
+                Some(action) => match app.keymap.first(action) {
+                    Some(chord) => chord.to_string(),
+                    None => "—".to_string(),
+                },
+                None => (*key).to_string(),
+            };
+            (key, *text)
+        })
+        .collect()
+}
 
 /// How many hints are kept whatever happens, counted from the end.
 ///
@@ -1035,7 +1063,7 @@ const MORE: Hint<'static> = ("", "…");
 const PINNED: usize = 2;
 
 /// One hint's width on screen: ` key ` and then ` what it does  `.
-fn hint_width(hint: &Hint) -> usize {
+fn hint_width(hint: &Shown) -> usize {
     let (key, text) = hint;
     let key_width = match key.is_empty() {
         true => 0,
@@ -1049,7 +1077,7 @@ fn hint_width(hint: &Hint) -> usize {
 /// The lists are written most-useful-first, so cutting from the end keeps the
 /// keys worth knowing. Anything dropped leaves a `…` behind, so a short line
 /// reads as abbreviated rather than as all there is.
-fn fit_hints<'a>(hints: &[Hint<'a>], width: u16) -> Vec<Hint<'a>> {
+fn fit_hints(hints: &[Shown], width: u16) -> Vec<Shown> {
     let width = width as usize;
     let total: usize = hints.iter().map(hint_width).sum();
     if total <= width || hints.len() <= PINNED {
@@ -1058,17 +1086,17 @@ fn fit_hints<'a>(hints: &[Hint<'a>], width: u16) -> Vec<Hint<'a>> {
 
     let split = hints.len() - PINNED;
     let tail = &hints[split..];
-    let mut used: usize = tail.iter().map(hint_width).sum::<usize>() + hint_width(&MORE);
+    let mut used: usize = tail.iter().map(hint_width).sum::<usize>() + hint_width(&more());
     let mut out = Vec::new();
     for hint in &hints[..split] {
         let hint_width = hint_width(hint);
         if used + hint_width > width {
             break;
         }
-        out.push(*hint);
+        out.push(hint.clone());
         used += hint_width;
     }
-    out.push(MORE);
+    out.push(more());
     out.extend_from_slice(tail);
     out
 }
@@ -1076,18 +1104,18 @@ fn fit_hints<'a>(hints: &[Hint<'a>], width: u16) -> Vec<Hint<'a>> {
 /// Every hint list, in the order each is written: most useful first, ways out
 /// last, because [`fit_hints`] cuts from the end but keeps the tail.
 const SHELL_ZOOMED: &[Hint] = &[
-    ("F6", "back to files"),
-    ("Ctrl-]", "sshman keys"),
-    ("F3", "unzoom"),
-    ("F9", "close this pane"),
+    ("@enter-shell", "back to files"),
+    ("@command", "sshman keys"),
+    ("@zoom", "unzoom"),
+    ("@close-pane", "close this pane"),
     ("", "every other key goes to the shell"),
 ];
 const SHELL: &[Hint] = &[
-    ("F6", "back to files"),
-    ("Ctrl-]", "sshman keys"),
+    ("@enter-shell", "back to files"),
+    ("@command", "sshman keys"),
     ("drag", "select"),
-    ("F3", "zoom"),
-    ("F9", "close this pane"),
+    ("@zoom", "zoom"),
+    ("@close-pane", "close this pane"),
     ("", "every other key goes to the shell"),
 ];
 /// While sshman has the keyboard: the pane keys, and then every other sshman
@@ -1097,14 +1125,14 @@ const COMMAND: &[Hint] = &[
     ("↵", "use it"),
     ("Shift-↑↓←→", "resize"),
     ("g", "move it"),
-    ("S", "shell"),
-    ("T", "list"),
-    ("F9", "close"),
-    ("m", "zoom"),
-    ("A", "arrange"),
-    ("y", "copy"),
-    ("C", "connect"),
-    ("?", "help"),
+    ("@shell", "shell"),
+    ("@new-list", "list"),
+    ("@close-pane", "close"),
+    ("@zoom", "zoom"),
+    ("@arrange", "arrange"),
+    ("@copy-text", "copy"),
+    ("@connect", "connect"),
+    ("@help", "help"),
     ("Esc", "back"),
 ];
 /// And while one of them has been picked up.
@@ -1118,55 +1146,55 @@ const CARRYING: &[Hint] = &[
 /// so the ones that work inside one filesystem take their place. The only
 /// difference between the two ways of getting there is what `m` does next.
 const ZOOMED: &[Hint] = &[
-    ("Tab", "side"),
-    ("↵", "open"),
-    ("Space", "mark"),
-    ("c", "copy"),
-    ("M", "cut"),
-    ("P", "paste"),
-    ("m", "unzoom"),
-    ("e", "edit"),
-    ("d", "del"),
-    ("?", "help"),
-    ("q", "quit"),
+    ("@next-list", "side"),
+    ("@open", "open"),
+    ("@mark", "mark"),
+    ("@copy", "copy"),
+    ("@cut", "cut"),
+    ("@paste", "paste"),
+    ("@zoom", "unzoom"),
+    ("@edit", "edit"),
+    ("@delete", "del"),
+    ("@help", "help"),
+    ("@quit", "quit"),
 ];
 const LOCAL_TAB: &[Hint] = &[
-    ("↵", "open"),
-    ("Space", "mark"),
-    ("c", "copy"),
-    ("M", "cut"),
-    ("P", "paste"),
-    ("S", "shell"),
-    ("T", "new list"),
-    ("F9", "close pane"),
-    ("A", "arrange"),
-    ("e", "edit"),
-    ("d", "del"),
-    ("C", "server"),
-    ("?", "help"),
-    ("q", "quit"),
+    ("@open", "open"),
+    ("@mark", "mark"),
+    ("@copy", "copy"),
+    ("@cut", "cut"),
+    ("@paste", "paste"),
+    ("@shell", "shell"),
+    ("@new-list", "new list"),
+    ("@close-pane", "close pane"),
+    ("@arrange", "arrange"),
+    ("@edit", "edit"),
+    ("@delete", "del"),
+    ("@connect", "server"),
+    ("@help", "help"),
+    ("@quit", "quit"),
 ];
 const BROWSE: &[Hint] = &[
-    ("Tab", "pane"),
-    ("↵", "open"),
-    ("Space", "mark"),
-    ("c", "copy →"),
-    ("e", "edit"),
-    ("d", "del"),
-    ("m", "zoom"),
-    ("S", "shell"),
-    ("T", "new list"),
-    ("F9", "close pane"),
-    ("A", "arrange"),
-    (":", "cmd"),
-    ("s", "sudo"),
-    ("C", "connect"),
-    ("w", "workspaces"),
-    ("p", "ports"),
-    ("L", "local tab"),
-    (",", "settings"),
-    ("?", "help"),
-    ("q", "quit"),
+    ("@next-list", "pane"),
+    ("@open", "open"),
+    ("@mark", "mark"),
+    ("@copy", "copy →"),
+    ("@edit", "edit"),
+    ("@delete", "del"),
+    ("@zoom", "zoom"),
+    ("@shell", "shell"),
+    ("@new-list", "new list"),
+    ("@close-pane", "close pane"),
+    ("@arrange", "arrange"),
+    ("@remote-command", "cmd"),
+    ("@sudo", "sudo"),
+    ("@connect", "connect"),
+    ("@workspaces", "workspaces"),
+    ("@ports", "ports"),
+    ("@local-tab", "local tab"),
+    ("@settings", "settings"),
+    ("@help", "help"),
+    ("@quit", "quit"),
 ];
 const CONNECT: &[Hint] = &[
     ("Tab", "section"),
@@ -1204,6 +1232,13 @@ const THEMES: &[Hint] = &[
     ("↵", "keep this one"),
     ("Esc", "put the old one back"),
 ];
+const KEYS: &[Hint] = &[
+    ("↑↓", "choose"),
+    ("↵", "then press the key you want"),
+    ("Del", "back to the one it ships with"),
+    ("Esc", "close"),
+];
+const REBINDING: &[Hint] = &[("", "press the key you want"), ("Esc", "leave it as it is")];
 const OUTPUT: &[Hint] = &[("↑↓", "scroll"), ("Esc", "close")];
 const HELP_HINTS: &[Hint] = &[("↑↓", "scroll"), ("any key", "close")];
 
@@ -1227,6 +1262,8 @@ const ALL_HINTS: &[&[Hint]] = &[
     SETTINGS,
     ARRANGE,
     THEMES,
+    KEYS,
+    REBINDING,
     OUTPUT,
     HELP_HINTS,
 ];
@@ -1262,6 +1299,8 @@ fn hints_for(app: &App) -> &'static [Hint<'static>] {
         Mode::Settings => SETTINGS,
         Mode::Arrange => ARRANGE,
         Mode::Themes => THEMES,
+        Mode::Keys if app.rebinding.is_some() => REBINDING,
+        Mode::Keys => KEYS,
         Mode::Output => OUTPUT,
         Mode::Help => HELP_HINTS,
     }
@@ -1269,9 +1308,9 @@ fn hints_for(app: &App) -> &'static [Hint<'static>] {
 
 fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
-    let hints = hints_for(app);
+    let hints = shown_hints(app, hints_for(app));
     let mut spans = Vec::new();
-    for (k, v) in &fit_hints(hints, area.width) {
+    for (k, v) in &fit_hints(&hints, area.width) {
         if !k.is_empty() {
             spans.push(Span::styled(
                 format!(" {k} "),
@@ -1564,7 +1603,8 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
     // Two rows a setting, then a line saying where the themes came from and
     // one for every file that could not be read.
-    let rows = (Setting::ALL.len() * 2 + 2 + app.themes.problems.len()) as u16;
+    let rows =
+        (Setting::ALL.len() * 2 + 2 + app.themes.problems.len() + app.keymap.problems.len()) as u16;
     let rect = centered(
         area,
         74,
@@ -1635,7 +1675,10 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(theme.dim),
         ),
     ]));
-    for problem in &app.themes.problems {
+    // Anything in the config file that could not be used, said where the
+    // setting it belongs to is: a line that quietly did nothing is worse than
+    // one that was never written.
+    for problem in app.themes.problems.iter().chain(&app.keymap.problems) {
         lines.push(Line::from(Span::styled(
             format!("   {}", ellipsize(problem, 67)),
             Style::new().fg(theme.bad),
@@ -1643,6 +1686,90 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     }
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Which key asks for what, and how to say otherwise.
+fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
+    let height = (Action::ALL.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let rect = centered(area, 78, height.max(7));
+    clear_under(f, rect, app.background());
+
+    let waiting = app.rebinding.is_some();
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(if waiting { theme.warn } else { theme.accent }))
+        .title_top(Line::from(Span::styled(
+            " Keys ",
+            Style::new().fg(theme.accent).bold(),
+        )))
+        .title_bottom(
+            Line::from(Span::styled(
+                match waiting {
+                    true => " press the key you want · Esc leaves it ".to_string(),
+                    false => {
+                        " ↑↓ choose · ↵ then press a key · Del resets it · Esc closes ".to_string()
+                    }
+                },
+                Style::new().fg(theme.dim),
+            ))
+            .right_aligned(),
+        );
+    let inner = block.inner(rect).inner(Margin::new(1, 0));
+    f.render_widget(block, rect);
+
+    const KEYS_WIDTH: usize = 20;
+    let mut group = "";
+    let items: Vec<ListItem> = Action::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let chosen = index == app.action_sel;
+            let name = Style::new().fg(if chosen { theme.text } else { theme.muted });
+            // The heading goes on the first of its own, so fifty rows read as
+            // five short lists rather than one long one.
+            let heading = (action.group() != group).then(|| {
+                group = action.group();
+                group
+            });
+            let mut spans = vec![Span::styled(
+                if chosen { " ▸ " } else { "   " },
+                Style::new().fg(theme.accent),
+            )];
+            let keys = match (chosen, waiting) {
+                (true, true) => "press a key".to_string(),
+                _ => app.keymap.shown(*action),
+            };
+            spans.push(Span::styled(
+                format!("{:<KEYS_WIDTH$}", ellipsize(&keys, KEYS_WIDTH)),
+                match (chosen, waiting) {
+                    (true, true) => Style::new().fg(theme.warn).bold(),
+                    (true, false) => Style::new().fg(theme.accent).bold(),
+                    _ => Style::new().fg(theme.muted),
+                },
+            ));
+            spans.push(Span::styled(
+                format!("{:<16}", action.name()),
+                if chosen { name.bold() } else { name },
+            ));
+            spans.push(Span::styled(
+                match heading {
+                    Some(group) => format!("{group} — {}", action.blurb()),
+                    None => action.blurb().to_string(),
+                },
+                Style::new().fg(if heading.is_some() {
+                    theme.info
+                } else {
+                    theme.dim
+                }),
+            ));
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.action_sel.min(Action::ALL.len() - 1)));
+    f.render_stateful_widget(List::new(items), inner, &mut state);
 }
 
 /// The themes there are, each drawn in its own colours — and the one under
@@ -2171,6 +2298,16 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 pub const HELP: &[(&str, &str)] = &[
+    (
+        "",
+        "The keys below are the ones sshman ships with. Any you have",
+    ),
+    (
+        "",
+        "changed are in , → Keys, which is also where you change one:",
+    ),
+    ("", "↵ on a line, then press the key you want."),
+    ("", ""),
     ("", "Moving around"),
     ("Tab", "switch between the local and remote pane"),
     ("↑ ↓ / k j", "move the cursor"),
@@ -2463,6 +2600,23 @@ pub const HELP: &[(&str, &str)] = &[
     ("", ""),
     ("", "Editing and running things"),
     (",", "settings: what sshman remembers between sessions"),
+    (
+        "",
+        "  Keys lists everything sshman can be asked to do and which",
+    ),
+    (
+        "",
+        "  key asks for it. ↵ on one, then press the key you want —",
+    ),
+    (
+        "",
+        "  it is taken off whatever had it, and Del puts it back. Only",
+    ),
+    (
+        "",
+        "  what you changed is written to the config file, and a key",
+    ),
+    ("", "  can be given to two things there but not here."),
     (
         "",
         "  Background says whether a theme's own is painted, or the",
@@ -2787,45 +2941,58 @@ mod tests {
             .collect()
     }
 
-    const HINTS: &[Hint<'static>] = &[
-        ("Tab", "pane"),
-        ("↵", "open"),
-        ("Space", "mark"),
-        ("c", "copy →"),
-        ("?", "help"),
-        ("q", "quit"),
-    ];
+    /// A line of hints with their keys already filled in, which is the form
+    /// the fitting works on.
+    fn hints() -> Vec<Shown> {
+        [
+            ("Tab", "pane"),
+            ("↵", "open"),
+            ("Space", "mark"),
+            ("c", "copy →"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+        .into_iter()
+        .map(|(k, v): (&str, &'static str)| (k.to_string(), v))
+        .collect()
+    }
 
-    fn line_width(hints: &[Hint]) -> usize {
+    fn line_width(hints: &[Shown]) -> usize {
         hints.iter().map(hint_width).sum()
     }
 
     #[test]
     fn a_line_that_fits_is_left_alone() {
-        let wide = line_width(HINTS) as u16;
-        assert_eq!(fit_hints(HINTS, wide), HINTS);
-        assert_eq!(fit_hints(HINTS, wide + 40), HINTS);
+        let hints = hints();
+        let wide = line_width(&hints) as u16;
+        assert_eq!(fit_hints(&hints, wide), hints);
+        assert_eq!(fit_hints(&hints, wide + 40), hints);
     }
 
     #[test]
     fn a_narrow_line_keeps_the_ways_out_and_says_it_was_cut() {
-        let fitted = fit_hints(HINTS, 40);
+        let hints = hints();
+        let fitted = fit_hints(&hints, 40);
         assert!(line_width(&fitted) <= 40, "{fitted:?}");
         assert_eq!(
             &fitted[fitted.len() - 2..],
-            &HINTS[HINTS.len() - 2..],
+            &hints[hints.len() - 2..],
             "help and quit survive whatever else goes"
         );
-        assert!(fitted.contains(&MORE), "and the cut is visible: {fitted:?}");
+        assert!(
+            fitted.contains(&more()),
+            "and the cut is visible: {fitted:?}"
+        );
         // What is kept comes off the front, in order.
-        assert_eq!(fitted[0], HINTS[0]);
+        assert_eq!(fitted[0], hints[0]);
     }
 
     #[test]
     fn the_narrower_it_gets_the_less_is_shown() {
+        let hints = hints();
         let mut last = usize::MAX;
         for width in [200, 60, 40, 30, 20] {
-            let fitted = fit_hints(HINTS, width);
+            let fitted = fit_hints(&hints, width);
             assert!(
                 fitted.len() <= last,
                 "{width} showed more than the one before"
@@ -2833,23 +3000,53 @@ mod tests {
             last = fitted.len();
         }
         // Even with nothing to spare, the ways out are still there.
-        let squeezed = fit_hints(HINTS, 1);
-        assert_eq!(&squeezed[squeezed.len() - 2..], &HINTS[HINTS.len() - 2..]);
+        let squeezed = fit_hints(&hints, 1);
+        assert_eq!(&squeezed[squeezed.len() - 2..], &hints[hints.len() - 2..]);
+    }
+
+    #[test]
+    fn every_hint_that_names_an_action_names_a_real_one() {
+        // A `@name` that matched nothing would show as itself, advertising a
+        // key that is not a key.
+        for list in ALL_HINTS {
+            for (key, _) in *list {
+                if let Some(name) = key.strip_prefix('@') {
+                    assert!(Action::by_name(name).is_some(), "no action called {name:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_bar_shows_the_keys_you_have_rather_than_the_ones_it_ships_with() {
+        let (app, rows) = frame(110, 30, |app| {
+            app.keymap
+                .bind(Action::Quit, crate::keys::Chord::parse("Q").expect("a key"));
+        });
+        let bar = rows.last().expect("the hints").clone();
+        assert!(bar.contains(" Q  quit"), "{bar}");
+        assert!(!bar.contains(" q  quit"), "the old key is gone: {bar}");
+        // And the rest of the line is untouched.
+        assert!(bar.contains("quit"));
+        drop(app);
     }
 
     #[test]
     fn a_short_list_is_never_cut() {
         // Two hints are all ways out; there is nothing to drop.
-        let pair: &[Hint] = &[("↵", "confirm"), ("Esc", "cancel")];
-        assert_eq!(fit_hints(pair, 1), pair);
+        let pair: Vec<Shown> = vec![("↵".to_string(), "confirm"), ("Esc".to_string(), "cancel")];
+        assert_eq!(fit_hints(&pair, 1), pair);
     }
 
     #[test]
     fn keys_are_measured_in_characters_not_bytes() {
         // `Ctrl-←/→` is 8 characters and 12 bytes; measuring bytes would cut
         // the line short of what actually fits.
-        assert_eq!(hint_width(&("Ctrl-←/→", "tabs")), 8 + 2 + 4 + 3);
-        assert_eq!(hint_width(&("", "every other key goes to the shell")), 36);
+        assert_eq!(hint_width(&("Ctrl-←/→".to_string(), "tabs")), 8 + 2 + 4 + 3);
+        assert_eq!(
+            hint_width(&(String::new(), "every other key goes to the shell")),
+            36
+        );
     }
 
     #[test]
@@ -2866,7 +3063,7 @@ mod tests {
             assert!(
                 tail.iter().any(|k| matches!(
                     *k,
-                    "q" | "Esc" | "n" | "any key" | "every other key goes to the shell"
+                    "q" | "@quit" | "Esc" | "n" | "any key" | "every other key goes to the shell"
                 )),
                 "{tail:?} has no way out in it"
             );

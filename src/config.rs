@@ -7,6 +7,7 @@
 //! written by a future version with fields we do not know about all mean the
 //! same thing: fall back to what sshman would have done anyway.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,14 @@ pub struct Config {
     /// terminal emulator, and this is the colour scheme it is set to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_colours: Option<String>,
+
+    /// Keys of your own, by what they do: `"quit": ["Q"]`.
+    ///
+    /// Only what you have changed is written here; everything else keeps the
+    /// scheme sshman ships, so this file says what you decided rather than
+    /// repeating fifty things you did not.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: BTreeMap<String, Vec<String>>,
 
     /// The file this came from, and where it goes back to. Not part of the
     /// file itself, and `None` when there is nowhere to write — which is also
@@ -170,6 +179,7 @@ pub enum Setting {
     Theme,
     Background,
     ShellColours,
+    Keys,
 }
 
 /// How a setting is changed: by typing a value, or by stepping through the
@@ -187,6 +197,7 @@ impl Setting {
         Setting::Theme,
         Setting::Background,
         Setting::ShellColours,
+        Setting::Keys,
     ];
 
     pub fn label(self) -> &'static str {
@@ -196,6 +207,7 @@ impl Setting {
             Self::Theme => "Theme",
             Self::Background => "Background",
             Self::ShellColours => "Shell colours",
+            Self::Keys => "Keys",
         }
     }
 
@@ -207,13 +219,14 @@ impl Setting {
             Self::Theme => "the colours to draw in",
             Self::Background => "the theme's own, or whatever the terminal is set to",
             Self::ShellColours => "what a shell pane's own output is coloured from",
+            Self::Keys => "which key asks for what",
         }
     }
 
     pub fn kind(self) -> Kind {
         match self {
             Self::Editor | Self::EditorOpen => Kind::Text,
-            Self::Theme | Self::Background | Self::ShellColours => Kind::Choice,
+            Self::Theme | Self::Background | Self::ShellColours | Self::Keys => Kind::Choice,
         }
     }
 }
@@ -239,6 +252,11 @@ impl Config {
                 true => "the theme's own".into(),
                 false => "the terminal's".into(),
             },
+            Setting::Keys => match self.keys.len() {
+                0 => "the ones sshman ships".into(),
+                1 => "1 key of your own".into(),
+                n => format!("{n} keys of your own"),
+            },
         }
     }
 
@@ -262,6 +280,10 @@ impl Config {
                 true => "set here",
                 false => "the default",
             },
+            Setting::Keys => match self.keys.is_empty() {
+                true => "the default",
+                false => "set here",
+            },
             Setting::Editor => {
                 if self.editor.as_deref().is_some_and(|e| !e.trim().is_empty()) {
                     "set here"
@@ -284,6 +306,7 @@ impl Config {
             Setting::EditorOpen => self.editor_open.is_some(),
             Setting::Background => self.background.is_some(),
             Setting::ShellColours => self.shell_colours.is_some(),
+            Setting::Keys => !self.keys.is_empty(),
             Setting::Theme => self.theme_name().is_some(),
         }
     }
