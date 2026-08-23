@@ -2529,6 +2529,7 @@ pub const HELP: &[(&str, &str)] = &[
     ),
     ("↵", "hand the keyboard to the pane you have moved to"),
     ("Shift-↑↓←→", "move the border nearest it"),
+    ("Ctrl-← →", "the tab before this one, and the next"),
     ("g", "pick the pane up, to move it rather than the keyboard"),
     ("", "  ↑ ↓ ← →  shove it past its neighbour"),
     ("", "  Shift-↑↓←→  send it to that edge, a column or a row"),

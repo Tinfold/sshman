@@ -2894,6 +2894,11 @@ impl App {
         // move the cursor in a file list.
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
+            // Ctrl with an arrow is the tab strip's, wherever it is pressed:
+            // the panes answer a bare arrow, and let the chord through to the
+            // keymap below so tabs switch in here as they do anywhere else.
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::CONTROL) => {}
             KeyCode::Left | KeyCode::Char('h') if !shift => {
                 return self.move_focus(Dir::Across, false);
             }
@@ -2947,6 +2952,14 @@ impl App {
     fn carry_key(&mut self, key: KeyEvent) -> bool {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
+            // Ctrl-arrow means the tab strip even here, so it puts the pane
+            // down first rather than shoving it somewhere on the way out.
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.carrying = false;
+                return false;
+            }
             // Shove it past its neighbour, again and again if you like: the
             // keyboard goes with it, so the arrows keep meaning the same
             // thing however far it has travelled.
@@ -7092,6 +7105,53 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert!(!app.commanding);
         assert_eq!(app.focus, shell);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ctrl_and_an_arrow_still_switches_tabs_while_sshman_has_the_keyboard() {
+        let dir = scratch("command-tabs");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        fake_tab(&mut app, "two", None);
+        fake_tab(&mut app, "three", None);
+        assert_eq!(app.active, 2, "the newest tab is the one on screen");
+        let shell = add_term(&mut app, Side::Remote, Shell::spawn_local(&dir, 24, 80));
+
+        let chord = |app: &mut App, code| {
+            app.on_key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            });
+        };
+
+        command(&mut app);
+        chord(&mut app, KeyCode::Left);
+        assert_eq!(app.active, 1, "the tab before this one");
+        assert!(app.commanding, "and the keyboard is still sshman's");
+        chord(&mut app, KeyCode::Right);
+        assert_eq!(app.active, 2, "and back again");
+
+        // A bare arrow is still the panes': the chord is the only thing the
+        // tab strip takes.
+        app.focus_pane(app.files_pane(Side::Remote));
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, shell, "it moved the keyboard");
+        assert_eq!(app.active, 2, "without leaving the tab");
+
+        // Picked up, the chord puts the pane down rather than shoving it.
+        press(&mut app, 'g');
+        assert!(app.carrying);
+        let rect = |app: &App| app.layout.areas(Rect::new(0, 0, 100, 30)).of(shell);
+        let before = rect(&app);
+        chord(&mut app, KeyCode::Right);
+        assert!(!app.carrying, "put down on the way past");
+        assert_eq!(app.active, 0, "and the tab switched");
+        app.goto_tab(2);
+        assert_eq!(rect(&app), before, "the pane stayed where it was");
 
         std::fs::remove_dir_all(&dir).ok();
     }
