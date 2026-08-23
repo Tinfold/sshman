@@ -37,11 +37,13 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    Event, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode, supports_keyboard_enhancement,
 };
 use ratatui::layout::Position;
 
@@ -231,6 +233,36 @@ fn current_user() -> String {
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+/// Ask the terminal to stop conflating keys that a program inside a shell
+/// pane may well want to tell apart.
+///
+/// Without this, Shift-↵ and ↵ arrive as the same byte — the terminal has no
+/// way to say which was pressed — so sshman cannot pass on the difference no
+/// matter what the program inside asked for. `DISAMBIGUATE_ESCAPE_CODES` is
+/// the smallest flag that fixes it: modified keys with no traditional
+/// spelling come as `CSI … u`, and everything with a traditional spelling
+/// keeps it, so nothing else about the key handling changes.
+fn enable_rich_keys(out: &mut impl Write) {
+    if !supports_keyboard_enhancement().unwrap_or(false) {
+        return;
+    }
+    if execute!(
+        out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok()
+    {
+        shell::set_rich_keys(true);
+    }
+}
+
+/// Put back whatever the terminal was reporting before, if we changed it.
+fn disable_rich_keys(out: &mut impl Write) {
+    if shell::rich_keys() {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
+}
+
 fn setup_terminal() -> Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -242,11 +274,13 @@ fn setup_terminal() -> Result<Tui> {
         // keystrokes, which matters for pasting into an embedded shell.
         EnableBracketedPaste
     )?;
+    enable_rich_keys(&mut stdout);
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
+    disable_rich_keys(terminal.backend_mut());
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -621,6 +655,10 @@ fn to_clipboard(terminal: &mut Tui, text: &str) -> Result<()> {
 /// Hand the terminal back to the shell, run `f`, then take it over again.
 fn suspended<T>(terminal: &mut Tui, f: impl FnOnce() -> T) -> Result<T> {
     disable_raw_mode()?;
+    // The program about to run gets the terminal exactly as it found it,
+    // including how keys are reported: an editor that asked for nothing
+    // unusual should not be handed sshman's settings.
+    disable_rich_keys(terminal.backend_mut());
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -640,6 +678,12 @@ fn suspended<T>(terminal: &mut Tui, f: impl FnOnce() -> T) -> Result<T> {
         EnableBracketedPaste,
         Clear(ClearType::All)
     )?;
+    if shell::rich_keys() {
+        let _ = execute!(
+            terminal.backend_mut(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     terminal.hide_cursor().ok();
     force_full_redraw(terminal);
     Ok(out)
@@ -698,8 +742,9 @@ fn shell_command(app: &App) -> Option<String> {
     if tab.is_local() {
         let cwd = app.remote_cwd();
         return Some(format!(
-            "cd {} 2>/dev/null; exec \"$SHELL\" -l",
-            sh_quote(&cwd)
+            "cd {} 2>/dev/null; {}",
+            sh_quote(&cwd),
+            login_shell(app)
         ));
     }
     // A container is entered by running its runtime, not by dialling it. On a
@@ -726,12 +771,28 @@ fn shell_command(app: &App) -> Option<String> {
     cmd.push_str(&format!(" {}@{}", conn.user, conn.host));
     let cwd = app.remote_cwd();
     if !cwd.is_empty() {
-        // `exec $SHELL -l` keeps the user's normal login shell and rc files.
-        let inner = format!("cd {} 2>/dev/null; exec \"$SHELL\" -l", sh_quote(&cwd));
+        let inner = format!("cd {} 2>/dev/null; {}", sh_quote(&cwd), login_shell(app));
         cmd.push(' ');
         cmd.push_str(&sh_quote(&inner));
     }
     Some(cmd)
+}
+
+/// The `exec` that hands the whole terminal to a shell, as a shell line.
+///
+/// Without a setting that is `"$SHELL" -l`, which keeps the login shell and
+/// its rc files wherever the line ends up running — this machine or a server.
+/// With one, it is that shell, guarded so a server that has never heard of it
+/// falls back to the login shell rather than to nothing at all.
+fn login_shell(app: &App) -> String {
+    let fallback = "exec \"$SHELL\" -l";
+    match app.config.shell() {
+        None => fallback.to_string(),
+        Some(shell) => format!(
+            "command -v {} >/dev/null 2>&1 && exec {shell}; {fallback}",
+            sh_quote(shell.split_whitespace().next().unwrap_or(shell)),
+        ),
+    }
 }
 
 /// `ssh -t` with the details needed to reach `opts`, for a command that runs

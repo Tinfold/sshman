@@ -87,6 +87,8 @@ pub enum PromptKind {
     SetEditor,
     /// The keystrokes that open a file in an editor pane.
     SetEditorOpen,
+    /// The shell a shell pane starts from now on, and next time.
+    SetShell,
 }
 
 /// One of the ready-made ways to arrange a tab's panes.
@@ -926,6 +928,9 @@ impl App {
     ) -> Self {
         let config = Config::load();
         let editor = config.editor();
+        // Every pane that opens a shell asks for this, wherever it is opened
+        // from, so it is settled once here rather than passed down.
+        crate::shell::set_default_shell(config.shell().map(str::to_string));
         let mut themes = Themes::load();
         let theme_name = config.theme_name().unwrap_or(theme::DEFAULT).to_string();
         let theme = themes.by_name(&theme_name).unwrap_or_else(|| {
@@ -3336,6 +3341,7 @@ impl App {
             Action::Even => self.reset_layout(),
             Action::Arrange => self.open_arrangements(),
             Action::Split => self.split_with_term(Dir::Across, 50),
+            Action::SplitDown => self.split_with_term(Dir::Down, 50),
             Action::NewList => self.split_with_tree(Dir::Across, 50),
             Action::ClosePane => self.close_pane(self.focus),
             Action::Command => self.enter_command(),
@@ -3615,6 +3621,7 @@ impl App {
             }
             PromptKind::SetEditor => self.set_editor(value),
             PromptKind::SetEditorOpen => self.set_editor_open(value),
+            PromptKind::SetShell => self.set_shell(value),
         }
     }
 
@@ -3674,7 +3681,7 @@ impl App {
             Setting::Background | Setting::ShellColours | Setting::Watch => {
                 self.change_setting(setting, 1)
             }
-            Setting::Editor | Setting::EditorOpen => self.ask_for_setting(setting),
+            Setting::Editor | Setting::EditorOpen | Setting::Shell => self.ask_for_setting(setting),
         }
     }
 
@@ -3826,7 +3833,7 @@ impl App {
                 Setting::ShellColours => self.toggle_shell_colours(),
                 Setting::Watch => self.toggle_watch(),
                 Setting::Keys => self.open_keys(),
-                Setting::Editor | Setting::EditorOpen => {}
+                Setting::Editor | Setting::EditorOpen | Setting::Shell => {}
             },
         }
     }
@@ -3844,6 +3851,14 @@ impl App {
                 "Keys that open {file} — empty asks your editor's own".to_string(),
                 self.config.editor_open.clone().unwrap_or_default(),
             ),
+            Setting::Shell => (
+                PromptKind::SetShell,
+                format!(
+                    "Shell for a shell pane (empty uses {})",
+                    crate::config::default_shell()
+                ),
+                self.config.shell.clone().unwrap_or_default(),
+            ),
             // Nothing to type: they are chosen from a list.
             Setting::Theme
             | Setting::Background
@@ -3860,6 +3875,7 @@ impl App {
         match setting {
             Setting::Editor => self.set_editor(String::new()),
             Setting::EditorOpen => self.set_editor_open(String::new()),
+            Setting::Shell => self.set_shell(String::new()),
             Setting::Background => {
                 self.config.background = None;
                 self.save_config("background: the theme's own again".into());
@@ -4030,6 +4046,25 @@ impl App {
         let done = match self.config.editor.is_some() {
             true => format!("editor set to {editor}"),
             false => format!("editor cleared — using {editor}"),
+        };
+        self.save_config(done);
+    }
+
+    /// The shell a new shell pane starts, here and on the servers.
+    ///
+    /// It takes for the next pane opened, not for the ones already running: a
+    /// shell you are in the middle of using is not something to restart out
+    /// from under you.
+    fn set_shell(&mut self, value: String) {
+        let value = value.trim().to_string();
+        self.config.shell = (!value.is_empty()).then_some(value);
+        crate::shell::set_default_shell(self.config.shell().map(str::to_string));
+        let done = match self.config.shell() {
+            Some(shell) => format!("new shell panes will run {shell}"),
+            None => format!(
+                "shell cleared — new panes use {} here, and the login shell on a server",
+                crate::config::default_shell()
+            ),
         };
         self.save_config(done);
     }
@@ -6590,6 +6625,30 @@ mod tests {
     }
 
     #[test]
+    fn a_second_shell_opens_either_way_up_without_closing_the_first() {
+        let dir = scratch("split-both-ways");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        app.focus = Slot::files(Side::Remote);
+
+        press(&mut app, '|');
+        assert_eq!(app.layout.panes(), 3, "a shell beside the files");
+        // S here would close that one again, which is exactly what these two
+        // keys are for.
+        key(&mut app, KeyCode::F(6));
+        press(&mut app, '_');
+        assert_eq!(app.layout.panes(), 4, "and one below, the other still up");
+        assert_eq!(app.tabs[0].terms.len(), 2, "both still running");
+
+        // One border each way, so the two keys did not do the same thing.
+        let dividers = app.layout.areas(Rect::new(0, 0, 80, 24)).dividers;
+        assert!(dividers.iter().any(|d| d.dir == Dir::Across));
+        assert!(dividers.iter().any(|d| d.dir == Dir::Down));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_terminal_no_pane_is_showing_is_not_left_running() {
         let dir = scratch("orphan");
         let mut app = app_in(&dir);
@@ -7569,9 +7628,9 @@ mod tests {
         let before = app.theme;
 
         press(&mut app, ',');
-        key(&mut app, KeyCode::Down);
-        key(&mut app, KeyCode::Down);
-        assert_eq!(app.selected_setting(), Setting::Theme);
+        while app.selected_setting() != Setting::Theme {
+            key(&mut app, KeyCode::Down);
+        }
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.mode, Mode::Themes);
         assert_eq!(app.theme_sel, 0, "opening on the one you are using");

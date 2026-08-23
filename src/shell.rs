@@ -109,6 +109,11 @@ pub struct Shell {
     /// resize — lets go of it rather than leaving a highlight over text that
     /// has moved on.
     selection: Option<Selection>,
+    /// Which of the kitty keyboard protocol's flags the program inside has
+    /// turned on, so [`encode_key`] knows whether it may spell a key the new
+    /// way. Shared with the thread reading that program's output, which is
+    /// where the asking is noticed.
+    kitty: Arc<Mutex<KittyKeys>>,
     pub label: String,
 }
 
@@ -128,6 +133,7 @@ impl Shell {
             cols,
             scrollback: 0,
             selection: None,
+            kitty: Arc::new(Mutex::new(KittyKeys::default())),
             label,
         };
         let parser_for_thread = Arc::clone(&parser);
@@ -166,11 +172,20 @@ impl Shell {
     ) -> Self {
         let (shell, rx, parser) = Self::new(label, rows, cols);
         let alive = Arc::clone(&shell.alive);
+        let kitty = Arc::clone(&shell.kitty);
+        let tx = shell.tx.clone();
         let cwd = cwd.to_path_buf();
         thread::Builder::new()
             .name("local-shell".into())
             .spawn(move || {
-                if let Err(e) = run_local(&cwd, command, rows, cols, &parser, &rx, &alive) {
+                let wiring = Wiring {
+                    parser: &parser,
+                    rx: &rx,
+                    tx: &tx,
+                    alive: &alive,
+                    kitty: &kitty,
+                };
+                if let Err(e) = run_local(&cwd, command, rows, cols, &wiring) {
                     write_notice(&parser, &format!("could not start a shell: {e}"));
                 }
                 alive.store(false, Ordering::Relaxed);
@@ -212,12 +227,21 @@ impl Shell {
     ) -> Self {
         let (shell, rx, parser) = Self::new(label, rows, cols);
         let alive = Arc::clone(&shell.alive);
+        let kitty = Arc::clone(&shell.kitty);
+        let tx = shell.tx.clone();
         let opts = opts.clone();
         write_notice(&parser, &format!("connecting to {}…", opts.host));
         thread::Builder::new()
             .name("remote-shell".into())
             .spawn(move || {
-                if let Err(e) = run_remote(&opts, launch, rows, cols, &parser, &rx, &alive) {
+                let wiring = Wiring {
+                    parser: &parser,
+                    rx: &rx,
+                    tx: &tx,
+                    alive: &alive,
+                    kitty: &kitty,
+                };
+                if let Err(e) = run_remote(&opts, launch, rows, cols, &wiring) {
                     write_notice(&parser, &format!("shell connection failed: {e}"));
                 }
                 alive.store(false, Ordering::Relaxed);
@@ -259,7 +283,8 @@ impl Shell {
 
     pub fn send_key(&mut self, key: KeyEvent) {
         self.selection = None;
-        if let Some(bytes) = encode_key(&key) {
+        let kitty = self.kitty.lock().unwrap_or_else(|e| e.into_inner()).flags();
+        if let Some(bytes) = encode_key(&key, kitty) {
             // Typing should snap the view back to the prompt, the way a real
             // terminal does.
             self.set_scrollback(0);
@@ -430,16 +455,160 @@ fn write_notice(parser: &Arc<Mutex<vt100::Parser>>, text: &str) {
     guard.process(format!("\r\n{text}\r\n").as_bytes());
 }
 
-fn feed(hvp: &mut Hvp, parser: &Arc<Mutex<vt100::Parser>>, bytes: &[u8]) {
+/// Hand `bytes` from the program inside to the screen, and return anything
+/// it has to be told in reply — the answer to a question it asked about the
+/// keyboard, which is the only thing here that talks back.
+#[must_use]
+fn feed(hvp: &mut Hvp, parser: &Arc<Mutex<vt100::Parser>>, bytes: &[u8]) -> Vec<u8> {
     let fixed = hvp.rewrite(bytes);
     let mut guard = parser.lock().unwrap_or_else(|e| e.into_inner());
     guard.process(&fixed);
+    std::mem::take(&mut hvp.replies)
 }
 
-/// Rewrites `CSI … f` into `CSI … H` on the way to the parser.
+// ---- the kitty keyboard protocol -------------------------------------------
+
+/// The flags sshman is willing to turn on: `disambiguate escape codes`, and
+/// nothing else.
 ///
-/// The two are the same command — HVP and CUP both move the cursor to a row
-/// and column — but `vt100` implements only the `H` spelling. Anything that
+/// That one is the whole point of the exercise — it is what lets a program
+/// tell `Shift-↵` from `↵` — and it is also the only one sshman can honestly
+/// offer. The others ask for key releases and for every key as an escape
+/// code, neither of which sshman's own terminal is reporting to it, so
+/// agreeing to them would be promising events that could never arrive.
+const KITTY_SUPPORTED: u8 = 0b1;
+
+/// How deep a program may stack keyboard modes before we stop remembering.
+/// The protocol names the same number.
+const KITTY_STACK: usize = 16;
+
+/// What the program inside a shell pane has asked for from the kitty keyboard
+/// protocol.
+///
+/// A program pushes the flags it wants, pops back to what was there before
+/// when it is done, and may ask at any point what is actually on — sshman
+/// answers with what it granted rather than what was requested, which is how
+/// the protocol expects a terminal that supports only part of it to behave.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct KittyKeys {
+    /// Modes below the current one, innermost last. Empty means the plain
+    /// old encoding, which is where every shell starts.
+    stack: Vec<u8>,
+}
+
+impl KittyKeys {
+    fn flags(&self) -> u8 {
+        self.stack.last().copied().unwrap_or(0)
+    }
+
+    fn push(&mut self, flags: u8) {
+        if self.stack.len() == KITTY_STACK {
+            self.stack.remove(0);
+        }
+        self.stack.push(flags & KITTY_SUPPORTED);
+    }
+
+    fn pop(&mut self, count: usize) {
+        let keep = self.stack.len().saturating_sub(count.max(1));
+        self.stack.truncate(keep);
+    }
+
+    /// `CSI = flags ; mode u`: set them, add to them, or take them away.
+    fn set(&mut self, flags: u8, mode: u8) {
+        let now = self.flags();
+        let next = match mode {
+            2 => now | flags,
+            3 => now & !flags,
+            _ => flags,
+        } & KITTY_SUPPORTED;
+        match self.stack.last_mut() {
+            Some(top) => *top = next,
+            None => self.stack.push(next),
+        }
+    }
+}
+
+/// Whether sshman's own terminal agreed to report keys unambiguously.
+///
+/// It gates the whole protocol: if `Shift-↵` cannot reach sshman in the first
+/// place, saying yes to a program that asks for it would be promising
+/// something we have no way to deliver.
+static RICH_KEYS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_rich_keys(on: bool) {
+    RICH_KEYS.store(on, Ordering::Relaxed);
+}
+
+pub fn rich_keys() -> bool {
+    RICH_KEYS.load(Ordering::Relaxed)
+}
+
+/// Read a `CSI … u` sequence the program inside sent and do what it asks.
+///
+/// `params` is what came between the `CSI` and the `u`, private prefix and
+/// all. Returns the bytes to send back, if it was a question.
+fn kitty_request(keys: &Arc<Mutex<KittyKeys>>, params: &[u8]) -> Vec<u8> {
+    // Nothing to offer: sshman's own terminal is not telling it which of the
+    // ambiguous keys was pressed, so it has none of them to pass on. Saying
+    // nothing is what a terminal without the protocol does, and it is what
+    // the program inside is already prepared for.
+    if !rich_keys() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(params);
+    let (prefix, rest) = text.split_at(1);
+    let number = |s: &str| s.trim().parse::<u32>().ok();
+    let mut keys = keys.lock().unwrap_or_else(|e| e.into_inner());
+    match prefix {
+        // "What is on?" — answered with what we granted.
+        "?" => return format!("\x1b[?{}u", keys.flags()).into_bytes(),
+        ">" => keys.push(number(rest).unwrap_or(1) as u8),
+        "<" => keys.pop(number(rest).unwrap_or(1) as usize),
+        "=" => {
+            let (flags, mode) = match rest.split_once(';') {
+                Some((f, m)) => (number(f).unwrap_or(0), number(m).unwrap_or(1)),
+                None => (number(rest).unwrap_or(0), 1),
+            };
+            keys.set(flags as u8, mode as u8);
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+// ---- which shell a pane starts ---------------------------------------------
+
+/// The shell the settings name, if any. One process, one answer, and every
+/// pane opened after the setting changes gets the new one — which is why it
+/// lives here rather than being carried down through every caller that opens
+/// a pane.
+static DEFAULT_SHELL: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_default_shell(shell: Option<String>) {
+    *DEFAULT_SHELL.lock().unwrap_or_else(|e| e.into_inner()) = shell;
+}
+
+fn configured_shell() -> Option<String> {
+    DEFAULT_SHELL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// The program a shell pane on this machine runs.
+pub fn local_shell() -> String {
+    configured_shell().unwrap_or_else(crate::config::default_shell)
+}
+
+/// Everything the program inside says, on its way to the screen.
+///
+/// Two things happen here. `CSI … f` is rewritten into `CSI … H`, and
+/// `CSI … u` — the program asking about the keyboard — is answered and taken
+/// out of the stream, since it was never anything to draw.
+///
+/// The rewrite is there because the two are the same command — HVP and CUP
+/// both move the cursor to a row and column — but `vt100` implements only the
+/// `H` spelling. Anything that
 /// prefers `f` has every one of its positioning commands silently dropped,
 /// and its careful full-screen layout arrives as one long wrapped run of
 /// text. btop does exactly that: hundreds of `f`, not one `H`.
@@ -448,10 +617,15 @@ fn feed(hvp: &mut Hvp, parser: &Arc<Mutex<vt100::Parser>>, bytes: &[u8]) {
 /// until the byte that ends it turns up. Anything that stops looking like a
 /// sequence is passed through exactly as it came, which is the only safe
 /// thing to do with bytes we do not understand.
-#[derive(Default)]
 struct Hvp {
     /// The `ESC [ …` seen so far, when a sequence is still arriving.
     partial: Vec<u8>,
+    /// The keyboard modes the program inside has asked for. `CSI … u` never
+    /// reaches the screen: it is a conversation about the keyboard, and this
+    /// is sshman's half of it.
+    kitty: Arc<Mutex<KittyKeys>>,
+    /// What that conversation owes the program, waiting to be written back.
+    replies: Vec<u8>,
 }
 
 /// Longer than any real CSI sequence. Past this we are not looking at one,
@@ -459,6 +633,14 @@ struct Hvp {
 const MAX_CSI: usize = 64;
 
 impl Hvp {
+    fn new(kitty: Arc<Mutex<KittyKeys>>) -> Self {
+        Self {
+            partial: Vec::new(),
+            kitty,
+            replies: Vec::new(),
+        }
+    }
+
     fn rewrite(&mut self, input: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(input.len() + self.partial.len());
         for &byte in input {
@@ -487,6 +669,16 @@ impl Hvp {
                 }
                 // The final byte, which says what the sequence was.
                 0x40..=0x7e => {
+                    // `CSI ? u`, `CSI > … u` and friends are the program
+                    // asking about the keyboard, not something to draw. They
+                    // are answered here and go no further.
+                    let params = &self.partial[2..];
+                    if byte == b'u' && matches!(params.first(), Some(b'?' | b'>' | b'<' | b'=')) {
+                        let reply = kitty_request(&self.kitty, params);
+                        self.replies.extend_from_slice(&reply);
+                        self.partial.clear();
+                        continue;
+                    }
                     out.append(&mut self.partial);
                     out.push(if byte == b'f' { b'H' } else { byte });
                 }
@@ -503,15 +695,32 @@ impl Hvp {
 
 // ---- local ----------------------------------------------------------------
 
+/// Everything a running session is wired to: the screen it draws on, the
+/// keystrokes coming its way, the channel it answers on, and the two things
+/// both sides need to agree about — whether it is still alive, and what it
+/// has asked of the keyboard.
+struct Wiring<'a> {
+    parser: &'a Arc<Mutex<vt100::Parser>>,
+    rx: &'a Receiver<Msg>,
+    tx: &'a Sender<Msg>,
+    alive: &'a Arc<AtomicBool>,
+    kitty: &'a Arc<Mutex<KittyKeys>>,
+}
+
 fn run_local(
     cwd: &Path,
     command: Option<String>,
     rows: u16,
     cols: u16,
-    parser: &Arc<Mutex<vt100::Parser>>,
-    rx: &Receiver<Msg>,
-    alive: &Arc<AtomicBool>,
+    w: &Wiring,
 ) -> anyhow::Result<()> {
+    let Wiring {
+        parser,
+        rx,
+        tx,
+        alive,
+        kitty,
+    } = w;
     let pair = native_pty_system().openpty(PtySize {
         rows,
         cols,
@@ -519,17 +728,21 @@ fn run_local(
         pixel_height: 0,
     })?;
 
-    let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let mut cmd = match &command {
         // Run through a shell so the command line can use the user's PATH and
-        // ordinary shell syntax.
+        // ordinary shell syntax. Which shell is not the user's choice here:
+        // this is sshman running something it composed, and it composed it in
+        // the one language every shell in the family understands.
         Some(line) => {
-            let mut c = CommandBuilder::new(&program);
+            let mut c =
+                CommandBuilder::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
             c.arg("-c");
             c.arg(line);
             c
         }
-        None => CommandBuilder::new(&program),
+        // A prompt for the user, so it is their shell, and the setting is
+        // where they said which one that is.
+        None => argv_for(&local_shell()),
     };
     cmd.cwd(cwd);
     cmd.env("TERM", "xterm-256color");
@@ -544,15 +757,25 @@ fn run_local(
 
     let reader_parser = Arc::clone(parser);
     let reader_alive = Arc::clone(alive);
+    let reader_kitty = Arc::clone(kitty);
+    // The reader answers the keyboard questions it sees, and the writer loop
+    // below is the only thing holding the pty's writing end — so a reply goes
+    // round through the same channel a keystroke does.
+    let reader_tx = (*tx).clone();
     thread::Builder::new()
         .name("local-shell-reader".into())
         .spawn(move || {
             let mut buf = [0u8; 8192];
-            let mut hvp = Hvp::default();
+            let mut hvp = Hvp::new(reader_kitty);
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => feed(&mut hvp, &reader_parser, &buf[..n]),
+                    Ok(n) => {
+                        let reply = feed(&mut hvp, &reader_parser, &buf[..n]);
+                        if !reply.is_empty() && reader_tx.send(Msg::Bytes(reply)).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             reader_alive.store(false, Ordering::Relaxed);
@@ -591,6 +814,19 @@ fn run_local(
     Ok(())
 }
 
+/// Turn a shell setting into something to run. A whole command line is
+/// allowed — `bash --norc`, `nix develop -c fish` — so the words after the
+/// program are its arguments rather than part of its name.
+fn argv_for(line: &str) -> CommandBuilder {
+    let mut words = line.split_whitespace();
+    let program = words.next().unwrap_or("/bin/sh");
+    let mut cmd = CommandBuilder::new(program);
+    for arg in words {
+        cmd.arg(arg);
+    }
+    cmd
+}
+
 // ---- remote ---------------------------------------------------------------
 
 fn run_remote(
@@ -598,10 +834,15 @@ fn run_remote(
     launch: RemoteLaunch,
     rows: u16,
     cols: u16,
-    parser: &Arc<Mutex<vt100::Parser>>,
-    rx: &Receiver<Msg>,
-    alive: &Arc<AtomicBool>,
+    w: &Wiring,
 ) -> anyhow::Result<()> {
+    let Wiring {
+        parser,
+        rx,
+        alive,
+        kitty,
+        ..
+    } = w;
     let sess = establish(opts).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut channel = sess.channel_session()?;
@@ -618,7 +859,21 @@ fn run_remote(
             channel.shell()?;
             // Sending this before the first prompt makes the pty echo it a
             // second time above the prompt, which looks like a glitch.
-            startup_cd = Some(format!("cd {}\n", sh_quote(cwd)));
+            let mut line = format!("cd {}", sh_quote(cwd));
+            // A shell of your own, if the server has it. The `command -v`
+            // guard matters: an `exec` of something that is not there takes
+            // the login shell down with it, and being dropped into nothing
+            // because a server does not run the same shells your laptop does
+            // would be a poor way to find that out.
+            if let Some(shell) = configured_shell() {
+                line.push_str(&format!(
+                    "; command -v {0} >/dev/null 2>&1 && exec {1}",
+                    sh_quote(shell.split_whitespace().next().unwrap_or(&shell)),
+                    shell,
+                ));
+            }
+            line.push('\n');
+            startup_cd = Some(line);
         }
         RemoteLaunch::Command(cmdline) => channel.exec(cmdline)?,
     }
@@ -630,7 +885,7 @@ fn run_remote(
     let mut buf = [0u8; 8192];
     // One per stream: they land on the same screen, but a sequence split
     // across reads is only ever split within the stream carrying it.
-    let (mut hvp_out, mut hvp_err) = (Hvp::default(), Hvp::default());
+    let (mut hvp_out, mut hvp_err) = (Hvp::new(Arc::clone(kitty)), Hvp::new(Arc::clone(kitty)));
     let mut pending: Vec<u8> = Vec::new();
 
     loop {
@@ -670,7 +925,7 @@ fn run_remote(
                 }
             }
             Ok(n) => {
-                feed(&mut hvp_out, parser, &buf[..n]);
+                pending.extend_from_slice(&feed(&mut hvp_out, parser, &buf[..n]));
                 idle = false;
                 // The prompt is up; now it is safe to change directory.
                 if let Some(command) = startup_cd.take() {
@@ -683,7 +938,7 @@ fn run_remote(
 
         match channel.stderr().read(&mut buf) {
             Ok(n) if n > 0 => {
-                feed(&mut hvp_err, parser, &buf[..n]);
+                pending.extend_from_slice(&feed(&mut hvp_err, parser, &buf[..n]));
                 idle = false;
             }
             _ => {}
@@ -811,12 +1066,29 @@ pub fn encode_mouse(
 
 /// Turn a crossterm key event back into the bytes a terminal would send.
 /// Returns `None` for keys that produce nothing.
-pub fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
+///
+/// `kitty` is what the program inside has turned on of the kitty keyboard
+/// protocol. While it is zero — which is where every shell starts, and where
+/// most of them stay — every key is spelled the way terminals have always
+/// spelled it. The one thing the protocol buys us is the keys that have no
+/// traditional spelling at all: `Shift-↵` is the same byte as `↵` and always
+/// has been, so a program wanting a newline out of it has to ask for the new
+/// encoding, and this is where it gets it.
+pub fn encode_key(key: &KeyEvent, kitty: u8) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // Only ever true for a program that asked, and only for a chord that has
+    // nowhere else to go.
+    let modified = ctrl || alt || shift;
+    let rich = kitty & KITTY_SUPPORTED != 0 && modified;
 
     let bytes = match key.code {
+        KeyCode::Enter if rich => csi_u(13, ctrl, alt, shift),
+        KeyCode::Tab if rich => csi_u(9, ctrl, alt, shift),
+        KeyCode::BackTab if kitty & KITTY_SUPPORTED != 0 => csi_u(9, ctrl, alt, true),
+        KeyCode::Backspace if rich => csi_u(127, ctrl, alt, shift),
+        KeyCode::Esc if rich => csi_u(27, ctrl, alt, shift),
         KeyCode::Char(c) if ctrl => vec![control_byte(c)?],
         KeyCode::Char(c) => {
             let mut out = Vec::new();
@@ -868,6 +1140,15 @@ fn control_byte(c: char) -> Option<u8> {
     Some(b)
 }
 
+/// A key spelled the kitty way: `ESC [ codepoint ; modifiers u`, where the
+/// codepoint is the one the unmodified key stands for.
+fn csi_u(code: u32, ctrl: bool, alt: bool, shift: bool) -> Vec<u8> {
+    match modifier_code(ctrl, alt, shift) {
+        None => format!("\x1b[{code}u").into_bytes(),
+        Some(m) => format!("\x1b[{code};{m}u").into_bytes(),
+    }
+}
+
 /// Arrow and Home/End keys: plain `ESC [ X`, or `ESC [ 1 ; m X` when modified.
 fn cursor_key(final_byte: u8, ctrl: bool, alt: bool, shift: bool) -> Vec<u8> {
     match modifier_code(ctrl, alt, shift) {
@@ -904,9 +1185,17 @@ fn modifier_code(ctrl: bool, alt: bool, shift: bool) -> Option<u8> {
 mod tests {
     use super::*;
 
+    /// Whether sshman's terminal reports keys richly is one answer for the
+    /// whole process, so the two tests that change it take turns.
+    static RICH: Mutex<()> = Mutex::new(());
+
+    fn hvp() -> Hvp {
+        Hvp::new(Arc::new(Mutex::new(KittyKeys::default())))
+    }
+
     /// Feed a stream in one go.
     fn fixed(input: &[u8]) -> Vec<u8> {
-        Hvp::default().rewrite(input)
+        hvp().rewrite(input)
     }
 
     fn mouse(kind: MouseEventKind, mods: KeyModifiers) -> MouseEvent {
@@ -1102,7 +1391,7 @@ mod tests {
         for cut in 1..9 {
             let whole = b"\x1b[12;40fXY";
             let (a, b) = whole.split_at(cut);
-            let mut hvp = Hvp::default();
+            let mut hvp = hvp();
             let mut out = hvp.rewrite(a);
             out.extend(hvp.rewrite(b));
             assert_eq!(
@@ -1150,8 +1439,14 @@ mod tests {
         }
     }
 
+    /// What a shell that has asked for nothing unusual is sent.
     fn encode(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
-        encode_key(&key(code, modifiers)).expect("key should encode")
+        encode_key(&key(code, modifiers), 0).expect("key should encode")
+    }
+
+    /// What a program that has turned the kitty protocol on is sent.
+    fn encode_rich(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
+        encode_key(&key(code, modifiers), KITTY_SUPPORTED).expect("key should encode")
     }
 
     #[test]
@@ -1201,9 +1496,74 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_is_still_a_return_until_a_program_asks_for_the_difference() {
+        // Which is what a terminal has always sent, and what every shell
+        // prompt in the world is waiting for.
+        assert_eq!(encode(KeyCode::Enter, KeyModifiers::NONE), b"\r");
+        assert_eq!(encode(KeyCode::Enter, KeyModifiers::SHIFT), b"\r");
+        assert_eq!(encode(KeyCode::Enter, KeyModifiers::CONTROL), b"\r");
+
+        // Having asked, it gets told apart: 13 is the codepoint the key
+        // stands for, 2 is shift.
+        assert_eq!(
+            encode_rich(KeyCode::Enter, KeyModifiers::SHIFT),
+            b"\x1b[13;2u"
+        );
+        assert_eq!(
+            encode_rich(KeyCode::Enter, KeyModifiers::CONTROL),
+            b"\x1b[13;5u"
+        );
+        // And the plain one is left alone even then, since it was never
+        // ambiguous.
+        assert_eq!(encode_rich(KeyCode::Enter, KeyModifiers::NONE), b"\r");
+    }
+
+    #[test]
+    fn asking_for_the_keyboard_protocol_is_answered_and_kept_off_the_screen() {
+        let _rich = RICH.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = Arc::new(Mutex::new(KittyKeys::default()));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(4, 20, 0)));
+        let mut hvp = Hvp::new(Arc::clone(&keys));
+
+        // A terminal that cannot tell the keys apart itself has nothing to
+        // offer, and says so by saying nothing.
+        set_rich_keys(false);
+        assert!(feed(&mut hvp, &parser, b"\x1b[?u").is_empty());
+        assert_eq!(keys.lock().unwrap().flags(), 0);
+
+        set_rich_keys(true);
+        assert_eq!(feed(&mut hvp, &parser, b"\x1b[?u"), b"\x1b[?0u");
+        // Asked for everything; granted the one flag sshman can honour, and
+        // the next question is answered with what was granted rather than
+        // what was asked.
+        assert!(feed(&mut hvp, &parser, b"\x1b[>15u").is_empty());
+        assert_eq!(feed(&mut hvp, &parser, b"\x1b[?u"), b"\x1b[?1u");
+        assert_eq!(encode(KeyCode::Enter, KeyModifiers::SHIFT), b"\r");
+
+        // Popped back to where it started, the way a program does on its way
+        // out.
+        assert!(feed(&mut hvp, &parser, b"\x1b[<1u").is_empty());
+        assert_eq!(keys.lock().unwrap().flags(), 0);
+
+        // None of that was anything to draw.
+        let screen = parser.lock().unwrap();
+        assert_eq!(screen.screen().contents().trim(), "");
+        drop(screen);
+        set_rich_keys(false);
+    }
+
+    #[test]
+    fn a_shell_setting_may_carry_its_own_arguments() {
+        let cmd = argv_for("bash --norc -i");
+        assert!(cmd.get_argv()[0].to_string_lossy().ends_with("bash"));
+        assert_eq!(cmd.get_argv()[1], "--norc");
+        assert_eq!(cmd.get_argv()[2], "-i");
+    }
+
+    #[test]
     fn unmappable_keys_are_dropped() {
-        assert!(encode_key(&key(KeyCode::Null, KeyModifiers::NONE)).is_none());
-        assert!(encode_key(&key(KeyCode::F(20), KeyModifiers::NONE)).is_none());
+        assert!(encode_key(&key(KeyCode::Null, KeyModifiers::NONE), 0).is_none());
+        assert!(encode_key(&key(KeyCode::F(20), KeyModifiers::NONE), 0).is_none());
     }
 
     fn selection(anchor: (u16, u16), head: (u16, u16)) -> Selection {
@@ -1293,6 +1653,35 @@ mod tests {
         assert!(shell.selection().is_none());
 
         shell.type_in("exit\n");
+    }
+
+    #[test]
+    fn a_real_shell_gets_a_real_answer_about_the_keyboard() {
+        // The whole local path: a program prints the question, sshman's
+        // reader notices it, and the answer goes back down the pty the same
+        // way a keystroke would. `-icanon` is what lets a reply with no
+        // newline on the end of it be read at all, `-echo` keeps it off the
+        // screen, and `head -c 5` takes exactly the reply.
+        let _rich = RICH.lock().unwrap_or_else(|e| e.into_inner());
+        set_rich_keys(true);
+        let mut shell = Shell::spawn_local(Path::new("/"), 24, 80);
+        shell.type_in("stty -echo -icanon; printf '\\033[?u'; head -c 5 | od -An -c\n");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            // `od -An -c` spells the reply out: escape, then `[?0u`.
+            let seen = shell.with_screen(|s| s.contents().contains("033   [   ?   0   u"));
+            if seen {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the query went unanswered:\n{}",
+                shell.with_screen(|s| s.contents())
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        set_rich_keys(false);
     }
 
     #[test]

@@ -48,6 +48,18 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<String>,
 
+    /// The shell a shell pane starts. Empty or absent means `$SHELL`, then
+    /// `/bin/sh`, which is where it came from before there was anywhere to
+    /// write it down.
+    ///
+    /// A program name, or a whole command line — `zsh`, `/usr/bin/fish`,
+    /// `bash --norc`. It is only ever the *interactive* shell in a pane:
+    /// sshman's own work — listing a directory, unpacking an archive — keeps
+    /// running through `$SHELL`, so naming one that speaks a different
+    /// language here cannot break anything but your own prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+
     /// Whether a shell pane's colours come from the theme or from the
     /// terminal's own palette. Absent means the theme's.
     ///
@@ -124,6 +136,16 @@ impl Config {
             .unwrap_or_else(default_editor)
     }
 
+    /// The shell to start in a pane, as written, or `None` to leave it to the
+    /// machine the pane is on: `$SHELL` here, the account's login shell on a
+    /// server.
+    pub fn shell(&self) -> Option<&str> {
+        self.shell
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     /// Whether to paint the background a theme names. Anything but the word
     /// `terminal` means paint it, so a file written by a later version that
     /// knows more answers than this one still does something sensible.
@@ -194,6 +216,7 @@ impl Config {
 pub enum Setting {
     Editor,
     EditorOpen,
+    Shell,
     Theme,
     Background,
     ShellColours,
@@ -213,6 +236,7 @@ impl Setting {
     pub const ALL: &'static [Setting] = &[
         Setting::Editor,
         Setting::EditorOpen,
+        Setting::Shell,
         Setting::Theme,
         Setting::Background,
         Setting::ShellColours,
@@ -224,6 +248,7 @@ impl Setting {
         match self {
             Self::Editor => "Editor",
             Self::EditorOpen => "Opens with",
+            Self::Shell => "Shell",
             Self::Theme => "Theme",
             Self::Background => "Background",
             Self::ShellColours => "Shell colours",
@@ -237,6 +262,7 @@ impl Setting {
         match self {
             Self::Editor => "the program e opens files with",
             Self::EditorOpen => "the keys that open {file} in an editor pane",
+            Self::Shell => "the shell a shell pane starts",
             Self::Theme => "the colours to draw in",
             Self::Background => "the theme's own, or whatever the terminal is set to",
             Self::ShellColours => "what a shell pane's own output is coloured from",
@@ -247,7 +273,7 @@ impl Setting {
 
     pub fn kind(self) -> Kind {
         match self {
-            Self::Editor | Self::EditorOpen => Kind::Text,
+            Self::Editor | Self::EditorOpen | Self::Shell => Kind::Text,
             Self::Theme | Self::Background | Self::ShellColours | Self::Watch | Self::Keys => {
                 Kind::Choice
             }
@@ -266,6 +292,10 @@ impl Config {
                     "" => "(run at the prompt)".into(),
                     spec => spec.to_string(),
                 },
+            },
+            Setting::Shell => match self.shell() {
+                Some(shell) => shell.to_string(),
+                None => default_shell(),
             },
             Setting::Theme => self.theme_name().unwrap_or(theme::DEFAULT).to_string(),
             Setting::Background => match self.paint_background() {
@@ -316,6 +346,15 @@ impl Config {
                 true => "the default",
                 false => "set here",
             },
+            Setting::Shell => {
+                if self.shell().is_some() {
+                    "set here"
+                } else if env_set("SHELL") {
+                    "from $SHELL"
+                } else {
+                    "the fallback"
+                }
+            }
             Setting::Editor => {
                 if self.editor.as_deref().is_some_and(|e| !e.trim().is_empty()) {
                     "set here"
@@ -336,6 +375,7 @@ impl Config {
         match setting {
             Setting::Editor => self.editor.is_some(),
             Setting::EditorOpen => self.editor_open.is_some(),
+            Setting::Shell => self.shell.is_some(),
             Setting::Background => self.background.is_some(),
             Setting::ShellColours => self.shell_colours.is_some(),
             Setting::Watch => self.watch.is_some(),
@@ -364,6 +404,11 @@ fn default_open(editor: &str) -> &'static str {
         "vi" | "vim" | "nvim" | "view" | "kak" => "\\e:e {file}\\r",
         "hx" | "helix" => "\\e:o {file}\\r",
         "emacs" | "emacsclient" => "\\C-x\\C-f{file}\\r",
+        // No escape first, and deliberately: textfold's Alt-E opens its path
+        // box whatever else is on the screen, so there is nothing to get out
+        // of first. An escape here would be one more byte for the far end to
+        // tell apart from the start of the Alt-E itself.
+        "textfold" => "\\ee{file}\\r",
         _ => "",
     }
 }
@@ -420,6 +465,15 @@ pub fn default_editor() -> String {
         .map(|e| e.trim().to_string())
         .filter(|e| !e.is_empty())
         .unwrap_or_else(|| "vi".into())
+}
+
+/// The shell to start on this machine when nothing has been configured.
+pub fn default_shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".into())
 }
 
 /// Where everything sshman remembers between sessions lives: this file, the
@@ -481,6 +535,29 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_is_the_machines_own_until_one_is_named() {
+        let config = Config::default();
+        assert_eq!(config.shell(), None, "nothing said, nothing imposed");
+        assert_eq!(config.value(Setting::Shell), default_shell());
+
+        for blank in ["", "   "] {
+            let config = Config {
+                shell: Some(blank.into()),
+                ..Config::default()
+            };
+            assert_eq!(config.shell(), None, "{blank:?} is not a shell");
+        }
+
+        let config = Config {
+            shell: Some("  bash --norc  ".into()),
+            ..Config::default()
+        };
+        assert_eq!(config.shell(), Some("bash --norc"));
+        assert_eq!(config.origin(Setting::Shell), "set here");
+        assert!(config.is_set(Setting::Shell));
+    }
+
+    #[test]
     fn settings_round_trip_through_json() {
         let config = Config {
             editor: Some("nvim".into()),
@@ -504,6 +581,8 @@ mod tests {
         // The path it was found at and the flags after it are not the editor.
         assert_eq!(config.editor_open("/usr/bin/vim -p"), "\x1b:e {file}\r");
         assert_eq!(config.editor_open("hx"), "\x1b:o {file}\r");
+        // textfold's path box opens over anything, so no escape first.
+        assert_eq!(config.editor_open("textfold"), "\x1be{file}\r");
         assert_eq!(config.editor_open("emacs"), "\x18\x06{file}\r");
     }
 

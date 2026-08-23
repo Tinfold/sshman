@@ -92,7 +92,7 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `P` | paste what `c` or `M` picked up into this directory |
 | `e` / `F4` | edit in `$EDITOR` |
 | `E` | edit with a program you name, just this once |
-| `,` | settings: theme, background, keys, editor — what sshman remembers |
+| `,` | settings: theme, background, keys, editor, shell — what sshman remembers |
 | `v` | view in `$PAGER` |
 | `:` | run a command in the remote pane's directory |
 | `!` | full-screen shell in that directory: `ssh` for a server, `exec` into a container, a login shell on this machine |
@@ -106,8 +106,9 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `W` | close the tab on screen |
 | `Ctrl-←` / `Ctrl-→`, `Alt-1`…`Alt-9` | move between tabs |
 | `S` | cut the focused pane in two, with a terminal below — or close the last one |
-| `\|` | the same, with the terminal beside it |
-| `T` | the same, with another file list beside it |
+| `\|` | a terminal beside the focused pane, closing nothing |
+| `_` | a terminal below it, closing nothing |
+| `T` | another file list beside it, closing nothing |
 | `F9` | close the focused pane, from anywhere |
 | `A` | pick a ready-made arrangement for this tab |
 | `F6` | move the keyboard between the file list and the shell |
@@ -149,6 +150,7 @@ everything sshman can be asked to do and which key asks for it:
 ╭ Keys ──────────────────────────────────────────────────────────────────────╮
 │    S                shell           Panes — a shell below this pane        │
 │    |                split           a shell beside this pane               │
+│    _                split-down      a shell below, closing nothing         │
 │  ▸ T                new-list        another file list beside this pane     │
 │    F9               close-pane      close the focused pane                 │
 │    m / F3           zoom            give the whole screen to this pane     │
@@ -281,9 +283,14 @@ so splitting a pane, closing one, dragging a border and zooming are all one set
 of operations rather than one set per shape the screen might take.
 
 **Making panes.** `S` cuts the focused pane in two and puts a terminal in the
-half that opens up; `|` does the same sideways, and `T` puts another file list
-there instead. A pane is on the machine whose pane you split, so splitting the
-remote pane gives you a shell — or a second directory — on the server.
+half that opens up; `|` does the same sideways, `_` does it downwards, and `T`
+puts another file list there instead. A pane is on the machine whose pane you
+split, so splitting the remote pane gives you a shell — or a second directory —
+on the server.
+
+`S` is the one key that also takes back: from a file list it closes the last
+terminal that machine has open. `|` and `_` never close anything, which is what
+they are for — a second and a third shell without losing the first.
 
 **Closing panes.** `F9` closes the focused pane and its neighbour takes the
 space, from anywhere including inside a shell. Every pane also carries an
@@ -644,7 +651,9 @@ is still running when another shows it.
 
 Press `S` and a real shell opens under the focused pane — a local shell under
 the local pane, a shell on the server under the remote pane. `|` puts one
-beside it instead. As many as you like, on either machine. They are proper
+beside it instead and `_` below it, and neither of those closes anything, so
+they are the two to reach for once you already have one open. As many as you
+like, on either machine. They are proper
 terminals, not a command box: `vim`, `top`, `less`, colours and Ctrl-C all
 behave, because each one runs on a pty with a terminal emulator behind it.
 
@@ -654,7 +663,8 @@ the way back out, and `Ctrl-]` is [command mode](#command-mode), which reaches
 the rest of sshman without leaving the shell at all. The footer says so
 whenever a shell is focused.
 
-- The local shell starts in the local pane's directory, running `$SHELL`.
+- The local shell starts in the local pane's directory, running `$SHELL` — or
+  [whichever shell you named](#which-shell-a-pane-starts).
 - The remote shell starts in the remote pane's directory.
 - `Alt-↑` / `Alt-↓` resize the pane; the scroll wheel moves through history.
 - Full-screen programs work: `vim`, `top`, `btop`. One that asks for the mouse
@@ -666,10 +676,73 @@ whenever a shell is focused.
   when the program inside has asked for one — so a multi-line paste lands in
   the shell's line editor instead of running line by line before you have read
   it.
+- `Shift-↵` reaches the program inside, when it has asked to be able to tell it
+  from `↵` — see [keys that used to be the same
+  key](#keys-that-used-to-be-the-same-key).
 - When a shell exits, the pane says so; `S` closes it, `S` again starts a fresh
   one.
 - A terminal belongs to the tab whose pane you opened it in. Switching tabs
   hides it rather than ending it, and it is still there when you come back.
+
+### Keys that used to be the same key
+
+`Shift-↵` has, for most of the history of terminals, been the same byte as `↵`.
+There was nowhere in the encoding to say which was pressed, so a program that
+wants one to send the line and the other to open a new one inside it — every
+chat-shaped prompt written in the last few years, among others — could not have
+it. The way out is the kitty keyboard protocol, and it takes agreement at both
+ends: sshman's own terminal has to be willing to tell sshman which key was
+pressed, and the program in the pane has to ask sshman for the difference.
+
+sshman does both halves. On startup it asks its own terminal for unambiguous
+keys, and takes no for an answer — a terminal that cannot do it is left exactly
+as it was. To a program in a pane it then behaves as a terminal that supports
+the protocol: it answers the query, remembers what was pushed and popped, and
+spells `Shift-↵` as `CSI 13;2u` for the program that asked. A program that
+asked for nothing gets `\r`, the way it always did, and so does every program
+in every pane when sshman's own terminal said no.
+
+It grants the one flag it can honestly honour — *disambiguate escape codes*,
+which is the one that makes `Shift-↵` a key of its own. The rest of the
+protocol asks for key **releases** and for every key as an escape code; sshman
+is not being told about releases by its own terminal, so agreeing to pass them
+on would be promising events that could never arrive. A program that asks for
+everything is told what it actually got, which is what the protocol expects a
+terminal supporting part of it to say.
+
+Ghostty, kitty, foot, WezTerm and recent Alacritty all say yes. `xterm`, the
+macOS Terminal and older builds say no, and sshman behaves there exactly as it
+did before any of this.
+
+### Which shell a pane starts
+
+Out of the box a shell pane runs `$SHELL` here and the account's login shell on
+a server, which is almost always what you want and needs no setting at all.
+When it is not — `$SHELL` is what your terminal emulator was told, and that is
+not always what you would like sshman to open — press `,`, pick **Shell**, and
+name one:
+
+```json
+// ~/.config/sshman/config.json
+{
+  "shell": "fish"
+}
+```
+
+A whole command line is allowed, so `bash --norc` and `nix develop -c fish` are
+both fine; the words after the program are its arguments. It takes for the next
+pane you open rather than for the ones already running — a shell you are in the
+middle of using is not something to restart out from under you.
+
+On a server the same name is used, **if the server has it**: sshman checks with
+`command -v` before it `exec`s, so a box that has never heard of fish leaves you
+in the login shell rather than in nothing at all. `!` — the full-screen shell —
+does the same.
+
+This is only ever the *interactive* shell in a pane. sshman's own work — listing
+a directory, unpacking an archive, running what `:` was given — keeps going
+through `$SHELL`, so naming a shell here that speaks a different language cannot
+break anything but your own prompt.
 
 ### Selecting text in a shell
 
@@ -943,6 +1016,8 @@ instead:
 │               the program e opens files with                   │
 │    Opens with \e:o {file}\r  (for your editor)                  │
 │               the keys that open {file} in an editor pane      │
+│    Shell      fish  (set here)                                 │
+│               the shell a shell pane starts                    │
 ╰────────── ↵ opens it · ←→ steps it · Del clears · Esc closes ──╯
 ```
 
@@ -1013,9 +1088,9 @@ nothing is pushed back, and a save is a save. (Sudo mode is the exception — a
 root-owned file still goes the long way round, since the shell in the pane
 cannot read it either.)
 
-sshman knows the keystrokes for vim, neovim, helix, kakoune and emacs. For any
-other editor it treats the pane as the shell prompt it is and runs your editor
-as a command, which works for anything. To spell it out yourself, press `,` and
+sshman knows the keystrokes for vim, neovim, helix, kakoune, emacs and
+textfold. For any other editor it treats the pane as the shell prompt it is and
+runs your editor as a command, which works for anything. To spell it out yourself, press `,` and
 pick **Opens with**:
 
 ```json
@@ -1030,8 +1105,10 @@ pick **Opens with**:
 editor's own command line, not a shell, and every editor escapes differently —
 a path with spaces in it wants keys of your own. `\e` is escape, `\r` a return,
 `\t` a tab and `\C-x` a control character, so vim's is `\e:e {file}\r` — escape
-first, because the editor may well be in insert mode. An empty setting means
-"run it at the prompt", where the path *is* quoted for the shell.
+first, because the editor may well be in insert mode. textfold's is `\ee{file}\r`
+with no escape in front, because its Alt-E opens a path box over whatever else
+is on its screen and there is nothing to get out of first. An empty setting
+means "run it at the prompt", where the path *is* quoted for the shell.
 
 If you quit the editor, the pane goes with it; opening the next file starts a
 fresh one on that file.

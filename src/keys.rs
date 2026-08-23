@@ -57,6 +57,7 @@ pub enum Action {
     // Panes
     Shell,
     Split,
+    SplitDown,
     NewList,
     ClosePane,
     EnterShell,
@@ -133,6 +134,7 @@ impl Action {
         Action::ListArchive,
         Action::Shell,
         Action::Split,
+        Action::SplitDown,
         Action::NewList,
         Action::ClosePane,
         Action::EnterShell,
@@ -204,6 +206,7 @@ impl Action {
             Self::ListArchive => "list-archive",
             Self::Shell => "shell",
             Self::Split => "split",
+            Self::SplitDown => "split-down",
             Self::NewList => "new-list",
             Self::ClosePane => "close-pane",
             Self::EnterShell => "enter-shell",
@@ -276,6 +279,7 @@ impl Action {
             Self::ListArchive => "show what an archive holds",
             Self::Shell => "a shell below this pane, or close the last",
             Self::Split => "a shell beside this pane",
+            Self::SplitDown => "a shell below, closing nothing",
             Self::NewList => "another file list beside this pane",
             Self::ClosePane => "close the focused pane",
             Self::EnterShell => "in and out of a shell",
@@ -348,6 +352,7 @@ impl Action {
             | Self::ListArchive => "Files",
             Self::Shell
             | Self::Split
+            | Self::SplitDown
             | Self::NewList
             | Self::ClosePane
             | Self::EnterShell
@@ -560,6 +565,7 @@ const DEFAULTS: &[(Action, &[&str])] = &[
     (Action::ListArchive, &["X"]),
     (Action::Shell, &["S"]),
     (Action::Split, &["|"]),
+    (Action::SplitDown, &["_"]),
     (Action::NewList, &["T"]),
     (Action::ClosePane, &["F9"]),
     (Action::EnterShell, &["F6"]),
