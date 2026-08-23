@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::Target;
-use crate::layout::Layout;
+use crate::layout::{Layout, TermId};
 use crate::sshconn::ConnectOpts;
 
 /// One connection inside a workspace.
@@ -35,13 +35,19 @@ pub enum Item {
         /// Ports this tab was forwarding, in the shorthand you typed.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         forwards: Vec<String>,
-        /// The pane sizes this tab was showing. Absent in workspaces saved
-        /// before sizes were remembered, which open at whatever is on screen.
+        /// The panes this tab was showing, terminals among them. Absent in
+        /// workspaces saved before panes were remembered, which open at
+        /// whatever is on screen.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         layout: Option<Layout>,
+        /// Which of those terminals were opening files rather than being
+        /// typed in. The arrangement says where the terminals were; this says
+        /// which of them was the editor.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        editors: Vec<TermId>,
     },
     /// A tab on the machine sshman is running on. There is nothing to
-    /// reconnect, so its directory and sizes are the whole of it.
+    /// reconnect, so its directory and panes are the whole of it.
     Local {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
@@ -49,6 +55,8 @@ pub enum Item {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         layout: Option<Layout>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        editors: Vec<TermId>,
     },
     Container {
         /// Container name, so it survives being recreated.
@@ -63,6 +71,8 @@ pub enum Item {
         forwards: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         layout: Option<Layout>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        editors: Vec<TermId>,
     },
 }
 
@@ -123,13 +133,22 @@ impl Item {
         }
     }
 
-    /// The pane sizes to open this tab with, if they were written down.
-    /// Read from a file, so they are clamped before anyone draws with them.
+    /// The panes to open this tab with, if they were written down. Read from
+    /// a file, so they are made sense of before anyone draws with them.
     pub fn layout(&self) -> Option<Layout> {
         match self {
             Self::Ssh { layout, .. }
             | Self::Container { layout, .. }
             | Self::Local { layout, .. } => layout.clone().map(Layout::sane),
+        }
+    }
+
+    /// Which of this tab's terminals were opening files.
+    pub fn editors(&self) -> &[TermId] {
+        match self {
+            Self::Ssh { editors, .. }
+            | Self::Container { editors, .. }
+            | Self::Local { editors, .. } => editors,
         }
     }
 
@@ -172,6 +191,11 @@ pub struct Workspace {
     /// The local pane's directory when this was saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
+    /// Which of this machine's terminals were opening files. The panes they
+    /// were in are in each tab's own arrangement, since the tabs are what
+    /// decide which of this machine's panes they show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_editors: Vec<TermId>,
     #[serde(default)]
     pub items: Vec<Item>,
     #[serde(default)]
@@ -237,12 +261,14 @@ impl Workspaces {
         &mut self,
         name: &str,
         local_path: Option<String>,
+        local_editors: Vec<TermId>,
         items: Vec<Item>,
     ) -> std::io::Result<bool> {
         let name = name.trim().to_string();
         let workspace = Workspace {
             name: name.clone(),
             local_path,
+            local_editors,
             items,
             saved_at: now(),
         };
@@ -338,6 +364,7 @@ mod tests {
             path: path.map(String::from),
             forwards: Vec::new(),
             layout: None,
+            editors: Vec::new(),
         }
     }
 
@@ -347,6 +374,7 @@ mod tests {
             path: Some("/var/log".into()),
             name: Some("logs".into()),
             layout: Some(Layout::sides(35)),
+            editors: Vec::new(),
         };
         let text = serde_json::to_string(&item).unwrap();
         let back: Item = serde_json::from_str(&text).unwrap();
@@ -368,6 +396,7 @@ mod tests {
             path: None,
             name: None,
             layout: None,
+            editors: Vec::new(),
         };
         assert_eq!(item.describe(), "this machine");
     }
@@ -391,10 +420,47 @@ mod tests {
             path: Some("/etc".into()),
             forwards: Vec::new(),
             layout: Some(arranged.clone()),
+            editors: Vec::new(),
         };
         let text = serde_json::to_string(&item).unwrap();
         let back: Item = serde_json::from_str(&text).unwrap();
         assert_eq!(back.layout(), Some(arranged));
+    }
+
+    #[test]
+    fn the_terminals_a_tab_had_are_part_of_what_is_saved() {
+        use crate::layout::{Dir, Side, Slot};
+        let mut arranged = Layout::default();
+        let shell = Slot::term(Side::Remote, 2);
+        arranged.split(Slot::files(Side::Remote), Dir::Down, shell, 70);
+
+        let item = Item::Ssh {
+            user: "me".into(),
+            host: "web01".into(),
+            port: 22,
+            key_path: None,
+            name: None,
+            path: Some("/srv".into()),
+            forwards: Vec::new(),
+            layout: Some(arranged),
+            editors: vec![2],
+        };
+        let back: Item = serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+
+        assert!(
+            back.layout().expect("the panes").contains(shell),
+            "the terminal's pane survives the round trip"
+        );
+        assert_eq!(back.editors(), [2], "and which of them opened files");
+    }
+
+    #[test]
+    fn a_workspace_from_before_terminals_were_saved_still_opens() {
+        // No editors listed at all, which is what every workspace written
+        // before this says.
+        let text = r#"{"kind": "ssh", "user": "me", "host": "web01", "port": 22}"#;
+        let item: Item = serde_json::from_str(text).expect("old items must still load");
+        assert!(item.editors().is_empty());
     }
 
     #[test]
@@ -426,6 +492,7 @@ mod tests {
             forwards: Vec::new(),
             // A hand-edited file, or one from a version that allowed more.
             layout: Some(serde_json::from_str(r#"{"split_pct": 99, "shell_height": 1}"#).unwrap()),
+            editors: Vec::new(),
         };
         let got = item.layout().unwrap();
         let area = ratatui::layout::Rect::new(0, 0, 100, 30);
@@ -440,6 +507,7 @@ mod tests {
         w.save(
             "prod",
             Some("/tmp".into()),
+            Vec::new(),
             vec![ssh_item("web01", Some("/etc"))],
         )
         .unwrap();
@@ -455,11 +523,13 @@ mod tests {
     #[test]
     fn saving_the_same_name_replaces_rather_than_duplicates() {
         let mut w = ws();
-        w.save("prod", None, vec![ssh_item("web01", None)]).unwrap();
+        w.save("prod", None, Vec::new(), vec![ssh_item("web01", None)])
+            .unwrap();
         let replaced = w
             .save(
                 "prod",
                 None,
+                Vec::new(),
                 vec![ssh_item("web02", None), ssh_item("db", None)],
             )
             .unwrap();
@@ -472,7 +542,7 @@ mod tests {
     fn entries_are_listed_alphabetically() {
         let mut w = ws();
         for name in ["staging", "Alpha", "prod"] {
-            w.save(name, None, vec![]).unwrap();
+            w.save(name, None, Vec::new(), vec![]).unwrap();
         }
         let names: Vec<&str> = w.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["Alpha", "prod", "staging"]);
@@ -489,6 +559,7 @@ mod tests {
             path: Some("/srv".into()),
             forwards: vec!["3000".into(), "8080:db:5432".into()],
             layout: None,
+            editors: Vec::new(),
         };
         match item.to_target() {
             Target::Ssh(opts) => {
@@ -519,6 +590,7 @@ mod tests {
             path: Some("/data".into()),
             forwards: Vec::new(),
             layout: None,
+            editors: Vec::new(),
         };
         match item.to_target() {
             Target::Docker {
@@ -544,6 +616,7 @@ mod tests {
             path: None,
             forwards: Vec::new(),
             layout: None,
+            editors: Vec::new(),
         };
         match item.to_target() {
             Target::Docker { via, .. } => assert!(via.is_none()),
@@ -555,7 +628,7 @@ mod tests {
     #[test]
     fn removing_is_bounds_checked() {
         let mut w = ws();
-        w.save("only", None, vec![]).unwrap();
+        w.save("only", None, Vec::new(), vec![]).unwrap();
         assert!(w.remove(5).is_none());
         assert_eq!(w.remove(0).unwrap().name, "only");
         assert!(w.is_empty());
@@ -572,6 +645,7 @@ mod tests {
                 path: Some("/data".into()),
                 forwards: vec!["9000".into()],
                 layout: None,
+                editors: Vec::new(),
             },
         ];
         let json = serde_json::to_string(&items).unwrap();
@@ -582,10 +656,16 @@ mod tests {
     #[test]
     fn summaries_read_naturally() {
         let mut w = ws();
-        w.save("a", None, vec![]).unwrap();
-        w.save("b", None, vec![ssh_item("x", None)]).unwrap();
-        w.save("c", None, vec![ssh_item("x", None), ssh_item("y", None)])
+        w.save("a", None, Vec::new(), vec![]).unwrap();
+        w.save("b", None, Vec::new(), vec![ssh_item("x", None)])
             .unwrap();
+        w.save(
+            "c",
+            None,
+            Vec::new(),
+            vec![ssh_item("x", None), ssh_item("y", None)],
+        )
+        .unwrap();
         assert_eq!(w.find("a").unwrap().summary(), "empty");
         assert_eq!(w.find("b").unwrap().summary(), "1 connection");
         assert_eq!(w.find("c").unwrap().summary(), "2 connections");

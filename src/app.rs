@@ -554,6 +554,9 @@ pub struct RemoteTab {
     /// This tab's own terminals. They go when it does — a pty on a
     /// connection that has been closed has nothing on the other end.
     pub terms: Vec<Term>,
+    /// Terminals a workspace said were editor panes, waiting to be opened.
+    /// Emptied as they are, since after that each terminal says for itself.
+    wants_editor: Vec<TermId>,
     /// Which pane had the keyboard when you last left this tab, so coming
     /// back puts you where you were. It matters most zoomed, where the
     /// focused pane is the only one you can see at all.
@@ -644,9 +647,12 @@ pub struct PendingConnect {
     pub name: Option<String>,
     /// Ports to start forwarding once this connection is up, from a workspace.
     pub forwards: Vec<String>,
-    /// Sizes for the tab this becomes: a workspace's, or the ones on screen,
-    /// so opening a server does not throw away the split you just set up.
+    /// The panes for the tab this becomes: a workspace's, or the ones on
+    /// screen, so opening a server does not throw away the split you just set
+    /// up.
     pub layout: Layout,
+    /// Which of those panes' terminals were opening files, from a workspace.
+    pub editors: Vec<TermId>,
     /// What its worker is doing, if anything. Held here rather than in a list
     /// of its own so that giving up on an attempt takes the label with it: a
     /// worker whose replies nobody is reading any more cannot leave "…" in
@@ -657,6 +663,21 @@ pub struct PendingConnect {
     initial_dir: Option<String>,
     /// Install the public key once this connection succeeds.
     install_key: bool,
+}
+
+/// A connection a workspace could not make on its own, because the only way
+/// in is a password and a workspace does not keep one.
+///
+/// Everything else the workspace asked for is kept with it, so that supplying
+/// the password picks the connection up exactly where it was left rather than
+/// opening a bare tab at a home directory.
+pub struct Waiting {
+    pub label: String,
+    pub opts: ConnectOpts,
+    path: Option<String>,
+    forwards: Vec<String>,
+    layout: Layout,
+    editors: Vec<TermId>,
 }
 
 pub struct App {
@@ -706,6 +727,8 @@ pub struct App {
     /// local file list does, so a tab you come back to still has the shell you
     /// left running in it.
     pub local_terms: Vec<Term>,
+    /// The same waiting list as a tab's, for this machine's terminals.
+    wants_editor: Vec<TermId>,
     /// The number the next terminal gets, on either machine. One counter for
     /// all of them, so a number never means two different panes.
     next_term_id: TermId,
@@ -753,7 +776,7 @@ pub struct App {
     pub forward_sel: usize,
     /// Connections from a workspace that could not be made without a
     /// password. Kept so the user is told, and so `C` can offer them.
-    pub needs_password: Vec<(String, ConnectOpts)>,
+    pub needs_password: Vec<Waiting>,
     pub output: Vec<String>,
     pub output_title: String,
     pub output_scroll: u16,
@@ -867,6 +890,7 @@ impl App {
                 cwd: local_start,
             }],
             local_terms: Vec::new(),
+            wants_editor: Vec::new(),
             next_term_id: 0,
             next_tree_id: layout::MAIN,
             previous: None,
@@ -994,6 +1018,7 @@ impl App {
     /// to clean up after itself.
     pub fn settle_focus(&mut self) {
         self.ensure_trees();
+        self.ensure_terms();
         if self.prune_layout() {
             // The tab's copy has to follow, or adopting it again would bring
             // the pane that has gone back with it.
@@ -1053,11 +1078,63 @@ impl App {
         }
     }
 
+    /// Start a terminal for every terminal pane the arrangement names and
+    /// nothing is behind.
+    ///
+    /// A workspace remembers the panes a tab had, terminals among them, and
+    /// this is what makes them come back. Nothing of the session can: a pty
+    /// whose process has ended is gone. What comes back is a fresh shell in
+    /// the same place and the same directory — the part that was yours to
+    /// arrange, rather than the shell's to remember.
+    fn ensure_terms(&mut self) {
+        for slot in self.layout.slots() {
+            let Slot::Term { host, id } = slot else {
+                continue;
+            };
+            if self.term(slot).is_some() {
+                continue;
+            }
+            // Nowhere to open a remote one until the tab has said where it is.
+            if host == Side::Remote && self.remote_cwd().is_empty() {
+                continue;
+            }
+            // Ids come from one counter, so a restored pane must not be handed
+            // a number that is already spoken for.
+            self.next_term_id = self.next_term_id.max(id);
+
+            let wanted = match host {
+                Side::Local => &mut self.wants_editor,
+                Side::Remote => match self.tabs.get_mut(self.active) {
+                    Some(tab) => &mut tab.wants_editor,
+                    None => continue,
+                },
+            };
+            let was_editor = match wanted.iter().position(|w| *w == id) {
+                Some(at) => {
+                    wanted.remove(at);
+                    true
+                }
+                None => false,
+            };
+            let (run, opens) = match was_editor {
+                true => {
+                    let program = self.editor.clone();
+                    let opens = self.config.editor_open(&program);
+                    (Some(program), Some(opens))
+                }
+                false => (None, None),
+            };
+            let here = self.main_dir(host);
+            self.open_term(host, id, here, run, opens);
+        }
+    }
+
     /// Says whether it took anything away.
     fn prune_layout(&mut self) -> bool {
         let before = self.layout.panes();
         let terms: Vec<TermId> = self.local_terms.iter().map(|t| t.id).collect();
         let trees: Vec<TreeId> = self.local.iter().map(|t| t.id).collect();
+        let waiting = self.remote_cwd().is_empty();
         let (tab_terms, tab_trees): (Vec<TermId>, Vec<TreeId>) = match self.tab() {
             Some(tab) => (
                 tab.terms.iter().map(|t| t.id).collect(),
@@ -1080,10 +1157,14 @@ impl App {
                 host: Side::Local,
                 id,
             } => terms.contains(&id),
+            // A terminal pane on a tab that has not said where it is yet is
+            // waiting to be opened, not left over from one that has gone: it
+            // is what a workspace restores, and closing it up here would take
+            // it away a frame before it could arrive.
             Slot::Term {
                 host: Side::Remote,
                 id,
-            } => tab_terms.contains(&id),
+            } => tab_terms.contains(&id) || waiting,
         });
         self.layout.panes() != before
     }
@@ -1423,10 +1504,31 @@ impl App {
         self.connect_to_inner(target, status, false)
     }
 
+    /// What a workspace was asking for when it hit a password prompt, if this
+    /// is the connection it was asking about.
+    fn waiting_for(&self, target: &Target) -> Option<&Waiting> {
+        let opts = target.ssh_opts()?;
+        self.needs_password.iter().find(|w| {
+            w.opts.user == opts.user && w.opts.host == opts.host && w.opts.port == opts.port
+        })
+    }
+
     fn connect_to_inner(&mut self, target: Target, status: String, from_form: bool) {
         if !status.is_empty() {
             self.set_status(status, Level::Info);
         }
+
+        // A workspace parks a connection it could not make without a password.
+        // Typing one in is that same connection carrying on, so it opens where
+        // the workspace said, with the panes and the ports it asked for.
+        let asked_for = self.waiting_for(&target).map(|w| {
+            (
+                w.path.clone(),
+                w.forwards.clone(),
+                w.layout.clone(),
+                w.editors.clone(),
+            )
+        });
 
         self.next_pending_id += 1;
         let (tx, rx) = crate::worker::spawn();
@@ -1442,6 +1544,7 @@ impl App {
                 .then(|| self.form.name.value.trim().to_string())
                 .filter(|n| !n.is_empty()),
             forwards: Vec::new(),
+            editors: Vec::new(),
             // The arrangement on screen, so opening a server does not throw
             // away the split you just set up — minus the panes belonging to
             // the tab you were on, whose terminals are not this one's to show.
@@ -1464,6 +1567,15 @@ impl App {
             initial_dir: self.initial_remote.clone(),
             install_key: self.form.install_key,
         });
+
+        if let Some((path, forwards, layout, editors)) = asked_for
+            && let Some(pending) = self.pending.last_mut()
+        {
+            pending.initial_dir = path.or(pending.initial_dir.take());
+            pending.forwards = forwards;
+            pending.layout = layout;
+            pending.editors = editors;
+        }
     }
 
     // ---- worker messages ---------------------------------------------------
@@ -1875,6 +1987,7 @@ impl App {
                         trees
                     },
                     terms: Vec::new(),
+                    wants_editor: pending.editors.clone(),
                     focus: Slot::files(Side::Remote),
                     layout: pending.layout.clone(),
                     task: None,
@@ -1886,10 +1999,10 @@ impl App {
                 self.form.connecting = false;
                 self.host_key_issue = None;
                 if let Some(opts) = pending.target.ssh_opts() {
-                    self.needs_password.retain(|(_, waiting)| {
-                        !(waiting.user == opts.user
-                            && waiting.host == opts.host
-                            && waiting.port == opts.port)
+                    self.needs_password.retain(|waiting| {
+                        !(waiting.opts.user == opts.user
+                            && waiting.opts.host == opts.host
+                            && waiting.opts.port == opts.port)
                     });
                 }
                 self.mode = Mode::Browse;
@@ -1933,15 +2046,22 @@ impl App {
                 auth_failed,
             } => {
                 // Retire the worker: this attempt is over either way.
-                let (from_form, target_opts, name) =
+                let (from_form, target_opts, name, asked_for) =
                     match self.pending.iter().position(|p| p.id == id) {
                         Some(position) => {
                             let pending = self.pending.remove(position);
                             let _ = pending.tx.send(Req::Quit);
+                            let asked_for = (
+                                pending.initial_dir.clone(),
+                                pending.forwards.clone(),
+                                pending.layout.clone(),
+                                pending.editors.clone(),
+                            );
                             (
                                 pending.from_form,
                                 pending.target.ssh_opts().cloned(),
                                 pending.name.clone(),
+                                asked_for,
                             )
                         }
                         None => return,
@@ -1962,13 +2082,21 @@ impl App {
                                 format!("{}@{}:{}", opts.user, opts.host, opts.port)
                             }
                         });
-                        if !self.needs_password.iter().any(|(l, _)| l == &label) {
-                            self.needs_password.push((label, opts));
+                        if !self.needs_password.iter().any(|w| w.label == label) {
+                            let (path, forwards, layout, editors) = asked_for;
+                            self.needs_password.push(Waiting {
+                                label,
+                                opts,
+                                path,
+                                forwards,
+                                layout,
+                                editors,
+                            });
                         }
                         let waiting: Vec<&str> = self
                             .needs_password
                             .iter()
-                            .map(|(l, _)| l.as_str())
+                            .map(|w| w.label.as_str())
                             .collect();
                         self.set_status(
                             format!(
@@ -4387,8 +4515,14 @@ impl App {
         let items = self.workspace_items();
         let skipped = self.tabs.len() - items.len();
         let local = Some(self.local_cwd().display().to_string());
+        let local_editors = self
+            .local_terms
+            .iter()
+            .filter(|term| term.is_editor())
+            .map(|term| term.id)
+            .collect();
 
-        match self.workspaces.save(name, local, items) {
+        match self.workspaces.save(name, local, local_editors, items) {
             Ok(replaced) => {
                 let verb = if replaced { "replaced" } else { "saved" };
                 let mut msg = format!("{verb} workspace {name}");
@@ -4419,6 +4553,9 @@ impl App {
                 self.goto_local(Slot::files(Side::Local), path);
             }
         }
+        // This machine's terminals are shared, so which of them opened files
+        // is the workspace's to say rather than any one tab's.
+        self.wants_editor = workspace.local_editors.clone();
         if workspace.items.is_empty() {
             self.set_status(
                 format!("workspace {} is empty", workspace.name),
@@ -4442,6 +4579,7 @@ impl App {
                 if let Some(layout) = layout {
                     pending.layout = layout;
                 }
+                pending.editors = item.editors().to_vec();
             }
         }
         self.initial_remote = None;
@@ -4617,7 +4755,8 @@ impl App {
     pub fn open_connect_screen(&mut self) {
         // A workspace may have left connections waiting on a password; offer
         // those first, filled in, so all that is missing is the password.
-        if let Some((label, opts)) = self.needs_password.first().cloned() {
+        if let Some(waiting) = self.needs_password.first() {
+            let (label, opts) = (waiting.label.clone(), waiting.opts.clone());
             self.opts = opts;
             self.form = ConnectForm::new(&self.opts);
             self.form.name.set(label.clone());
@@ -4769,19 +4908,31 @@ impl App {
         run: Option<String>,
         opens: Option<String>,
     ) -> Option<Slot> {
+        self.next_term_id += 1;
+        let id = self.next_term_id;
+        // A terminal opens where the pane it came from is looking, which with
+        // several file lists on one machine is the only sensible answer to
+        // "which directory".
+        let here = self.dir_of(beside);
+        self.open_term(beside.host(), id, here, run, opens)
+    }
+
+    /// The same, for a terminal whose number is already decided — one a saved
+    /// arrangement named.
+    fn open_term(
+        &mut self,
+        host: Side,
+        id: TermId,
+        here: String,
+        run: Option<String>,
+        opens: Option<String>,
+    ) -> Option<Slot> {
         // A placeholder size: the first draw calls `ensure_size` with the
         // space the pane actually got, which resizes both emulator and pty.
         const ROWS: u16 = 24;
         const COLS: u16 = 80;
 
-        let host = beside.host();
-        // A terminal opens where the pane it came from is looking, which with
-        // several file lists on one machine is the only sensible answer to
-        // "which directory".
-        let here = match self.dir_of(beside) {
-            dir if dir.is_empty() => None,
-            dir => Some(dir),
-        };
+        let here = (!here.is_empty()).then_some(here);
         let shell = match host {
             Side::Local => {
                 let cwd = here.map(PathBuf::from).unwrap_or_else(|| self.local_cwd());
@@ -4848,8 +4999,6 @@ impl App {
             }
         };
 
-        self.next_term_id += 1;
-        let id = self.next_term_id;
         self.terms_mut(host)?.push(Term { id, shell, opens });
         Some(Slot::term(host, id))
     }
@@ -5465,6 +5614,7 @@ impl App {
             sudo: false,
             trees: vec![RemoteTree::new(layout::MAIN, "/home/me".into())],
             terms: Vec::new(),
+            wants_editor: Vec::new(),
             focus: Slot::files(Side::Remote),
             layout,
             task: None,
@@ -5543,11 +5693,20 @@ fn scroll_limit(lines: usize, view_height: u16) -> u16 {
 /// be rebuilt — a container reached through another container.
 fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
     let path = Some(tab.cwd().to_string()).filter(|p| !p.is_empty());
+    // The arrangement already says where this tab's terminals were; all that
+    // is left to say is which of them opened files.
+    let editors: Vec<TermId> = tab
+        .terms
+        .iter()
+        .filter(|term| term.is_editor())
+        .map(|term| term.id)
+        .collect();
     match &tab.target {
         Target::Local => Some(WorkspaceItem::Local {
             path,
             name: tab.name.clone(),
             layout: Some(tab.layout.clone()),
+            editors,
         }),
         Target::Ssh(opts) => Some(WorkspaceItem::Ssh {
             user: opts.user.clone(),
@@ -5558,6 +5717,7 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
             path,
             forwards: saved_forwards(tab),
             layout: Some(tab.layout.clone()),
+            editors,
         }),
         Target::Docker {
             via,
@@ -5578,13 +5738,15 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
                     path: None,
                     forwards: Vec::new(),
                     // Not a tab of its own: it is how the container is
-                    // reached, so it has no panes and no sizes.
+                    // reached, so it has no panes of its own.
                     layout: None,
+                    editors: Vec::new(),
                 })
             }),
             path,
             forwards: saved_forwards(tab),
             layout: Some(tab.layout.clone()),
+            editors,
         }),
     }
 }
@@ -6324,6 +6486,123 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_pane_that_nothing_is_behind_gets_a_terminal() {
+        // What reopening a workspace does: the panes were written down, the
+        // shells that were in them were not — a pty whose process has ended
+        // cannot be. A fresh one opens in the same place.
+        let dir = scratch("restore-terms");
+        let mut app = app_in(&dir);
+        let slot = Slot::term(Side::Local, 9);
+        app.layout.split(here(), Dir::Down, slot, 70);
+
+        app.settle_focus();
+        assert_eq!(app.layout.panes(), 3, "the pane was kept, not pruned away");
+        assert!(app.term(slot).is_some(), "and there is a shell in it");
+        assert!(
+            app.next_term_id >= 9,
+            "its number is not handed out to another"
+        );
+
+        // And only once: the next frame finds it already there.
+        app.settle_focus();
+        assert_eq!(app.local_terms.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_restored_editor_pane_is_an_editor_pane_again() {
+        let dir = scratch("restore-editor");
+        let mut app = app_in(&dir);
+        let slot = Slot::term(Side::Local, 4);
+        app.layout.split(here(), Dir::Across, slot, 30);
+        // What the workspace said about this machine's terminals.
+        app.wants_editor = vec![4];
+
+        app.settle_focus();
+        assert_eq!(app.editor_pane(Side::Local), Some(slot));
+        assert!(
+            app.wants_editor.is_empty(),
+            "asked for once — after that the terminal says for itself"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_workspace_writes_down_the_panes_a_tab_had() {
+        let dir = scratch("ws-panes");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", Some(Shell::spawn_local(&dir, 24, 80)));
+        let shell = app.layout.find(Slot::is_term).expect("the tab's");
+        app.term_mut(shell).expect("just made").opens = Some(String::new());
+
+        let items = app.workspace_items();
+        assert_eq!(items.len(), 1);
+        let saved = items[0].layout().expect("the panes");
+        assert!(
+            saved.contains(shell),
+            "the terminal's pane is part of the arrangement"
+        );
+        assert_eq!(
+            items[0].editors(),
+            [shell.id()],
+            "and it is written down as the one that opens files"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_remote_terminal_waits_until_its_tab_has_somewhere_to_open_it() {
+        let dir = scratch("restore-remote");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        if let Some(tab) = app.tabs.get_mut(0) {
+            tab.trees[0].cwd.clear();
+        }
+        let slot = Slot::term(Side::Remote, 3);
+        app.layout
+            .split(Slot::files(Side::Remote), Dir::Down, slot, 70);
+
+        app.settle_focus();
+        assert!(app.term(slot).is_none(), "nowhere to open it yet");
+        assert!(
+            app.layout.contains(slot),
+            "but the pane waits rather than being closed up"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_waiting_terminal_opens_as_soon_as_its_tab_says_where_it_is() {
+        let dir = scratch("restore-remote-later");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        let slot = Slot::term(Side::Remote, 3);
+        app.layout
+            .split(Slot::files(Side::Remote), Dir::Down, slot, 70);
+        if let Some(tab) = app.tabs.get_mut(0) {
+            tab.trees[0].cwd.clear();
+        }
+        app.settle_focus();
+        assert!(app.term(slot).is_none());
+
+        // The listing arrives, and the pane that was waiting fills in.
+        if let Some(tab) = app.tabs.get_mut(0) {
+            tab.trees[0].cwd = dir.display().to_string();
+        }
+        app.settle_focus();
+        assert!(
+            app.term(slot).is_some(),
+            "the shell opened where it was left"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_new_tab_does_not_inherit_the_terminals_of_the_one_before_it() {
         let dir = scratch("no-inherit");
         let mut app = app_in(&dir);
@@ -6634,6 +6913,7 @@ mod tests {
             target: Target::Ssh(ConnectOpts::default()),
             name: None,
             forwards: Vec::new(),
+            editors: Vec::new(),
             layout: Layout::default(),
             task: None,
             tx,

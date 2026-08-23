@@ -203,7 +203,7 @@ fn draw_title_bar(f: &mut Frame, app: &mut App, area: Rect) {
         let waiting: Vec<&str> = app
             .needs_password
             .iter()
-            .map(|(label, _)| label.as_str())
+            .map(|waiting| waiting.label.as_str())
             .collect();
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -2615,8 +2615,25 @@ pub const HELP: &[(&str, &str)] = &[
     ),
     (
         "",
-        "  set, Del forgets one. Each member remembers its directory.",
+        "  set, Del forgets one. Each member remembers its directory",
     ),
+    (
+        "",
+        "  and the panes it was arranged into, terminals among them —",
+    ),
+    (
+        "",
+        "  so a tab left split with a shell opens split with a shell,",
+    ),
+    (
+        "",
+        "  and an editor pane opens as one. The session itself cannot",
+    ),
+    (
+        "",
+        "  come back: a pty whose process has ended is gone, so what",
+    ),
+    ("", "  you get is a fresh shell where the old one was."),
     ("", "  Start with `sshman -w NAME`, or list them with"),
     (
         "",

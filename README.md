@@ -474,12 +474,24 @@ and `Enter` on one to open it again.
 ╰─────────────────────────────────────────────────────────────────────╯
 ```
 
-Each member remembers **which directory it was showing** and **the pane sizes
-it was using**, so reopening puts you back where you were rather than at three
+Each member remembers **which directory it was showing** and **the panes it was
+arranged into**, so reopening puts you back where you were rather than at three
 home directories in three identical panes — and the local pane's directory is
-restored too. A workspace saved by an older version simply has no sizes in it,
+restored too. A workspace saved by an older version simply has no panes in it,
 and opens at whatever is on screen. Containers are saved by name rather than by
 the id they happened to have, so a workspace survives them being recreated.
+
+**Shells come back too.** The arrangement includes the terminal panes, so a tab
+you left split with a shell on the server opens split with a shell on the
+server, in the same place and the same directory — and a pane that was your
+[editor](#the-editor-pane) opens as an editor again. What cannot come back is
+the *session*: a pty whose process has ended is gone, so what you get is a
+fresh shell where the old one was. The part a workspace can keep is the part
+that was yours to arrange rather than the shell's to remember.
+
+A remote shell waits for its tab to say where it is before opening, so a
+workspace of five servers does not try to start shells on connections that are
+still being made.
 
 ```sh
 sshman -w morning          # open a workspace straight away
@@ -492,7 +504,9 @@ servers comes up in about the time one does.
 **Passwords are never saved** — not in workspaces, not anywhere. A server that
 can only be reached with a password therefore cannot reconnect on its own, so
 it is listed in the title bar as waiting, and `C` offers it already filled in
-with only the password missing. Servers on keys or an agent just reconnect. If
+with only the password missing. Typing one in is that same connection carrying
+on, not a new one: it opens on the directory the workspace saved, with the
+panes and the forwarded ports it asked for. Servers on keys or an agent just reconnect. If
 you want a workspace to come up untouched, tick *Install my public key* when
 you first connect.
 
