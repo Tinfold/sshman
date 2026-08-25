@@ -42,6 +42,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_title_bar(f, app, rows[0]);
     app.tab_spans.clear();
+    app.tab_close_buttons.clear();
     app.tab_bar_row = None;
     if tabs_h == 1 {
         draw_tab_bar(f, app, rows[1]);
@@ -241,11 +242,14 @@ fn draw_title_bar(f: &mut Frame, app: &mut App, area: Rect) {
 /// `‹12 `: a chevron, a count of tabs that way, and a space.
 const TAB_MARK: u16 = 5;
 
+/// `✕ `: the button that closes a tab, and the space after it.
+const TAB_CLOSE: &str = "✕ ";
+
 /// How much of a tab's name survives when there are several. Enough to tell
 /// two servers apart, and never so wide that one tab crowds the rest out.
 fn tab_title_budget(width: u16, tabs: usize) -> usize {
     (width as usize / tabs.max(1))
-        .saturating_sub(8)
+        .saturating_sub(8 + TAB_CLOSE.chars().count())
         .clamp(6, 24)
 }
 
@@ -288,6 +292,8 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     app.tab_bar_row = Some(area.y);
 
     let budget = tab_title_budget(area.width, app.tabs.len());
+    // The name, and then the button that closes it. Two spans rather than
+    // one string: the `✕` is a thing you can hit, and it is drawn as one.
     let chips: Vec<String> = app
         .tabs
         .iter()
@@ -306,9 +312,13 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
             )
         })
         .collect();
-    // Each chip carries the space that follows it, so the widths add up to
-    // what the row actually takes.
-    let widths: Vec<u16> = chips.iter().map(|c| c.chars().count() as u16 + 1).collect();
+    let close_w = TAB_CLOSE.chars().count() as u16;
+    // Each chip carries its close button and the space that follows it, so
+    // the widths add up to what the row actually takes.
+    let widths: Vec<u16> = chips
+        .iter()
+        .map(|c| c.chars().count() as u16 + close_w + 1)
+        .collect();
     let shown = tab_window(&widths, app.active, area.width);
 
     let mut spans = Vec::new();
@@ -333,11 +343,29 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Style::new().fg(theme.muted)
         };
-        let width = chips[index].chars().count() as u16;
-        spans.push(Span::styled(chips[index].clone(), style));
+        // The button keeps the chip's background so it reads as part of it,
+        // and a colour of its own so it reads as a button.
+        let close_style = match active {
+            true => Style::new().fg(theme.on_accent).bg(theme.accent),
+            false => Style::new().fg(theme.dim),
+        };
+        let dragging = app.tab_drag == Some(index);
+        let label = chips[index].chars().count() as u16;
+        spans.push(Span::styled(
+            chips[index].clone(),
+            match dragging {
+                true => style.add_modifier(Modifier::REVERSED),
+                false => style,
+            },
+        ));
+        spans.push(Span::styled(TAB_CLOSE, close_style));
         spans.push(Span::raw(" "));
-        app.tab_spans.push((x, x + width, index));
-        x += width + 1;
+        // The whole chip goes here — the close button is tested first, so
+        // the overlap costs nothing and a click anywhere else still switches.
+        app.tab_spans.push((x, x + label + close_w, index));
+        app.tab_close_buttons
+            .push((x + label, x + label + close_w, index));
+        x += label + close_w + 1;
     }
 
     if shown.end < app.tabs.len() {
@@ -351,7 +379,7 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     // The reminder of what the keys are, but only where there is room for it:
     // with the row full of tabs, the tabs are the useful half.
-    const HINT: &str = "  + or L new tab · C connect · W close · Ctrl-←/→ switch";
+    const HINT: &str = "  + new tab · ✕ or W close · Ctrl-←/→ switch · Ctrl-⇧-←/→ move";
     if x + HINT.chars().count() as u16 <= area.right() {
         spans.push(Span::styled(HINT, Style::new().fg(theme.dim)));
     }
@@ -1922,7 +1950,7 @@ fn shorten_home(path: &std::path::Path) -> String {
 
 fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
-    let rows = app.workspaces.len().max(1) as u16;
+    let rows = app.workspace_rows().max(1) as u16;
     let rect = centered(
         area,
         84,
@@ -1947,7 +1975,7 @@ fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(rect).inner(Margin::new(1, 0));
     f.render_widget(block, rect);
 
-    if app.workspaces.is_empty() {
+    if app.workspaces.is_empty() && !app.session_row() {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
@@ -1969,18 +1997,23 @@ fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .workspaces
-        .entries
+    // The session before this one sits above the saved ones: it is the entry
+    // people reach for most and the only one nobody had to think to save.
+    let listed = app
+        .previous_session
         .iter()
-        .map(|w| {
+        .map(|w| (true, w))
+        .chain(app.workspaces.entries.iter().map(|w| (false, w)));
+    let items: Vec<ListItem> = listed
+        .map(|(session, w)| {
             // The members are the point, so name them rather than just counting.
             let members: Vec<String> = w.items.iter().map(|i| i.describe()).collect();
+            let name = match session {
+                true => Style::new().fg(theme.accent).bold(),
+                false => Style::new().fg(theme.text).bold(),
+            };
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:<18} ", ellipsize(&w.name, 18)),
-                    Style::new().fg(theme.text).bold(),
-                ),
+                Span::styled(format!("{:<18} ", ellipsize(&w.name, 18)), name),
                 Span::styled(
                     format!("{:<15} ", w.summary()),
                     Style::new().fg(theme.muted),
@@ -2423,13 +2456,21 @@ pub const HELP: &[(&str, &str)] = &[
     ),
     (
         "",
-        "  Switching tabs zoomed into a shell shows the other tab's",
+        "  The zoom belongs to the tab: one left full screen on a log",
     ),
     (
         "",
-        "  shell, or its files when it has none — and coming back",
+        "  stays that way while the tab beside it stays split. Switching",
     ),
-    ("", "  puts you in the shell you left."),
+    (
+        "",
+        "  tabs zoomed into a shell shows the other tab's shell, or its",
+    ),
+    (
+        "",
+        "  files when it has none — and coming back puts you in the",
+    ),
+    ("", "  shell you left, full screen again."),
     ("Alt-Shift-↑↓←→", "move the border nearest the focused pane"),
     ("drag a border", "the same, with the mouse"),
     ("=", "even the borders up again, for the tab on screen"),
@@ -2445,12 +2486,24 @@ pub const HELP: &[(&str, &str)] = &[
     ("", ""),
     ("", "The editor pane"),
     (
+        "i",
+        "an editor pane beside this one, or close the one there is",
+    ),
+    (
         "A",
         "then Editor: a file list, your editor, a terminal below",
     ),
     (
         "",
-        "  The editor runs in a pane of its own, and clicking a file",
+        "  i is that pane on its own, for a tab you have already",
+    ),
+    (
+        "",
+        "  arranged by hand; the arrangement builds a whole tab around",
+    ),
+    (
+        "",
+        "  one. The editor runs in a pane of its own, and clicking a file",
     ),
     (
         "",
@@ -2778,25 +2831,33 @@ pub const HELP: &[(&str, &str)] = &[
     ),
     (
         "",
-        "  set, Del forgets one. Each member remembers its directory",
+        "  set, Del forgets one. Each member remembers the panes it was",
     ),
     (
         "",
-        "  and the panes it was arranged into, terminals among them —",
+        "  arranged into, terminals among them, and the directory every",
     ),
     (
         "",
-        "  so a tab left split with a shell opens split with a shell,",
+        "  one of them was pointed at — so a tab left split with a shell",
     ),
     (
         "",
-        "  and an editor pane opens as one. The session itself cannot",
+        "  in /var/log opens split with a shell in /var/log. The shells",
     ),
     (
         "",
-        "  come back: a pty whose process has ended is gone, so what",
+        "  come back running, on every tab rather than only the one you",
     ),
-    ("", "  you get is a fresh shell where the old one was."),
+    (
+        "",
+        "  look at first. The session itself cannot: a pty whose process",
+    ),
+    (
+        "",
+        "  has ended is gone, so what you get is a fresh shell where the",
+    ),
+    ("", "  old one was."),
     ("", "  Start with `sshman -w NAME`, or list them with"),
     (
         "",
@@ -2806,6 +2867,33 @@ pub const HELP: &[(&str, &str)] = &[
         "",
         "  password-only server is flagged in the title bar for C.",
     ),
+    ("", ""),
+    ("", "The last session, without saving anything"),
+    (
+        "",
+        "  sshman writes down where the session got to as you work, so",
+    ),
+    (
+        "",
+        "  it survives being closed any way at all — quit, a closed",
+    ),
+    (
+        "",
+        "  window, a machine that never woke up. `previous session` at",
+    ),
+    (
+        "",
+        "  the top of the workspace list brings it back, and so does",
+    ),
+    (
+        "",
+        "  `sshman --resume`. Del on that row forgets it. It is exactly",
+    ),
+    (
+        "",
+        "  a workspace you never had to name, and holds no more than one",
+    ),
+    ("", "  does — no passwords, and no shell history."),
     ("", ""),
     ("", "Servers and tabs"),
     ("C", "the connection screen: a saved server or a new one"),
@@ -2818,7 +2906,13 @@ pub const HELP: &[(&str, &str)] = &[
         "W",
         "close the tab on screen (ends that session and its shell)",
     ),
+    ("✕", "the same for any tab, clicked on its own chip"),
     ("Ctrl-← / Ctrl-→", "move between tabs"),
+    (
+        "Ctrl-⇧-← / →",
+        "move this tab along the row, wrapping at the ends",
+    ),
+    ("drag", "the same with the mouse: take a chip and let go"),
     ("Alt-1 … Alt-9", "jump straight to a tab"),
     (
         "",
@@ -2867,7 +2961,19 @@ pub const HELP: &[(&str, &str)] = &[
         "  picks one, Enter connects, Del forgets. Passwords are",
     ),
     ("", "  never saved."),
-    ("q / Ctrl-C", "quit"),
+    (
+        "q / Ctrl-C",
+        "quit — it asks first, and the same key again is yes",
+    ),
+    (
+        "",
+        "  Everything open goes with it, so the second press is the",
+    ),
+    (
+        "",
+        "  answer to the first. What was open is written down either",
+    ),
+    ("", "  way: `sshman --resume` brings it back."),
 ];
 
 // ---- geometry --------------------------------------------------------------
@@ -3339,6 +3445,51 @@ mod tests {
         // Every chip on the row can be clicked, including the marks.
         assert!(app.tab_spans.iter().any(|(_, _, i)| *i == 3));
         for (start, end, _) in &app.tab_spans {
+            assert!(*end <= 60 && start < end, "{start}..{end}");
+        }
+    }
+
+    #[test]
+    fn every_tab_offers_a_way_to_close_it_where_it_says_it_does() {
+        let (app, rows) = frame(110, 20, |app| {
+            for host in ["alpha", "bravo"] {
+                app.fake_tab(host);
+            }
+        });
+        assert_eq!(app.tab_close_buttons.len(), 2, "one per tab on the row");
+        for (start, end, index) in &app.tab_close_buttons {
+            let drawn: String = rows[1]
+                .chars()
+                .skip(*start as usize)
+                .take((end - start) as usize)
+                .collect();
+            assert!(drawn.starts_with('✕'), "tab {index}: {drawn:?}");
+            // It sits inside the chip it belongs to, which is what makes the
+            // rest of the chip still mean "go here".
+            let chip = app
+                .tab_spans
+                .iter()
+                .find(|(_, _, i)| i == index)
+                .expect("the chip it belongs to");
+            assert!(
+                chip.0 <= *start && *end <= chip.1,
+                "{chip:?} vs {start}..{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_row_of_tabs_is_not_wider_than_the_screen_once_they_carry_buttons() {
+        let (app, _) = frame(60, 20, |app| {
+            for host in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] {
+                app.fake_tab(host);
+            }
+            app.goto_tab(3);
+        });
+        for (start, end, _) in &app.tab_spans {
+            assert!(*end <= 60 && start < end, "{start}..{end}");
+        }
+        for (start, end, _) in &app.tab_close_buttons {
             assert!(*end <= 60 && start < end, "{start}..{end}");
         }
     }

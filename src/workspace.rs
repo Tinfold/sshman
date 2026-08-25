@@ -17,6 +17,54 @@ use crate::backend::Target;
 use crate::layout::{Layout, TermId};
 use crate::sshconn::ConnectOpts;
 
+/// Where one pane was pointed, by the number the arrangement calls it.
+///
+/// The arrangement says where a pane was on screen; this says what it was
+/// showing, which is the other half of putting a tab back the way it was.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PaneDir {
+    pub id: u32,
+    pub path: String,
+}
+
+/// The directories a tab's panes were in.
+///
+/// File lists and terminals are numbered separately, so they are listed
+/// separately. The first file list is also written down as the tab's `path`,
+/// which is what a workspace saved before this said and what everything that
+/// means "this tab's directory" still reads.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaneDirs {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trees: Vec<PaneDir>,
+    /// Where each terminal was when the workspace was saved — as well as that
+    /// could be known. See [`crate::shell::Shell::cwd`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shells: Vec<PaneDir>,
+}
+
+impl PaneDirs {
+    pub fn is_empty(&self) -> bool {
+        self.trees.is_empty() && self.shells.is_empty()
+    }
+
+    /// The directory a file list was in, if it was written down.
+    pub fn tree(&self, id: u32) -> Option<&str> {
+        self.trees
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.path.as_str())
+    }
+
+    /// The same for a terminal.
+    pub fn shell(&self, id: u32) -> Option<&str> {
+        self.shells
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.path.as_str())
+    }
+}
+
 /// One connection inside a workspace.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -45,6 +93,9 @@ pub enum Item {
         /// which of them was the editor.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         editors: Vec<TermId>,
+        /// What each of those panes was showing.
+        #[serde(default, skip_serializing_if = "PaneDirs::is_empty")]
+        dirs: PaneDirs,
     },
     /// A tab on the machine sshman is running on. There is nothing to
     /// reconnect, so its directory and panes are the whole of it.
@@ -57,6 +108,8 @@ pub enum Item {
         layout: Option<Layout>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         editors: Vec<TermId>,
+        #[serde(default, skip_serializing_if = "PaneDirs::is_empty")]
+        dirs: PaneDirs,
     },
     Container {
         /// Container name, so it survives being recreated.
@@ -73,6 +126,8 @@ pub enum Item {
         layout: Option<Layout>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         editors: Vec<TermId>,
+        #[serde(default, skip_serializing_if = "PaneDirs::is_empty")]
+        dirs: PaneDirs,
     },
 }
 
@@ -143,6 +198,17 @@ impl Item {
         }
     }
 
+    /// What each of this tab's panes was showing. Empty for a workspace saved
+    /// before panes said where they were, which opens them all in the tab's
+    /// own directory the way it always did.
+    pub fn dirs(&self) -> &PaneDirs {
+        match self {
+            Self::Ssh { dirs, .. } | Self::Container { dirs, .. } | Self::Local { dirs, .. } => {
+                dirs
+            }
+        }
+    }
+
     /// Which of this tab's terminals were opening files.
     pub fn editors(&self) -> &[TermId] {
         match self {
@@ -196,6 +262,11 @@ pub struct Workspace {
     /// decide which of this machine's panes they show.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_editors: Vec<TermId>,
+    /// What this machine's panes were showing. Shared between the tabs the
+    /// same way the panes themselves are, so it belongs to the workspace
+    /// rather than to any one of them.
+    #[serde(default, skip_serializing_if = "PaneDirs::is_empty")]
+    pub local_dirs: PaneDirs,
     #[serde(default)]
     pub items: Vec<Item>,
     #[serde(default)]
@@ -209,6 +280,63 @@ impl Workspace {
             1 => "1 connection".into(),
             n => format!("{n} connections"),
         }
+    }
+}
+
+/// What a workspace holding the last session is called, wherever one is
+/// listed or reported.
+pub const SESSION_NAME: &str = "previous session";
+
+/// The session as it was last seen, kept so it can be opened again.
+///
+/// The same shape as a workspace — the same tabs, the same panes, the same
+/// directories — but written down without being asked for. Quitting is not
+/// the only way sshman stops, and a crash or a closed terminal gives no
+/// chance to write anything, so this is not saved on the way out: it is kept
+/// up to date as you work, and whatever is on disk when the process ends is
+/// what comes back.
+///
+/// It lives in a file of its own rather than among the workspaces, so that a
+/// list you curated is never rearranged by something you did not ask for.
+pub struct Session;
+
+impl Session {
+    /// The session sshman was in last time, if there was one.
+    pub fn load() -> Option<Workspace> {
+        let text = std::fs::read_to_string(Self::path()?).ok()?;
+        let mut workspace: Workspace = serde_json::from_str(&text).ok()?;
+        workspace.name = SESSION_NAME.to_string();
+        Some(workspace)
+    }
+
+    /// Write down where things stand. Called as the session changes rather
+    /// than as it ends.
+    pub fn save(workspace: &Workspace) -> std::io::Result<()> {
+        let Some(path) = Self::path() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(workspace)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // Written beside then renamed, so a session ending mid-write cannot
+        // leave half a file to come back to.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        restrict_permissions(&tmp);
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Throw away what was kept.
+    pub fn forget() {
+        if let Some(path) = Self::path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    fn path() -> Option<PathBuf> {
+        Some(config_dir()?.join("session.json"))
     }
 }
 
@@ -262,6 +390,7 @@ impl Workspaces {
         name: &str,
         local_path: Option<String>,
         local_editors: Vec<TermId>,
+        local_dirs: PaneDirs,
         items: Vec<Item>,
     ) -> std::io::Result<bool> {
         let name = name.trim().to_string();
@@ -269,6 +398,7 @@ impl Workspaces {
             name: name.clone(),
             local_path,
             local_editors,
+            local_dirs,
             items,
             saved_at: now(),
         };
@@ -320,11 +450,16 @@ impl Workspaces {
 }
 
 fn workspaces_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("workspaces.json"))
+}
+
+/// Where everything sshman remembers between sessions lives.
+fn config_dir() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => dirs::home_dir()?.join(".config"),
     };
-    Some(base.join("sshman").join("workspaces.json"))
+    Some(base.join("sshman"))
 }
 
 #[cfg(unix)]
@@ -336,7 +471,8 @@ fn restrict_permissions(path: &std::path::Path) {
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &std::path::Path) {}
 
-fn now() -> i64 {
+/// Seconds since the epoch, for saying when something was written down.
+pub fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -365,6 +501,7 @@ mod tests {
             forwards: Vec::new(),
             layout: None,
             editors: Vec::new(),
+            dirs: PaneDirs::default(),
         }
     }
 
@@ -375,6 +512,7 @@ mod tests {
             name: Some("logs".into()),
             layout: Some(Layout::sides(35)),
             editors: Vec::new(),
+            dirs: PaneDirs::default(),
         };
         let text = serde_json::to_string(&item).unwrap();
         let back: Item = serde_json::from_str(&text).unwrap();
@@ -397,6 +535,7 @@ mod tests {
             name: None,
             layout: None,
             editors: Vec::new(),
+            dirs: PaneDirs::default(),
         };
         assert_eq!(item.describe(), "this machine");
     }
@@ -421,6 +560,7 @@ mod tests {
             forwards: Vec::new(),
             layout: Some(arranged.clone()),
             editors: Vec::new(),
+            dirs: PaneDirs::default(),
         };
         let text = serde_json::to_string(&item).unwrap();
         let back: Item = serde_json::from_str(&text).unwrap();
@@ -444,6 +584,7 @@ mod tests {
             forwards: Vec::new(),
             layout: Some(arranged),
             editors: vec![2],
+            dirs: PaneDirs::default(),
         };
         let back: Item = serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
 
@@ -452,6 +593,81 @@ mod tests {
             "the terminal's pane survives the round trip"
         );
         assert_eq!(back.editors(), [2], "and which of them opened files");
+    }
+
+    #[test]
+    fn where_every_pane_was_pointed_survives_the_round_trip() {
+        let item = Item::Ssh {
+            user: "me".into(),
+            host: "web01".into(),
+            port: 22,
+            key_path: None,
+            name: None,
+            path: Some("/srv".into()),
+            forwards: Vec::new(),
+            layout: None,
+            editors: Vec::new(),
+            dirs: PaneDirs {
+                trees: vec![
+                    PaneDir {
+                        id: 0,
+                        path: "/srv".into(),
+                    },
+                    PaneDir {
+                        id: 4,
+                        path: "/var/log".into(),
+                    },
+                ],
+                shells: vec![PaneDir {
+                    id: 2,
+                    path: "/etc/nginx".into(),
+                }],
+            },
+        };
+        let back: Item = serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        assert_eq!(back.dirs().tree(0), Some("/srv"));
+        assert_eq!(back.dirs().tree(4), Some("/var/log"));
+        assert_eq!(back.dirs().shell(2), Some("/etc/nginx"));
+        assert_eq!(back.dirs().tree(2), None, "the two are numbered apart");
+        assert_eq!(back.dirs().shell(9), None);
+    }
+
+    #[test]
+    fn a_workspace_from_before_panes_said_where_they_were_still_opens() {
+        let text = r#"{"kind": "ssh", "user": "me", "host": "web01", "port": 22,
+                       "path": "/srv"}"#;
+        let item: Item = serde_json::from_str(text).expect("old items must still load");
+        assert!(item.dirs().is_empty());
+        assert_eq!(
+            item.dirs().tree(0),
+            None,
+            "so every pane opens at the tab's own directory, as it always did"
+        );
+        assert_eq!(item.path(), Some("/srv"));
+    }
+
+    #[test]
+    fn the_last_session_is_kept_apart_from_the_saved_ones() {
+        // It is a workspace in every other way, so it must read as one.
+        let session = Workspace {
+            name: SESSION_NAME.into(),
+            local_path: Some("/tmp".into()),
+            local_editors: Vec::new(),
+            local_dirs: PaneDirs {
+                trees: vec![PaneDir {
+                    id: 0,
+                    path: "/tmp".into(),
+                }],
+                shells: Vec::new(),
+            },
+            items: vec![ssh_item("web01", Some("/etc"))],
+            saved_at: now(),
+        };
+        let back: Workspace =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!(back.name, SESSION_NAME);
+        assert_eq!(back.items[0].path(), Some("/etc"));
+        assert_eq!(back.local_dirs.tree(0), Some("/tmp"));
     }
 
     #[test]
@@ -493,6 +709,7 @@ mod tests {
             // A hand-edited file, or one from a version that allowed more.
             layout: Some(serde_json::from_str(r#"{"split_pct": 99, "shell_height": 1}"#).unwrap()),
             editors: Vec::new(),
+            dirs: PaneDirs::default(),
         };
         let got = item.layout().unwrap();
         let area = ratatui::layout::Rect::new(0, 0, 100, 30);
@@ -508,6 +725,7 @@ mod tests {
             "prod",
             Some("/tmp".into()),
             Vec::new(),
+            PaneDirs::default(),
             vec![ssh_item("web01", Some("/etc"))],
         )
         .unwrap();
@@ -523,13 +741,20 @@ mod tests {
     #[test]
     fn saving_the_same_name_replaces_rather_than_duplicates() {
         let mut w = ws();
-        w.save("prod", None, Vec::new(), vec![ssh_item("web01", None)])
-            .unwrap();
+        w.save(
+            "prod",
+            None,
+            Vec::new(),
+            PaneDirs::default(),
+            vec![ssh_item("web01", None)],
+        )
+        .unwrap();
         let replaced = w
             .save(
                 "prod",
                 None,
                 Vec::new(),
+                PaneDirs::default(),
                 vec![ssh_item("web02", None), ssh_item("db", None)],
             )
             .unwrap();
@@ -542,7 +767,8 @@ mod tests {
     fn entries_are_listed_alphabetically() {
         let mut w = ws();
         for name in ["staging", "Alpha", "prod"] {
-            w.save(name, None, Vec::new(), vec![]).unwrap();
+            w.save(name, None, Vec::new(), PaneDirs::default(), vec![])
+                .unwrap();
         }
         let names: Vec<&str> = w.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["Alpha", "prod", "staging"]);
@@ -560,6 +786,7 @@ mod tests {
             forwards: vec!["3000".into(), "8080:db:5432".into()],
             layout: None,
             editors: Vec::new(),
+            dirs: PaneDirs::default(),
         };
         match item.to_target() {
             Target::Ssh(opts) => {
@@ -591,6 +818,7 @@ mod tests {
             forwards: Vec::new(),
             layout: None,
             editors: Vec::new(),
+            dirs: PaneDirs::default(),
         };
         match item.to_target() {
             Target::Docker {
@@ -617,6 +845,7 @@ mod tests {
             forwards: Vec::new(),
             layout: None,
             editors: Vec::new(),
+            dirs: PaneDirs::default(),
         };
         match item.to_target() {
             Target::Docker { via, .. } => assert!(via.is_none()),
@@ -628,7 +857,8 @@ mod tests {
     #[test]
     fn removing_is_bounds_checked() {
         let mut w = ws();
-        w.save("only", None, Vec::new(), vec![]).unwrap();
+        w.save("only", None, Vec::new(), PaneDirs::default(), vec![])
+            .unwrap();
         assert!(w.remove(5).is_none());
         assert_eq!(w.remove(0).unwrap().name, "only");
         assert!(w.is_empty());
@@ -646,6 +876,7 @@ mod tests {
                 forwards: vec!["9000".into()],
                 layout: None,
                 editors: Vec::new(),
+                dirs: PaneDirs::default(),
             },
         ];
         let json = serde_json::to_string(&items).unwrap();
@@ -656,13 +887,21 @@ mod tests {
     #[test]
     fn summaries_read_naturally() {
         let mut w = ws();
-        w.save("a", None, Vec::new(), vec![]).unwrap();
-        w.save("b", None, Vec::new(), vec![ssh_item("x", None)])
+        w.save("a", None, Vec::new(), PaneDirs::default(), vec![])
             .unwrap();
+        w.save(
+            "b",
+            None,
+            Vec::new(),
+            PaneDirs::default(),
+            vec![ssh_item("x", None)],
+        )
+        .unwrap();
         w.save(
             "c",
             None,
             Vec::new(),
+            PaneDirs::default(),
             vec![ssh_item("x", None), ssh_item("y", None)],
         )
         .unwrap();

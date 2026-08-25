@@ -114,6 +114,12 @@ struct Args {
     #[arg(short = 'w', long, value_name = "NAME")]
     workspace: Option<String>,
 
+    /// Reopen whatever was open last time: the same servers, panes and
+    /// directories. sshman writes this down as you go, so it survives being
+    /// closed any way at all.
+    #[arg(short = 'r', long)]
+    resume: bool,
+
     /// List saved workspaces and exit
     #[arg(long)]
     list_workspaces: bool,
@@ -138,6 +144,17 @@ fn main() -> Result<()> {
             let members: Vec<String> = w.items.iter().map(|i| i.describe()).collect();
             println!("{:<20} {:<16} {}", w.name, w.summary(), members.join(", "));
         }
+        // Not a workspace, but the thing most people are looking for when
+        // they run this, and `--resume` is how it opens.
+        if let Some(session) = workspace::Session::load().filter(|s| !s.items.is_empty()) {
+            let members: Vec<String> = session.items.iter().map(|i| i.describe()).collect();
+            println!(
+                "\n{:<20} {:<16} {}   (sshman --resume)",
+                session.name,
+                session.summary(),
+                members.join(", ")
+            );
+        }
         return Ok(());
     }
 
@@ -148,13 +165,20 @@ fn main() -> Result<()> {
     };
 
     // A named workspace takes over from the connection screen: it already
-    // says what to connect to.
-    let requested = match &args.workspace {
-        Some(name) => match workspace::Workspaces::load().find(name).cloned() {
+    // says what to connect to. So does `--resume`, which is the same thing
+    // asked of the session that wrote itself down.
+    let requested = match (&args.workspace, args.resume) {
+        (Some(name), _) => match workspace::Workspaces::load().find(name).cloned() {
             Some(found) => Some(found),
             None => anyhow::bail!("no workspace called {name:?} — see `sshman --list-workspaces`"),
         },
-        None => None,
+        (None, true) => match workspace::Session::load().filter(|s| !s.items.is_empty()) {
+            Some(session) => Some(session),
+            None => anyhow::bail!(
+                "nothing to resume — no session has been recorded on this machine yet"
+            ),
+        },
+        (None, false) => None,
     };
 
     let mut app = App::new(
@@ -301,7 +325,12 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
         //    sshman being the one to change it.
         app.watch_dirs();
 
-        // 3. Anything that needs the terminal to itself.
+        // 3. Keep the record of where this session got to close to true.
+        //    There is no "on the way out" to do this in: a terminal window
+        //    closed on sshman never comes back here at all.
+        app.cache_session();
+
+        // 4. Anything that needs the terminal to itself.
         if let Some(action) = app.pending_action.take() {
             match action {
                 UiAction::Quit => return Ok(()),
@@ -346,10 +375,10 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
             continue;
         }
 
-        // 4. Draw.
+        // 5. Draw.
         terminal.draw(|f| ui::draw(f, app))?;
 
-        // 5. Wait briefly for input. The timeout is what lets worker messages
+        // 6. Wait briefly for input. The timeout is what lets worker messages
         //    and progress updates surface without any input at all.
         if event::poll(Duration::from_millis(60))? {
             match event::read()? {
@@ -374,6 +403,33 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
         if app.should_quit {
             return Ok(());
         }
+    }
+}
+
+/// Follow a tab being dragged along the row: as the pointer crosses into a
+/// neighbour's chip, the two change places, so what you see under the pointer
+/// is where the tab will be when you let go.
+fn drag_tab_to(app: &mut App, column: u16, row: u16) {
+    let Some(from) = app.tab_drag else { return };
+    if Some(row) != app.tab_bar_row {
+        return;
+    }
+    let Some((_, _, over)) = app
+        .tab_spans
+        .iter()
+        .find(|(start, end, _)| column >= *start && column < *end)
+        .copied()
+    else {
+        return;
+    };
+    // The chevrons at either end stand for the tab just off screen that way,
+    // so dragging on to one carries this tab past the edge of the row.
+    if app.move_tab_to(from, over) {
+        app.tab_drag = Some(over);
+        app.set_status(
+            format!("moved to {}/{}", over + 1, app.tabs.len()),
+            app::Level::Info,
+        );
     }
 }
 
@@ -428,6 +484,19 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 app.move_over = app.areas.at(m.column, m.row);
             }
             MouseEventKind::Up(MouseButton::Left) => app.drop_moved_pane(),
+            _ => {}
+        }
+        return;
+    }
+
+    // A tab being dragged along the row owns the mouse until the button comes
+    // back up, so that a pointer wandering off the row does not drop it.
+    if app.tab_drag.is_some() {
+        match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                drag_tab_to(app, m.column, m.row)
+            }
+            MouseEventKind::Up(MouseButton::Left) => app.tab_drag = None,
             _ => {}
         }
         return;
@@ -517,14 +586,30 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
 
     // The tab bar, when there is one.
     if Some(m.row) == app.tab_bar_row {
-        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some((_, _, index)) = app
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            // The `✕` first: it sits inside the chip it belongs to, and a
+            // click on it is never a click on the rest of the chip.
+            if let Some((_, _, index)) = app
+                .tab_close_buttons
+                .iter()
+                .find(|(start, end, _)| m.column >= *start && m.column < *end)
+                .copied()
+            {
+                app.close_tab_at(index);
+                return;
+            }
+            if let Some((_, _, index)) = app
                 .tab_spans
                 .iter()
                 .find(|(start, end, _)| m.column >= *start && m.column < *end)
                 .copied()
-        {
-            app.goto_tab(index);
+            {
+                app.goto_tab(index);
+                // Held down, the chip comes with the pointer. A press that
+                // never moves is just the switch above, so nothing is said
+                // about moving until something actually does.
+                app.tab_drag = Some(app.active);
+            }
         }
         return;
     }

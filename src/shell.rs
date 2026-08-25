@@ -20,7 +20,7 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -114,6 +114,20 @@ pub struct Shell {
     /// way. Shared with the thread reading that program's output, which is
     /// where the asking is noticed.
     kitty: Arc<Mutex<KittyKeys>>,
+    /// What the program inside has let slip about where it is. Shared with
+    /// the thread reading that program's output, which is where it is heard.
+    /// See [`Shell::cwd`].
+    reported_cwd: Arc<Mutex<Reported>>,
+    /// The home directory on the machine this shell is on, so that a shell
+    /// reporting `~/work` can be taken to mean somewhere in particular.
+    home: Option<String>,
+    /// The process id of a shell on this machine, once it has one. Zero means
+    /// there is none to ask — a remote shell, or one inside a container,
+    /// where the process on this end is only the pipe to it.
+    pid: Arc<AtomicU32>,
+    /// The directory this shell was started in, which is what its directory
+    /// is until something says otherwise.
+    start_dir: Option<String>,
     pub label: String,
 }
 
@@ -134,6 +148,10 @@ impl Shell {
             scrollback: 0,
             selection: None,
             kitty: Arc::new(Mutex::new(KittyKeys::default())),
+            reported_cwd: Arc::new(Mutex::new(Reported::default())),
+            pid: Arc::new(AtomicU32::new(0)),
+            home: None,
+            start_dir: None,
             label,
         };
         let parser_for_thread = Arc::clone(&parser);
@@ -170,9 +188,19 @@ impl Shell {
         rows: u16,
         cols: u16,
     ) -> Self {
-        let (shell, rx, parser) = Self::new(label, rows, cols);
+        let (mut shell, rx, parser) = Self::new(label, rows, cols);
+        shell.start_dir = Some(cwd.display().to_string());
+        shell.home = dirs::home_dir().map(|home| home.display().to_string());
         let alive = Arc::clone(&shell.alive);
         let kitty = Arc::clone(&shell.kitty);
+        let reported = Arc::clone(&shell.reported_cwd);
+        // A shell of your own can be asked where it is directly; a command we
+        // composed — `docker exec`, an editor — is a process whose directory
+        // says nothing about the pane, so it is not asked.
+        let pid = match command {
+            None => Arc::clone(&shell.pid),
+            Some(_) => Arc::new(AtomicU32::new(0)),
+        };
         let tx = shell.tx.clone();
         let cwd = cwd.to_path_buf();
         thread::Builder::new()
@@ -184,6 +212,8 @@ impl Shell {
                     tx: &tx,
                     alive: &alive,
                     kitty: &kitty,
+                    cwd: &reported,
+                    pid: &pid,
                 };
                 if let Err(e) = run_local(&cwd, command, rows, cols, &wiring) {
                     write_notice(&parser, &format!("could not start a shell: {e}"));
@@ -196,14 +226,26 @@ impl Shell {
     }
 
     /// A shell on the server, on a connection of its own, starting in `cwd`.
-    pub fn spawn_remote(opts: &ConnectOpts, cwd: &str, rows: u16, cols: u16) -> Self {
-        Self::spawn_remote_inner(
+    ///
+    /// `home` is that user's home directory on that server, which the tab
+    /// already knows from logging in. It is only ever used to make sense of a
+    /// shell that says it is in `~`.
+    pub fn spawn_remote(
+        opts: &ConnectOpts,
+        cwd: &str,
+        home: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        let mut shell = Self::spawn_remote_inner(
             format!("{}@{}", opts.user, opts.host),
             opts,
             RemoteLaunch::LoginShell(cwd.to_string()),
             rows,
             cols,
-        )
+        );
+        shell.home = home.map(str::to_string);
+        shell
     }
 
     /// A shell inside a container on a server: the same SSH connection of its
@@ -225,9 +267,16 @@ impl Shell {
         rows: u16,
         cols: u16,
     ) -> Self {
-        let (shell, rx, parser) = Self::new(label, rows, cols);
+        let (mut shell, rx, parser) = Self::new(label, rows, cols);
+        if let RemoteLaunch::LoginShell(cwd) = &launch {
+            shell.start_dir = Some(cwd.clone());
+        }
         let alive = Arc::clone(&shell.alive);
         let kitty = Arc::clone(&shell.kitty);
+        let reported = Arc::clone(&shell.reported_cwd);
+        // Nothing on this machine to ask: the process at this end is the SSH
+        // session, not the shell.
+        let pid = Arc::new(AtomicU32::new(0));
         let tx = shell.tx.clone();
         let opts = opts.clone();
         write_notice(&parser, &format!("connecting to {}…", opts.host));
@@ -240,6 +289,8 @@ impl Shell {
                     tx: &tx,
                     alive: &alive,
                     kitty: &kitty,
+                    cwd: &reported,
+                    pid: &pid,
                 };
                 if let Err(e) = run_remote(&opts, launch, rows, cols, &wiring) {
                     write_notice(&parser, &format!("shell connection failed: {e}"));
@@ -253,6 +304,58 @@ impl Shell {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Where this shell is now, as well as it can be known.
+    ///
+    /// A pty carries characters, not state, so nothing here can simply be
+    /// read off. There are three ways to find out, in the order they are
+    /// trusted:
+    ///
+    /// 1. Ask the kernel which directory the process is in. Exact, and only
+    ///    possible for a shell running on this machine.
+    /// 2. `OSC 7`, the sequence whose whole meaning is "I am in this
+    ///    directory". Exact wherever it arrives, but many shells never send
+    ///    it unless their prompt has been set up to.
+    /// 3. The window title, which most shells do set from their prompt and
+    ///    which conventionally reads `user@host: directory`. A guess — a
+    ///    title is the shell's to write, not a promise — so it is only read
+    ///    when it takes that shape exactly, and never over either of the
+    ///    above.
+    ///
+    /// Failing all three, the directory the shell was started in, which is
+    /// still the right answer for a shell nobody has `cd`-ed anywhere.
+    pub fn cwd(&self) -> Option<String> {
+        let pid = self.pid.load(Ordering::Relaxed);
+        if pid != 0
+            && let Some(dir) = cwd_of_process(pid)
+        {
+            return Some(dir);
+        }
+        let reported = self
+            .reported_cwd
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        reported
+            .exact
+            .or_else(|| reported.from_title.and_then(|dir| self.at_home(&dir)))
+            .or_else(|| self.start_dir.clone())
+    }
+
+    /// Turn a directory a shell named into one anything else could use: the
+    /// `~` a prompt writes is only a path once you know whose home it is.
+    fn at_home(&self, dir: &str) -> Option<String> {
+        if let Some(rest) = dir.strip_prefix('~') {
+            let home = self.home.as_deref()?;
+            return match rest.strip_prefix('/') {
+                Some(under) => Some(format!("{}/{under}", home.trim_end_matches('/'))),
+                None if rest.is_empty() => Some(home.to_string()),
+                // `~someone-else` is a home we have no way to find.
+                None => None,
+            };
+        }
+        dir.starts_with('/').then(|| dir.to_string())
     }
 
     /// Render with the parser locked. The vt100 screen borrows the parser, so
@@ -626,6 +729,10 @@ struct Hvp {
     kitty: Arc<Mutex<KittyKeys>>,
     /// What that conversation owes the program, waiting to be written back.
     replies: Vec<u8>,
+    /// Listens for the shell saying where it is. Unlike the keyboard
+    /// conversation this only watches: what it hears goes to the screen
+    /// untouched, because it is the terminal's business as well as ours.
+    osc: OscWatch,
 }
 
 /// Longer than any real CSI sequence. Past this we are not looking at one,
@@ -633,15 +740,17 @@ struct Hvp {
 const MAX_CSI: usize = 64;
 
 impl Hvp {
-    fn new(kitty: Arc<Mutex<KittyKeys>>) -> Self {
+    fn new(kitty: Arc<Mutex<KittyKeys>>, cwd: Arc<Mutex<Reported>>) -> Self {
         Self {
             partial: Vec::new(),
             kitty,
             replies: Vec::new(),
+            osc: OscWatch::new(cwd),
         }
     }
 
     fn rewrite(&mut self, input: &[u8]) -> Vec<u8> {
+        self.osc.feed(input);
         let mut out = Vec::with_capacity(input.len() + self.partial.len());
         for &byte in input {
             if self.partial.is_empty() {
@@ -693,6 +802,196 @@ impl Hvp {
     }
 }
 
+// ---- where the shell is ----------------------------------------------------
+
+/// The most an OSC payload may run to before we stop keeping it. Paths are
+/// well under this; a clipboard sequence is not, and is none of our business.
+const MAX_OSC: usize = 4096;
+
+/// What a shell has let slip about where it is. See [`Shell::cwd`], which
+/// decides what to make of it.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+struct Reported {
+    /// From `OSC 7`, whose whole meaning is this and nothing else.
+    exact: Option<String>,
+    /// Read out of the window title, which is a guess. Kept as the shell
+    /// wrote it, `~` and all.
+    from_title: Option<String>,
+}
+
+/// Watches the stream for a shell saying which directory it is in.
+///
+/// A pane is a pty, and a pty carries characters rather than state, so the
+/// only way to know is to hear the shell mention it. Two things do:
+/// `ESC ] 7 ; file://host/path ST`, which means exactly that, and the window
+/// title, which most shells set from their prompt and which conventionally
+/// reads `user@host: directory`. Neither is required of anyone, so what this
+/// hears is a bonus on top of the directory the shell was started in rather
+/// than a replacement for it.
+///
+/// It only listens. Every byte it sees has already been passed on to the
+/// screen, since a terminal has its own uses for the same sequences.
+struct OscWatch {
+    /// The payload of an OSC sequence as it arrives; `None` between them.
+    partial: Option<Vec<u8>>,
+    /// The last byte was `ESC`, which is half of both the opening `ESC ]` and
+    /// the closing `ESC \`.
+    esc: bool,
+    cwd: Arc<Mutex<Reported>>,
+}
+
+impl OscWatch {
+    fn new(cwd: Arc<Mutex<Reported>>) -> Self {
+        Self {
+            partial: None,
+            esc: false,
+            cwd,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            match &mut self.partial {
+                None => {
+                    if self.esc && byte == b']' {
+                        self.partial = Some(Vec::new());
+                    }
+                    self.esc = byte == 0x1b;
+                }
+                Some(buf) => {
+                    // Either terminator ends it: a BEL, or the `ESC \` whose
+                    // ESC is already sitting on the end of the payload.
+                    let st = self.esc && byte == b'\\';
+                    if byte == 0x07 || st {
+                        if st && buf.last() == Some(&0x1b) {
+                            buf.pop();
+                        }
+                        let payload = std::mem::take(buf);
+                        self.partial = None;
+                        self.esc = false;
+                        self.note(&payload);
+                        continue;
+                    }
+                    self.esc = byte == 0x1b;
+                    if buf.len() >= MAX_OSC {
+                        // Far too long to be a path. Whatever this is, it is
+                        // not ours, and holding on to it would be a leak.
+                        self.partial = None;
+                        self.esc = false;
+                        continue;
+                    }
+                    buf.push(byte);
+                }
+            }
+        }
+    }
+
+    /// Take a finished OSC payload and keep whatever it said about where the
+    /// shell is.
+    fn note(&mut self, payload: &[u8]) {
+        let Ok(text) = std::str::from_utf8(payload) else {
+            return;
+        };
+        let mut seen = self.cwd.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(path) = osc7_path(text) {
+            seen.exact = Some(path);
+        } else if let Some(dir) = title_dir(text) {
+            seen.from_title = Some(dir);
+        }
+    }
+}
+
+/// The directory an OSC payload names, if it names one.
+///
+/// The shape is `7;file://host/path`, where the host is whichever machine the
+/// shell is on and so nothing to check against — a shell on the server quite
+/// correctly names the server. A bare `7;/path` is accepted too: some shells
+/// send that, and it means the same thing.
+fn osc7_path(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("7;")?;
+    let path = match rest.strip_prefix("file://") {
+        Some(after) => &after[after.find('/')?..],
+        None => rest,
+    };
+    let decoded = percent_decoded(path);
+    // Anything that is not an absolute path is not something we could put a
+    // file list or a new shell into.
+    decoded.starts_with('/').then_some(decoded)
+}
+
+/// Undo the `%20`-style escaping a URL uses. Bytes that are not valid UTF-8
+/// once decoded leave the text as it was, which is the safe answer for a path.
+fn percent_decoded(text: &str) -> String {
+    if !text.contains('%') {
+        return text.to_string();
+    }
+    let raw = text.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'%' if i + 2 < raw.len() => match u8::from_str_radix(&text[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(raw[i]);
+                    i += 1;
+                }
+            },
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
+/// The directory a window title mentions, if it is one of the titles a shell
+/// prompt writes.
+///
+/// The shape is `user@host: directory`, which is what the stock prompt on
+/// every Debian- and Fedora-descended system sets and what a good many people
+/// keep. Insisting on the whole shape — an `@`, then a colon, then something
+/// that could be a path — is what keeps a program's own title out of this: an
+/// editor showing `hosts: /etc/hosts` has no `@` in it, and one that somehow
+/// did would still have to be naming a directory to fool anyone.
+///
+/// The `~` a prompt writes is left as it is. Only the shell's own machine
+/// knows whose home that is; see [`Shell::at_home`].
+fn title_dir(payload: &str) -> Option<String> {
+    // `OSC 0` sets the icon name and the title, `1` the icon name, `2` the
+    // title. Shells use 0.
+    let (kind, title) = payload.split_once(';')?;
+    if !matches!(kind, "0" | "1" | "2") {
+        return None;
+    }
+    let (who, where_) = title.split_once(':')?;
+    // A user and a host, and nothing that would make this a sentence.
+    if !who.contains('@') || who.contains(' ') || who.contains('/') {
+        return None;
+    }
+    let dir = where_.trim();
+    (dir.starts_with('/') || dir.starts_with('~')).then(|| dir.to_string())
+}
+
+/// The directory a process on this machine is in, asked of the kernel.
+///
+/// Only Linux keeps this somewhere readable. Everywhere else a shell has to
+/// say where it is for us to know, which is what [`OscWatch`] is for.
+#[cfg(target_os = "linux")]
+fn cwd_of_process(pid: u32) -> Option<String> {
+    let link = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    Some(link.to_str()?.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cwd_of_process(_pid: u32) -> Option<String> {
+    None
+}
+
 // ---- local ----------------------------------------------------------------
 
 /// Everything a running session is wired to: the screen it draws on, the
@@ -705,6 +1004,11 @@ struct Wiring<'a> {
     tx: &'a Sender<Msg>,
     alive: &'a Arc<AtomicBool>,
     kitty: &'a Arc<Mutex<KittyKeys>>,
+    /// Where the program inside says it is, filled in as it says so.
+    cwd: &'a Arc<Mutex<Reported>>,
+    /// Where to write the process id, for a shell that has one on this
+    /// machine. Left at zero for one that does not.
+    pid: &'a Arc<AtomicU32>,
 }
 
 fn run_local(
@@ -720,6 +1024,8 @@ fn run_local(
         tx,
         alive,
         kitty,
+        cwd: reported,
+        pid,
     } = w;
     let pair = native_pty_system().openpty(PtySize {
         rows,
@@ -747,6 +1053,8 @@ fn run_local(
     cmd.cwd(cwd);
     cmd.env("TERM", "xterm-256color");
     let mut child = pair.slave.spawn_command(cmd)?;
+    // The one thing that can be asked, later, where this shell has got to.
+    pid.store(child.process_id().unwrap_or(0), Ordering::Relaxed);
     // Drop our handle on the slave side, otherwise the pty never reports EOF
     // when the shell exits.
     drop(pair.slave);
@@ -758,6 +1066,7 @@ fn run_local(
     let reader_parser = Arc::clone(parser);
     let reader_alive = Arc::clone(alive);
     let reader_kitty = Arc::clone(kitty);
+    let reader_cwd = Arc::clone(reported);
     // The reader answers the keyboard questions it sees, and the writer loop
     // below is the only thing holding the pty's writing end — so a reply goes
     // round through the same channel a keystroke does.
@@ -766,7 +1075,7 @@ fn run_local(
         .name("local-shell-reader".into())
         .spawn(move || {
             let mut buf = [0u8; 8192];
-            let mut hvp = Hvp::new(reader_kitty);
+            let mut hvp = Hvp::new(reader_kitty, reader_cwd);
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -841,6 +1150,7 @@ fn run_remote(
         rx,
         alive,
         kitty,
+        cwd: reported,
         ..
     } = w;
     let sess = establish(opts).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -885,7 +1195,10 @@ fn run_remote(
     let mut buf = [0u8; 8192];
     // One per stream: they land on the same screen, but a sequence split
     // across reads is only ever split within the stream carrying it.
-    let (mut hvp_out, mut hvp_err) = (Hvp::new(Arc::clone(kitty)), Hvp::new(Arc::clone(kitty)));
+    let (mut hvp_out, mut hvp_err) = (
+        Hvp::new(Arc::clone(kitty), Arc::clone(reported)),
+        Hvp::new(Arc::clone(kitty), Arc::clone(reported)),
+    );
     let mut pending: Vec<u8> = Vec::new();
 
     loop {
@@ -1190,7 +1503,117 @@ mod tests {
     static RICH: Mutex<()> = Mutex::new(());
 
     fn hvp() -> Hvp {
-        Hvp::new(Arc::new(Mutex::new(KittyKeys::default())))
+        Hvp::new(
+            Arc::new(Mutex::new(KittyKeys::default())),
+            Arc::new(Mutex::new(Reported::default())),
+        )
+    }
+
+    /// Everything a stream of bytes let slip about where the shell is.
+    fn reported(chunks: &[&[u8]]) -> Reported {
+        let seen = Arc::new(Mutex::new(Reported::default()));
+        let mut watch = OscWatch::new(Arc::clone(&seen));
+        for chunk in chunks {
+            watch.feed(chunk);
+        }
+        let heard = seen.lock().unwrap();
+        heard.clone()
+    }
+
+    /// The directory a stream reported outright, if it reported one.
+    fn heard(chunks: &[&[u8]]) -> Option<String> {
+        reported(chunks).exact
+    }
+
+    #[test]
+    fn a_shell_saying_where_it_is_is_heard() {
+        assert_eq!(
+            heard(&[b"\x1b]7;file://web01/etc/nginx\x07"]),
+            Some("/etc/nginx".into()),
+            "the host names the machine the shell is on, which is not ours to check"
+        );
+        // The other terminator, which is what most shells actually send.
+        assert_eq!(
+            heard(&[b"\x1b]7;file://localhost/srv\x1b\\"]),
+            Some("/srv".into())
+        );
+        // And the bare form some shells use.
+        assert_eq!(heard(&[b"\x1b]7;/var/log\x07"]), Some("/var/log".into()));
+    }
+
+    #[test]
+    fn a_directory_split_across_two_reads_is_still_heard() {
+        assert_eq!(
+            heard(&[b"\x1b]7;file://h/home/me/wo", b"rk/app\x1b\\"]),
+            Some("/home/me/work/app".into())
+        );
+    }
+
+    #[test]
+    fn spaces_in_a_reported_directory_come_back_as_spaces() {
+        assert_eq!(
+            heard(&[b"\x1b]7;file://h/home/me/My%20Files\x07"]),
+            Some("/home/me/My Files".into())
+        );
+    }
+
+    #[test]
+    fn nothing_else_a_program_paints_is_taken_for_a_directory() {
+        // A window title, which is a guess rather than a report.
+        assert_eq!(heard(&[b"\x1b]0;me@web01: ~\x07"]), None);
+        // A clipboard sequence, which is long and none of our business.
+        let mut long = b"\x1b]52;c;".to_vec();
+        long.extend(std::iter::repeat_n(b'A', MAX_OSC * 2));
+        long.extend(b"\x07");
+        assert_eq!(heard(&[&long]), None);
+        // Ordinary output that happens to mention one.
+        assert_eq!(heard(&[b"7;file:///etc\n"]), None);
+    }
+
+    #[test]
+    fn a_prompt_that_sets_the_window_title_gives_its_directory_away() {
+        // The stock prompt on every Debian- and Fedora-descended system.
+        assert_eq!(
+            reported(&[b"\x1b]0;tester@web01: /etc/ssh\x07"]).from_title,
+            Some("/etc/ssh".into())
+        );
+        // `~` is left as the shell wrote it: only that machine knows whose.
+        assert_eq!(
+            reported(&[b"\x1b]0;tester@web01: ~/work\x07"]).from_title,
+            Some("~/work".into())
+        );
+        // A program's own title is not a prompt, and does not count.
+        assert_eq!(reported(&[b"\x1b]2;vim: /etc/hosts\x07"]).from_title, None);
+        assert_eq!(reported(&[b"\x1b]0;make -j8\x07"]).from_title, None);
+        assert_eq!(
+            reported(&[b"\x1b]0;me@host: not a path\x07"]).from_title,
+            None
+        );
+        // And a title never overrules the sequence that means exactly this.
+        let both = reported(&[b"\x1b]7;file://h/srv\x07\x1b]0;me@h: ~\x07"]);
+        assert_eq!(both.exact, Some("/srv".into()));
+    }
+
+    #[test]
+    fn a_home_a_prompt_wrote_as_a_squiggle_is_made_into_a_path() {
+        let mut shell = Shell::spawn_local(Path::new("/"), 24, 80);
+        shell.home = Some("/home/tester".into());
+        assert_eq!(shell.at_home("~"), Some("/home/tester".into()));
+        assert_eq!(shell.at_home("~/work"), Some("/home/tester/work".into()));
+        assert_eq!(shell.at_home("/etc"), Some("/etc".into()));
+        assert_eq!(shell.at_home("~someone"), None, "someone else's home");
+        assert_eq!(shell.at_home("work"), None, "and nothing relative");
+        shell.home = None;
+        assert_eq!(shell.at_home("~/work"), None, "with no home to stand on");
+        shell.type_in("exit\n");
+    }
+
+    #[test]
+    fn a_reported_directory_reaches_the_screen_as_well() {
+        // The shell's report is the terminal's business too — a title bar is
+        // drawn from the same sequences — so nothing may be swallowed.
+        let out = fixed(b"\x1b]7;file://h/tmp\x07ok");
+        assert_eq!(out, b"\x1b]7;file://h/tmp\x07ok");
     }
 
     /// Feed a stream in one go.
@@ -1523,7 +1946,7 @@ mod tests {
         let _rich = RICH.lock().unwrap_or_else(|e| e.into_inner());
         let keys = Arc::new(Mutex::new(KittyKeys::default()));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(4, 20, 0)));
-        let mut hvp = Hvp::new(Arc::clone(&keys));
+        let mut hvp = Hvp::new(Arc::clone(&keys), Arc::new(Mutex::new(Reported::default())));
 
         // A terminal that cannot tell the keys apart itself has nothing to
         // offer, and says so by saying nothing.
@@ -1682,6 +2105,31 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         set_rich_keys(false);
+    }
+
+    #[test]
+    fn a_local_shell_that_moves_says_where_it_went() {
+        // A real pty and a real shell: the point is that `cd` inside one is
+        // noticed from out here, which is what a saved session writes down.
+        let mut shell = Shell::spawn_local(Path::new("/"), 24, 80);
+        assert_eq!(shell.cwd().as_deref(), Some("/"), "where it was started");
+
+        shell.type_in("cd /tmp\n");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // `/tmp` is a symlink on some systems, so the real path is what
+            // the kernel reports and either spelling is right.
+            let now = shell.cwd().unwrap_or_default();
+            if now.ends_with("/tmp") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell's directory never caught up: {now:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        shell.type_in("exit\n");
     }
 
     #[test]

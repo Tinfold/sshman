@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
@@ -27,7 +27,7 @@ use crate::theme::{self, Theme, Themes};
 use crate::types::{FileEntry, rbasename, rjoin, rparent};
 use crate::watch;
 use crate::worker::{HostKeyIssue, Req, Resp};
-use crate::workspace::{Item as WorkspaceItem, Workspaces};
+use crate::workspace::{Item as WorkspaceItem, PaneDirs, Workspaces};
 use ratatui::style::Color;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -160,6 +160,9 @@ pub struct PromptState {
 pub enum ConfirmAction {
     DeleteLocal(Vec<PathBuf>),
     DeleteRemote(Vec<String>),
+    /// Leave sshman. Everything open goes with it, which is why it is asked
+    /// about rather than done.
+    Quit,
     AcceptHostKey,
     /// Overwrite the recorded host key for this server. Guarded by a typed
     /// phrase, because the innocent explanation and an attack look identical
@@ -175,6 +178,10 @@ pub struct ConfirmState {
     /// When set, `y` is not enough: the user must type this word exactly.
     pub require_phrase: Option<String>,
     pub input: TextInput,
+    /// Where to go when this closes. Nearly always the file panes, but a
+    /// question asked from an overlay — "really quit?" over the connection
+    /// screen — must not answer itself by dumping you somewhere else.
+    pub return_to: Mode,
 }
 
 impl ConfirmState {
@@ -186,6 +193,7 @@ impl ConfirmState {
             danger,
             require_phrase: None,
             input: TextInput::default(),
+            return_to: Mode::Browse,
         }
     }
 
@@ -627,6 +635,10 @@ pub struct RemoteTab {
     /// Terminals a workspace said were editor panes, waiting to be opened.
     /// Emptied as they are, since after that each terminal says for itself.
     wants_editor: Vec<TermId>,
+    /// Where a workspace said this tab's panes were pointed. Read as each
+    /// pane is opened; a pane it says nothing about opens in the tab's own
+    /// directory, which is what every tab did before this was written down.
+    wants_dir: PaneDirs,
     /// Which pane had the keyboard when you last left this tab, so coming
     /// back puts you where you were. It matters most zoomed, where the
     /// focused pane is the only one you can see at all.
@@ -635,6 +647,10 @@ pub struct RemoteTab {
     /// still wide when you come back to it, and a workspace writes this down
     /// along with everything else about the tab.
     pub layout: Layout,
+    /// Whether this tab was showing one pane full screen. Its own, the same
+    /// way its arrangement is: a server you are watching a log on stays
+    /// zoomed while the tab beside it stays split.
+    pub zoomed: bool,
     /// What this tab's worker is doing, if anything. See
     /// [`PendingConnect::task`] for why it lives here.
     pub task: Option<String>,
@@ -723,6 +739,8 @@ pub struct PendingConnect {
     pub layout: Layout,
     /// Which of those panes' terminals were opening files, from a workspace.
     pub editors: Vec<TermId>,
+    /// Where a workspace said those panes were pointed.
+    pub dirs: PaneDirs,
     /// What its worker is doing, if anything. Held here rather than in a list
     /// of its own so that giving up on an attempt takes the label with it: a
     /// worker whose replies nobody is reading any more cannot leave "…" in
@@ -748,6 +766,7 @@ pub struct Waiting {
     forwards: Vec<String>,
     layout: Layout,
     editors: Vec<TermId>,
+    dirs: PaneDirs,
 }
 
 pub struct App {
@@ -772,7 +791,14 @@ pub struct App {
     /// Screen span of each tab chip, recorded by the renderer so a click can
     /// be matched to a tab.
     pub tab_spans: Vec<(u16, u16, usize)>,
+    /// The span of the `✕` inside each chip, which closes that tab rather
+    /// than switching to it. Recorded separately so the rest of the chip
+    /// stays a plain "go here".
+    pub tab_close_buttons: Vec<(u16, u16, usize)>,
     pub tab_bar_row: Option<u16>,
+    /// A tab being dragged along the row by its chip. Holds where it is now,
+    /// which moves as the pointer passes over its neighbours.
+    pub tab_drag: Option<usize>,
     /// Rows the scrollable overlays were last drawn with, so scrolling can
     /// stop at the end of the content instead of running into blank space.
     pub output_view_height: u16,
@@ -799,6 +825,10 @@ pub struct App {
     pub local_terms: Vec<Term>,
     /// The same waiting list as a tab's, for this machine's terminals.
     wants_editor: Vec<TermId>,
+    /// And the same for where this machine's panes were pointed. They are
+    /// shared between the tabs, so this belongs to the session rather than to
+    /// any one of them.
+    wants_dirs: PaneDirs,
     /// The number the next terminal gets, on either machine. One counter for
     /// all of them, so a number never means two different panes.
     next_term_id: TermId,
@@ -834,6 +864,11 @@ pub struct App {
     pub confirm: Option<ConfirmState>,
     pub picker: Option<PickerState>,
     pub workspaces: Workspaces,
+    /// The session sshman was in last time, read once at startup and left
+    /// alone after that. What is being written down as you work replaces the
+    /// file, not this: "restore the previous session" has to keep meaning the
+    /// one before this, however long this one runs.
+    pub previous_session: Option<crate::workspace::Workspace>,
     pub workspace_sel: usize,
     pub settings_sel: usize,
     pub arrangement_sel: usize,
@@ -917,6 +952,12 @@ pub struct App {
     watched_local: Instant,
     watched_deep: Instant,
     watched_remote: Instant,
+
+    /// When the session was last written down, and what was written. Kept so
+    /// that a session nobody is touching costs one comparison a second
+    /// rather than a file write.
+    cached_session: Instant,
+    session_written: Option<String>,
 }
 
 impl App {
@@ -963,7 +1004,9 @@ impl App {
             close_buttons: Vec::new(),
             pane_titles: Vec::new(),
             tab_spans: Vec::new(),
+            tab_close_buttons: Vec::new(),
             tab_bar_row: None,
+            tab_drag: None,
             output_view_height: 1,
             help_view_height: 1,
             layout: Layout::default(),
@@ -974,6 +1017,7 @@ impl App {
             local: vec![LocalTree::new(layout::MAIN, local_start)],
             local_terms: Vec::new(),
             wants_editor: Vec::new(),
+            wants_dirs: PaneDirs::default(),
             next_term_id: 0,
             next_tree_id: layout::MAIN,
             previous: None,
@@ -1000,6 +1044,7 @@ impl App {
             confirm: None,
             picker: None,
             workspaces: Workspaces::load(),
+            previous_session: crate::workspace::Session::load(),
             workspace_sel: 0,
             settings_sel: 0,
             arrangement_sel: 0,
@@ -1039,6 +1084,8 @@ impl App {
             watched_local: Instant::now(),
             watched_deep: Instant::now(),
             watched_remote: Instant::now(),
+            cached_session: Instant::now(),
+            session_written: None,
         };
         app.reload_local();
         if auto_connect {
@@ -1141,7 +1188,15 @@ impl App {
             match host {
                 Side::Local => {
                     if !self.local.iter().any(|t| t.id == id) {
-                        let cwd = self.local_cwd();
+                        // Where a workspace said this list was looking, as
+                        // long as it is still a directory, and otherwise
+                        // wherever this machine's first list is.
+                        let cwd = self
+                            .wants_dirs
+                            .tree(id)
+                            .map(crate::local::expand)
+                            .filter(|path| path.is_dir())
+                            .unwrap_or_else(|| self.local_cwd());
                         self.local.push(LocalTree::new(id, cwd));
                         self.reload_local();
                     }
@@ -1153,7 +1208,11 @@ impl App {
                     if tab.tree(id).is_some() {
                         continue;
                     }
-                    let cwd = tab.cwd().to_string();
+                    let cwd = tab
+                        .wants_dir
+                        .tree(id)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| tab.cwd().to_string());
                     tab.trees.push(RemoteTree::new(id, cwd.clone()));
                     if !cwd.is_empty() {
                         self.goto_remote(slot, cwd);
@@ -1172,15 +1231,18 @@ impl App {
     /// the same place and the same directory — the part that was yours to
     /// arrange, rather than the shell's to remember.
     fn ensure_terms(&mut self) {
-        for slot in self.layout.slots() {
+        for (index, slot) in self.terminal_panes() {
             let Slot::Term { host, id } = slot else {
                 continue;
             };
-            if self.term(slot).is_some() {
+            if self.term_of(index, slot).is_some() {
                 continue;
             }
-            // Nowhere to open a remote one until the tab has said where it is.
-            if host == Side::Remote && self.remote_cwd().is_empty() {
+            // Where it goes: what it was showing when it was written down,
+            // and otherwise wherever its machine is now. There is nowhere to
+            // open a remote one until its tab has said where it is.
+            let here = self.term_start_dir(index, host, id);
+            if host == Side::Remote && here.is_empty() {
                 continue;
             }
             // Ids come from one counter, so a restored pane must not be handed
@@ -1189,7 +1251,7 @@ impl App {
 
             let wanted = match host {
                 Side::Local => &mut self.wants_editor,
-                Side::Remote => match self.tabs.get_mut(self.active) {
+                Side::Remote => match self.tabs.get_mut(index) {
                     Some(tab) => &mut tab.wants_editor,
                     None => continue,
                 },
@@ -1209,8 +1271,74 @@ impl App {
                 }
                 false => (None, None),
             };
-            let here = self.main_dir(host);
-            self.open_term(host, id, here, run, opens);
+            self.open_term_in(index, host, id, here, run, opens);
+        }
+    }
+
+    /// Every terminal pane any tab is arranged around, with the tab it
+    /// belongs to.
+    ///
+    /// Not only the tab on screen: a workspace that opened four servers with
+    /// a shell on each meant four shells. One that starts only when you first
+    /// look at its tab is a shell whose first minute you missed — and on a
+    /// slow link, a tab you have to sit and wait in before it is any use.
+    fn terminal_panes(&self) -> Vec<(usize, Slot)> {
+        let mut panes: Vec<(usize, Slot)> = self
+            .layout
+            .slots()
+            .into_iter()
+            .filter(|slot| slot.is_term())
+            .map(|slot| (self.active, slot))
+            .collect();
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if index == self.active {
+                continue;
+            }
+            panes.extend(
+                tab.layout
+                    .slots()
+                    .into_iter()
+                    .filter(|slot| slot.is_term())
+                    .map(|slot| (index, slot)),
+            );
+        }
+        panes
+    }
+
+    /// The terminal behind a pane on a named tab. This machine's are shared,
+    /// so for those the tab does not come into it.
+    fn term_of(&self, tab: usize, slot: Slot) -> Option<&Term> {
+        let Slot::Term { host, id } = slot else {
+            return None;
+        };
+        match host {
+            Side::Local => self.local_terms.iter().find(|t| t.id == id),
+            Side::Remote => self.tabs.get(tab)?.terms.iter().find(|t| t.id == id),
+        }
+    }
+
+    /// The directory a terminal should open in: the one it was in when a
+    /// workspace wrote it down, and otherwise wherever its machine is now.
+    fn term_start_dir(&self, tab: usize, host: Side, id: TermId) -> String {
+        let saved = match host {
+            Side::Local => self
+                .wants_dirs
+                .shell(id)
+                // A directory that has since gone would stop the shell
+                // starting at all, which is a poor trade for a `cd`.
+                .filter(|path| crate::local::expand(path).is_dir()),
+            Side::Remote => self.tabs.get(tab).and_then(|t| t.wants_dir.shell(id)),
+        };
+        if let Some(dir) = saved {
+            return dir.to_string();
+        }
+        match host {
+            Side::Local => self.local_cwd().display().to_string(),
+            Side::Remote => self
+                .tabs
+                .get(tab)
+                .map(|t| t.cwd().to_string())
+                .unwrap_or_default(),
         }
     }
 
@@ -1680,6 +1808,7 @@ impl App {
                 w.forwards.clone(),
                 w.layout.clone(),
                 w.editors.clone(),
+                w.dirs.clone(),
             )
         });
 
@@ -1698,6 +1827,7 @@ impl App {
                 .filter(|n| !n.is_empty()),
             forwards: Vec::new(),
             editors: Vec::new(),
+            dirs: PaneDirs::default(),
             // The arrangement on screen, so opening a server does not throw
             // away the split you just set up — minus the panes belonging to
             // the tab you were on, whose terminals are not this one's to show.
@@ -1721,13 +1851,14 @@ impl App {
             install_key: self.form.install_key,
         });
 
-        if let Some((path, forwards, layout, editors)) = asked_for
+        if let Some((path, forwards, layout, editors, dirs)) = asked_for
             && let Some(pending) = self.pending.last_mut()
         {
             pending.initial_dir = path.or(pending.initial_dir.take());
             pending.forwards = forwards;
             pending.layout = layout;
             pending.editors = editors;
+            pending.dirs = dirs;
         }
     }
 
@@ -1998,6 +2129,10 @@ impl App {
     /// Ask every worker to stop. Threads would die with the process anyway;
     /// this closes the SSH sessions politely on the way out.
     pub fn shutdown(&mut self) {
+        // One last look before everything is torn down, so a tab opened in
+        // the last second is still there next time. Straight to the write:
+        // this is the one that cannot wait its turn.
+        self.write_session();
         for pending in self.pending.drain(..) {
             let _ = pending.tx.send(Req::Quit);
         }
@@ -2141,8 +2276,10 @@ impl App {
                     },
                     terms: Vec::new(),
                     wants_editor: pending.editors.clone(),
+                    wants_dir: pending.dirs.clone(),
                     focus: Slot::files(Side::Remote),
                     layout: pending.layout.clone(),
+                    zoomed: false,
                     task: None,
                     forwards: Vec::new(),
                     tx: pending.tx,
@@ -2170,12 +2307,22 @@ impl App {
                     false => format!("Connected to {title}{note}"),
                 };
                 self.set_status(msg, Level::Good);
-                // Every list this tab opened with starts in the same place;
-                // the arrangement decides how many there are.
-                for slot in self.layout.slots() {
-                    if slot.is_files() && slot.host() == Side::Remote {
-                        self.goto_remote(slot, start.clone());
-                    }
+                // Every list this tab opened with is pointed where it was
+                // when the workspace was saved, and otherwise at the door the
+                // server let us in by. The arrangement decides how many there
+                // are; `dirs` decides where each of them looks.
+                let lists: Vec<(Slot, String)> = self
+                    .layout
+                    .slots()
+                    .into_iter()
+                    .filter(|slot| slot.is_files() && slot.host() == Side::Remote)
+                    .map(|slot| {
+                        let was = pending.dirs.tree(slot.id()).map(str::to_string);
+                        (slot, was.unwrap_or_else(|| start.clone()))
+                    })
+                    .collect();
+                for (slot, dir) in lists {
+                    self.goto_remote(slot, dir);
                 }
 
                 // Ports a workspace recorded for this connection.
@@ -2209,6 +2356,7 @@ impl App {
                                 pending.forwards.clone(),
                                 pending.layout.clone(),
                                 pending.editors.clone(),
+                                pending.dirs.clone(),
                             );
                             (
                                 pending.from_form,
@@ -2236,7 +2384,7 @@ impl App {
                             }
                         });
                         if !self.needs_password.iter().any(|w| w.label == label) {
-                            let (path, forwards, layout, editors) = asked_for;
+                            let (path, forwards, layout, editors, dirs) = asked_for;
                             self.needs_password.push(Waiting {
                                 label,
                                 opts,
@@ -2244,6 +2392,7 @@ impl App {
                                 forwards,
                                 layout,
                                 editors,
+                                dirs,
                             });
                         }
                         let waiting: Vec<&str> = self
@@ -2324,6 +2473,7 @@ impl App {
                             danger: true,
                             require_phrase: Some("replace".into()),
                             input: TextInput::default(),
+                            return_to: Mode::Browse,
                         });
                         self.mode = Mode::Confirm;
                         self.set_status("host key mismatch — not connected", Level::Bad);
@@ -2675,9 +2825,10 @@ impl App {
             return;
         }
 
-        // Ctrl-C quits from anywhere else.
+        // Ctrl-C quits from anywhere else — after being asked, and pressing
+        // it a second time is the answer.
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            self.pending_action = Some(UiAction::Quit);
+            self.ask_quit();
             return;
         }
         match self.mode {
@@ -3172,7 +3323,9 @@ impl App {
     fn run(&mut self, action: Action) {
         let at = self.focus;
         match action {
-            Action::Quit => self.pending_action = Some(UiAction::Quit),
+            Action::Quit => self.ask_quit(),
+            Action::MoveTabLeft => self.move_tab(-1),
+            Action::MoveTabRight => self.move_tab(1),
             // Cancel backs out of whatever narrowing is in effect. It
             // deliberately does not quit: losing a session to a stray Esc is
             // infuriating.
@@ -3375,6 +3528,7 @@ impl App {
             Action::Connect => self.open_connect_screen(),
             // A tab that needs no server at all.
             Action::LocalTab => self.open_local_tab(),
+            Action::EditorPane => self.toggle_editor_pane(),
             Action::CloseTab => self.close_tab(),
             Action::NextTab => self.cycle_tab(1),
             Action::PreviousTab => self.cycle_tab(-1),
@@ -4083,6 +4237,18 @@ impl App {
             return;
         }
 
+        // The quit dialog answers to the quit key too, so pressing `q` twice
+        // leaves — the dialog is a guard against the stray first press, not a
+        // toll on everyone who meant it.
+        if matches!(
+            self.confirm.as_ref().map(|c| &c.action),
+            Some(ConfirmAction::Quit)
+        ) && self.keymap.action(&key) == Some(Action::Quit)
+        {
+            self.ask_quit();
+            return;
+        }
+
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 if self.confirm.as_ref().is_some_and(|c| !c.satisfied()) {
@@ -4101,8 +4267,9 @@ impl App {
                     self.mode = Mode::Browse;
                     return;
                 };
-                self.mode = Mode::Browse;
+                self.mode = state.return_to;
                 match state.action {
+                    ConfirmAction::Quit => self.pending_action = Some(UiAction::Quit),
                     ConfirmAction::DeleteLocal(paths) => {
                         let mut failed = Vec::new();
                         let total = paths.len();
@@ -4151,12 +4318,17 @@ impl App {
                     self.confirm.as_ref().map(|c| &c.action),
                     Some(ConfirmAction::AcceptHostKey | ConfirmAction::ReplaceHostKey)
                 );
+                let back = self
+                    .confirm
+                    .as_ref()
+                    .map(|c| c.return_to)
+                    .unwrap_or(Mode::Browse);
                 self.confirm = None;
                 if was_host_key && !self.connected() {
                     self.mode = Mode::Connect;
                     self.form.error = Some("host key rejected".into());
                 } else {
-                    self.mode = Mode::Browse;
+                    self.mode = back;
                 }
                 self.set_status("cancelled", Level::Info);
             }
@@ -4769,13 +4941,35 @@ impl App {
     pub fn open_workspaces(&mut self) {
         self.workspace_sel = self
             .workspace_sel
-            .min(self.workspaces.len().saturating_sub(1));
+            .min(self.workspace_rows().saturating_sub(1));
         self.mode = Mode::Workspaces;
-        if self.workspaces.is_empty() {
+        if self.workspaces.is_empty() && self.previous_session.is_none() {
             self.set_status(
                 "no workspaces yet — s saves what you have open now",
                 Level::Info,
             );
+        }
+    }
+
+    /// How many rows the workspace list has: the saved ones, and the session
+    /// before this one above them when there was one.
+    pub fn workspace_rows(&self) -> usize {
+        self.workspaces.len() + usize::from(self.previous_session.is_some())
+    }
+
+    /// Whether the first row is the session before this one rather than a
+    /// workspace. It is listed there because it is the one people reach for
+    /// most and the one nobody thought to save.
+    pub fn session_row(&self) -> bool {
+        self.previous_session.is_some()
+    }
+
+    /// The saved workspace a row stands for, or `None` for the session row.
+    pub fn workspace_at(&self, row: usize) -> Option<usize> {
+        match self.session_row() {
+            true if row == 0 => None,
+            true => Some(row - 1),
+            false => Some(row),
         }
     }
 
@@ -4784,15 +4978,18 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Browse,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.workspace_sel =
-                    (self.workspace_sel + 1).min(self.workspaces.len().saturating_sub(1));
+                    (self.workspace_sel + 1).min(self.workspace_rows().saturating_sub(1));
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.workspace_sel = self.workspace_sel.saturating_sub(1);
             }
             KeyCode::Char('s') => {
+                // Naming it after the row you are on replaces that workspace,
+                // which is what `s` on top of one is usually for. The session
+                // row is not a name anyone means to save under.
                 let suggestion = self
-                    .workspaces
-                    .get(self.workspace_sel)
+                    .workspace_at(self.workspace_sel)
+                    .and_then(|index| self.workspaces.get(index))
                     .map(|w| w.name.clone())
                     .unwrap_or_default();
                 self.open_prompt(
@@ -4802,25 +4999,68 @@ impl App {
                 );
             }
             KeyCode::Delete => {
-                if let Some(removed) = self.workspaces.remove(self.workspace_sel) {
-                    self.set_status(format!("forgot workspace {}", removed.name), Level::Info);
+                match self.workspace_at(self.workspace_sel) {
+                    Some(index) => {
+                        if let Some(removed) = self.workspaces.remove(index) {
+                            self.set_status(
+                                format!("forgot workspace {}", removed.name),
+                                Level::Info,
+                            );
+                        }
+                    }
+                    // Forgetting the last session is forgetting a file, not a
+                    // list entry: the one being written down now takes its
+                    // place the moment anything changes.
+                    None => {
+                        crate::workspace::Session::forget();
+                        self.previous_session = None;
+                        self.set_status("forgot the previous session", Level::Info);
+                    }
                 }
                 self.workspace_sel = self
                     .workspace_sel
-                    .min(self.workspaces.len().saturating_sub(1));
+                    .min(self.workspace_rows().saturating_sub(1));
             }
             KeyCode::Enter => {
                 self.mode = Mode::Browse;
-                let index = self.workspace_sel;
-                self.launch_workspace_at(index);
+                match self.workspace_at(self.workspace_sel) {
+                    Some(index) => self.launch_workspace_at(index),
+                    None => self.restore_previous_session(),
+                }
             }
             _ => {}
         }
     }
 
+    /// Open everything the last session had open.
+    pub fn restore_previous_session(&mut self) {
+        let Some(session) = self.previous_session.clone() else {
+            self.set_status("no previous session to come back to", Level::Info);
+            return;
+        };
+        if session.items.is_empty() {
+            self.set_status("the previous session had nothing open", Level::Info);
+            return;
+        }
+        self.launch_workspace(&session);
+    }
+
     /// Turn the tabs on screen into something that can be saved.
     fn workspace_items(&self) -> Vec<WorkspaceItem> {
         self.tabs.iter().filter_map(workspace_item_for).collect()
+    }
+
+    /// Where this machine's panes are pointed. They are shared between the
+    /// tabs, so they belong to the workspace rather than to any one of them.
+    fn local_pane_dirs(&self) -> crate::workspace::PaneDirs {
+        pane_dirs(
+            self.local
+                .iter()
+                .map(|tree| (tree.id, tree.cwd.display().to_string())),
+            self.local_terms
+                .iter()
+                .map(|term| (term.id, term.shell.cwd())),
+        )
     }
 
     fn save_workspace(&mut self, name: &str) {
@@ -4837,8 +5077,12 @@ impl App {
             .filter(|term| term.is_editor())
             .map(|term| term.id)
             .collect();
+        let local_dirs = self.local_pane_dirs();
 
-        match self.workspaces.save(name, local, local_editors, items) {
+        match self
+            .workspaces
+            .save(name, local, local_editors, local_dirs, items)
+        {
             Ok(replaced) => {
                 let verb = if replaced { "replaced" } else { "saved" };
                 let mut msg = format!("{verb} workspace {name}");
@@ -4850,6 +5094,74 @@ impl App {
                 self.set_status(msg, Level::Good);
             }
             Err(e) => self.set_status(format!("could not save workspace: {e}"), Level::Bad),
+        }
+    }
+
+    /// How this session looks written down, in the shape a workspace takes.
+    ///
+    /// Everything a workspace holds and nothing more: what each tab was
+    /// connected to, how its panes were arranged, and where every one of
+    /// them was pointed. No passwords, because none are kept anywhere.
+    pub fn session_snapshot(&self) -> crate::workspace::Workspace {
+        crate::workspace::Workspace {
+            name: crate::workspace::SESSION_NAME.to_string(),
+            local_path: Some(self.local_cwd().display().to_string())
+                .filter(|path| !path.is_empty()),
+            local_editors: self
+                .local_terms
+                .iter()
+                .filter(|term| term.is_editor())
+                .map(|term| term.id)
+                .collect(),
+            local_dirs: self.local_pane_dirs(),
+            items: self.workspace_items(),
+            saved_at: crate::workspace::now(),
+        }
+    }
+
+    /// Keep the file that says where this session got to up to date.
+    ///
+    /// Called from the main loop rather than on the way out, because there is
+    /// no way out to hook: a terminal closed on sshman, a machine that went to
+    /// sleep and never woke, a panic — none of them give anyone a chance to
+    /// write anything. What is on disk when the process stops is what comes
+    /// back, so the answer is to keep it close to true all the time.
+    ///
+    /// A session nobody is touching costs one comparison a second: the
+    /// snapshot is only written when it says something different.
+    pub fn cache_session(&mut self) {
+        const EVERY: Duration = Duration::from_secs(1);
+        if self.cached_session.elapsed() < EVERY {
+            return;
+        }
+        self.cached_session = Instant::now();
+        self.write_session();
+    }
+
+    /// Write the snapshot down, if it says anything new.
+    fn write_session(&mut self) {
+        // Nothing open is not a session worth coming back to, and writing it
+        // down would throw away the one that is already there — which is
+        // exactly what you want on the way out of a workspace you opened by
+        // mistake, and exactly what you do not want on the way in.
+        if self.tabs.is_empty() {
+            return;
+        }
+        let snapshot = self.session_snapshot();
+        // The time of the write moves every second whether or not anything
+        // else does, so it is left out of what is compared: it is a note
+        // about the write rather than part of what is being written down.
+        let Ok(json) = serde_json::to_string(&crate::workspace::Workspace {
+            saved_at: 0,
+            ..snapshot.clone()
+        }) else {
+            return;
+        };
+        if self.session_written.as_deref() == Some(json.as_str()) {
+            return;
+        }
+        if crate::workspace::Session::save(&snapshot).is_ok() {
+            self.session_written = Some(json);
         }
     }
 
@@ -4869,9 +5181,11 @@ impl App {
                 self.goto_local(Slot::files(Side::Local), path);
             }
         }
-        // This machine's terminals are shared, so which of them opened files
-        // is the workspace's to say rather than any one tab's.
+        // This machine's panes are shared, so which of them opened files and
+        // where each of them was pointed are the workspace's to say rather
+        // than any one tab's.
         self.wants_editor = workspace.local_editors.clone();
+        self.wants_dirs = workspace.local_dirs.clone();
         if workspace.items.is_empty() {
             self.set_status(
                 format!("workspace {} is empty", workspace.name),
@@ -4896,6 +5210,7 @@ impl App {
                     pending.layout = layout;
                 }
                 pending.editors = item.editors().to_vec();
+                pending.dirs = item.dirs().clone();
             }
         }
         self.initial_remote = None;
@@ -5141,17 +5456,92 @@ impl App {
         );
     }
 
+    /// Ask before leaving.
+    ///
+    /// Quitting takes every shell, every connection and any transfer still
+    /// running down with it, and `q` sits one key away from half the file
+    /// keys. Pressing it again — or `y`, or `↵` — goes.
+    pub fn ask_quit(&mut self) {
+        // Asked twice means meant: the second press is the answer to the
+        // first, which is what makes `q q` and `Ctrl-C Ctrl-C` work.
+        if let Some(state) = self
+            .confirm
+            .take_if(|c| matches!(c.action, ConfirmAction::Quit))
+        {
+            self.mode = state.return_to;
+            self.pending_action = Some(UiAction::Quit);
+            return;
+        }
+
+        let mut body = match self.tabs.len() {
+            0 => vec!["Nothing is open.".to_string()],
+            1 => vec!["This is open:".to_string()],
+            n => vec![format!("These {n} tabs are open:")],
+        };
+        for tab in self.tabs.iter().take(8) {
+            body.push(format!("  {}", tab.title()));
+        }
+        if self.tabs.len() > 8 {
+            body.push(format!("  … and {} more", self.tabs.len() - 8));
+        }
+        // Work in flight is the one thing quitting actually loses, so it is
+        // said plainly rather than left to be noticed afterwards.
+        if let Some(task) = self.current_task() {
+            body.push(String::new());
+            body.push(format!("Still going: {task}"));
+        }
+        if !self.pending.is_empty() {
+            body.push(format!("Still connecting: {} more", self.pending.len()));
+        }
+        // Only where it is true: nothing is written down while nothing is
+        // open, and promising it back would be a lie told at the worst moment.
+        if !self.tabs.is_empty() {
+            body.push(String::new());
+            body.push("This session is written down as you go, so `sshman --resume`".into());
+            body.push("or `previous session` on the workspace list brings it back.".into());
+        }
+
+        let danger = self.current_task().is_some();
+        let mut state = ConfirmState::simple("Leave sshman?", body, ConfirmAction::Quit, danger);
+        // Asked from wherever you were: cancelling has to put you back there
+        // rather than dropping you into the file panes. The exception is
+        // another dialog, which this one has just replaced — there is nothing
+        // left to go back to.
+        state.return_to = match self.mode {
+            Mode::Confirm => Mode::Browse,
+            other => other,
+        };
+        self.confirm = Some(state);
+        self.mode = Mode::Confirm;
+        self.set_status("q or y leaves, Esc stays", Level::Info);
+    }
+
     /// Close the tab on screen, ending its SSH session and its shell.
     pub fn close_tab(&mut self) {
-        if self.tabs.is_empty() {
+        self.close_tab_at(self.active);
+    }
+
+    /// The same for any tab, whether or not it is the one on screen — what
+    /// the `✕` on a chip asks for.
+    pub fn close_tab_at(&mut self, index: usize) {
+        if index >= self.tabs.len() {
             self.set_status("no tab to close", Level::Info);
             return;
         }
-        let tab = self.tabs.remove(self.active);
+        // The arrangement on screen belongs to the active tab, and after the
+        // removal `active` may well name a different one. Handing it back
+        // first is what keeps the two from being mixed up.
+        self.stash_layout();
+        let was_active = index == self.active;
+        let tab = self.tabs.remove(index);
         let title = tab.title();
         let _ = tab.tx.send(Req::Quit);
         drop(tab); // takes its terminals' sessions down with it
 
+        // Whatever was on screen stays on screen unless it is what just went.
+        if index < self.active {
+            self.active -= 1;
+        }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         }
@@ -5162,15 +5552,57 @@ impl App {
             self.settle_focus();
             self.set_status(format!("closed {title} — no servers left"), Level::Info);
         } else {
-            self.adopt_layout();
-            let leaving = self.focus;
-            self.focus = self.focus_for_tab(leaving);
-            self.settle_focus();
-            if let Some(opts) = self.tab().and_then(|t| t.ssh_opts()) {
-                self.opts = opts.clone();
+            if was_active {
+                self.adopt_layout();
+                let leaving = self.focus;
+                self.focus = self.focus_for_tab(leaving);
+                if let Some(opts) = self.tab().and_then(|t| t.ssh_opts()) {
+                    self.opts = opts.clone();
+                }
             }
+            self.settle_focus();
             self.set_status(format!("closed {title}"), Level::Info);
         }
+    }
+
+    /// Shove the tab on screen one place along the row, wrapping at the ends
+    /// the same way stepping between them does.
+    pub fn move_tab(&mut self, delta: isize) {
+        if self.tabs.len() < 2 {
+            self.set_status("only one tab — nowhere to move it", Level::Info);
+            return;
+        }
+        let len = self.tabs.len() as isize;
+        let to = (self.active as isize + delta).rem_euclid(len) as usize;
+        let from = self.active;
+        if self.move_tab_to(from, to) {
+            let title = self.tab().map(|t| t.title()).unwrap_or_default();
+            self.set_status(
+                format!("{title} moved to {}/{}", to + 1, self.tabs.len()),
+                Level::Info,
+            );
+        }
+    }
+
+    /// Take the tab at `from` out of the row and put it back at `to`. The tab
+    /// on screen is still the tab on screen afterwards, wherever either of
+    /// them ended up. Says whether anything moved.
+    pub fn move_tab_to(&mut self, from: usize, to: usize) -> bool {
+        let len = self.tabs.len();
+        if from >= len || to >= len || from == to {
+            return false;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        // `active` names a position, and the positions have just shifted
+        // under it. Follow the tab it was naming rather than the index.
+        self.active = match self.active {
+            a if a == from => to,
+            a if from < a && a <= to => a - 1,
+            a if to <= a && a < from => a + 1,
+            a => a,
+        };
+        true
     }
 
     // ---- terminals ---------------------------------------------------------
@@ -5234,9 +5666,24 @@ impl App {
     }
 
     /// The same, for a terminal whose number is already decided — one a saved
-    /// arrangement named.
+    /// arrangement named. It opens on the tab you are looking at.
     fn open_term(
         &mut self,
+        host: Side,
+        id: TermId,
+        here: String,
+        run: Option<String>,
+        opens: Option<String>,
+    ) -> Option<Slot> {
+        self.open_term_in(self.active, host, id, here, run, opens)
+    }
+
+    /// And the same on any tab, whether or not it is the one on screen: a
+    /// workspace opens several at once, and the shells on all of them are
+    /// started rather than waiting to be looked at.
+    fn open_term_in(
+        &mut self,
+        index: usize,
         host: Side,
         id: TermId,
         here: String,
@@ -5260,12 +5707,15 @@ impl App {
                 }
             }
             Side::Remote => {
-                let Some(tab) = self.tab() else {
+                let Some(tab) = self.tabs.get(index) else {
                     self.set_status("not connected", Level::Bad);
                     return None;
                 };
                 let cwd = here.unwrap_or_else(|| tab.cwd().to_string());
                 let label = tab.title();
+                // Where the server put us at login, which is the one thing
+                // that makes sense of a shell reporting it is in `~`.
+                let home = tab.conn.home.clone();
                 // This tab's own credentials, and its own connection, so a
                 // busy shell never stalls transfers — on this tab or any other.
                 match (&tab.target, tab.ssh_opts()) {
@@ -5299,7 +5749,7 @@ impl App {
                         }
                     }
                     (Target::Ssh(opts), _) => match &run {
-                        None => Shell::spawn_remote(opts, &cwd, ROWS, COLS),
+                        None => Shell::spawn_remote(opts, &cwd, Some(&home), ROWS, COLS),
                         Some(cmd) => Shell::spawn_remote_command(
                             label,
                             opts,
@@ -5315,7 +5765,11 @@ impl App {
             }
         };
 
-        self.terms_mut(host)?.push(Term { id, shell, opens });
+        let term = Term { id, shell, opens };
+        match host {
+            Side::Local => self.local_terms.push(term),
+            Side::Remote => self.tabs.get_mut(index)?.terms.push(term),
+        }
         Some(Slot::term(host, id))
     }
 
@@ -5414,6 +5868,42 @@ impl App {
             Some(slot) => self.close_pane(*slot),
             None => self.split_with_term(Dir::Down, 70),
         }
+    }
+
+    /// Open an editor pane beside the focused one, or close the one this
+    /// machine already has.
+    ///
+    /// The ready-made arrangement (`A`) builds a whole tab around one. This
+    /// is that pane on its own, for a tab you have already arranged by hand
+    /// and now want to read a file in — and the same key takes it away again,
+    /// the way `S` does for a shell.
+    fn toggle_editor_pane(&mut self) {
+        let host = self.host();
+        if let Some(open) = self.editor_pane(host) {
+            self.close_pane(open);
+            return;
+        }
+        let at = self.focus;
+        let Some(editor) = self.new_editor_term(at) else {
+            return;
+        };
+        // Beside rather than below: an editor wants the height, and the file
+        // list it is opening from wants only enough width to read names in.
+        if !self.layout.split(at, Dir::Across, editor, 40) {
+            // Nothing was placed, so nothing was opened: the terminal goes
+            // with the next tidy-up rather than running out of sight.
+            self.settle_focus();
+            return;
+        }
+        // The keyboard stays where it was. The point of this pane is picking
+        // files and watching them open beside you, not typing in it.
+        self.settle_focus();
+        self.stash_layout();
+        let program = self.editor.clone();
+        self.set_status(
+            format!("{program} pane open — e or a click opens a file in it"),
+            Level::Good,
+        );
     }
 
     /// Move the keyboard to the pane across the nearest border running that
@@ -5525,8 +6015,10 @@ impl App {
     /// first would otherwise write down the panes from before you moved them.
     fn stash_layout(&mut self) {
         let live = self.layout.clone();
+        let zoomed = self.zoomed;
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.layout = live;
+            tab.zoomed = zoomed;
         }
     }
 
@@ -5590,8 +6082,9 @@ impl App {
 
     /// Draw the active tab's arrangement from here on.
     fn adopt_layout(&mut self) {
-        if let Some(tab) = self.tab() {
-            self.layout = tab.layout.clone();
+        if let Some((layout, zoomed)) = self.tab().map(|tab| (tab.layout.clone(), tab.zoomed)) {
+            self.layout = layout;
+            self.zoomed = zoomed;
         }
     }
 
@@ -5927,8 +6420,10 @@ impl App {
             trees: vec![RemoteTree::new(layout::MAIN, "/home/me".into())],
             terms: Vec::new(),
             wants_editor: Vec::new(),
+            wants_dir: PaneDirs::default(),
             focus: Slot::files(Side::Remote),
             layout,
+            zoomed: false,
             task: None,
             forwards: Vec::new(),
             tx,
@@ -5991,12 +6486,17 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
         .filter(|term| term.is_editor())
         .map(|term| term.id)
         .collect();
+    let dirs = pane_dirs(
+        tab.trees.iter().map(|tree| (tree.id, tree.cwd.clone())),
+        tab.terms.iter().map(|term| (term.id, term.shell.cwd())),
+    );
     match &tab.target {
         Target::Local => Some(WorkspaceItem::Local {
             path,
             name: tab.name.clone(),
             layout: Some(tab.layout.clone()),
             editors,
+            dirs,
         }),
         Target::Ssh(opts) => Some(WorkspaceItem::Ssh {
             user: opts.user.clone(),
@@ -6008,6 +6508,7 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
             forwards: saved_forwards(tab),
             layout: Some(tab.layout.clone()),
             editors,
+            dirs,
         }),
         Target::Docker {
             via,
@@ -6031,13 +6532,38 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
                     // reached, so it has no panes of its own.
                     layout: None,
                     editors: Vec::new(),
+                    dirs: Default::default(),
                 })
             }),
             path,
             forwards: saved_forwards(tab),
             layout: Some(tab.layout.clone()),
             editors,
+            dirs,
         }),
+    }
+}
+
+/// Gather where a set of panes were pointed, ready to be written down.
+///
+/// A pane with nothing to say — a terminal whose directory could not be
+/// found out, a file list that never finished loading — is left out rather
+/// than written down as empty, so restoring falls back to the tab's own
+/// directory instead of trying to `cd` to nowhere.
+fn pane_dirs(
+    trees: impl Iterator<Item = (TreeId, String)>,
+    shells: impl Iterator<Item = (TermId, Option<String>)>,
+) -> crate::workspace::PaneDirs {
+    crate::workspace::PaneDirs {
+        trees: trees
+            .filter(|(_, path)| !path.is_empty())
+            .map(|(id, path)| crate::workspace::PaneDir { id, path })
+            .collect(),
+        shells: shells
+            .filter_map(|(id, path)| Some((id, path?)))
+            .filter(|(_, path)| !path.is_empty())
+            .map(|(id, path)| crate::workspace::PaneDir { id, path })
+            .collect(),
     }
 }
 
@@ -6088,6 +6614,7 @@ fn file_signature(path: &std::path::Path) -> Option<(i64, u64)> {
 mod tests {
     use super::*;
     use crate::types::EntryKind;
+    use crate::workspace::PaneDir;
     use ratatui::crossterm::event::KeyEventState;
     use std::path::Path;
 
@@ -6099,6 +6626,10 @@ mod tests {
         let mut app = App::new(ConnectOpts::default(), dir.to_path_buf(), None, false);
         app.mode = Mode::Browse;
         app.status.clear();
+        // Whatever this machine has saved is none of a test's business, and
+        // a test must never write over it either.
+        app.workspaces = Workspaces::default();
+        app.previous_session = None;
         app
     }
 
@@ -6507,14 +7038,17 @@ mod tests {
         app.focus = shell;
         app.zoomed = true;
 
-        // The second tab has no shell, so there is none to show.
+        // The second tab has no shell, so there is none to show, and it was
+        // never zoomed: the zoom belongs to the tab that was zoomed.
         app.goto_tab(1);
         assert!(!app.in_term());
-        assert!(app.zoomed, "the zoom itself stays put");
+        assert!(!app.zoomed, "the other tab is still split");
 
-        // Going back must land where we left off, not on the file list.
+        // Going back must land where we left off, not on the file list, and
+        // full screen again.
         app.goto_tab(0);
         assert_eq!(app.focus, shell, "the shell we were in has to come back");
+        assert!(app.zoomed, "and so does the zoom it was left in");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7437,6 +7971,7 @@ mod tests {
             name: None,
             forwards: Vec::new(),
             editors: Vec::new(),
+            dirs: PaneDirs::default(),
             layout: Layout::default(),
             task: None,
             tx,
@@ -7730,7 +8265,9 @@ mod tests {
         assert_eq!(app.config.keys["quit"], ["Q"], "and it is written down");
         app.mode = Mode::Browse;
         press(&mut app, 'q');
-        assert!(app.pending_action.is_none(), "q no longer quits");
+        assert!(app.confirm.is_none(), "q no longer quits");
+        press(&mut app, 'Q');
+        assert_eq!(app.mode, Mode::Confirm, "the new key asks first");
         press(&mut app, 'Q');
         assert!(matches!(app.pending_action, Some(UiAction::Quit)));
 
@@ -8031,6 +8568,416 @@ mod tests {
             "the borders go back to the middle"
         );
         assert!(!app.zoomed);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- the row of tabs ---------------------------------------------------
+
+    #[test]
+    fn a_tab_can_be_shoved_along_the_row() {
+        let dir = scratch("tab-move");
+        let mut app = app_in(&dir);
+        for host in ["one", "two", "three"] {
+            fake_tab(&mut app, host, None);
+        }
+        app.goto_tab(1);
+
+        app.move_tab(1);
+        assert_eq!(titles(&app), ["one", "three", "two"]);
+        assert_eq!(
+            app.active, 2,
+            "the tab you were looking at is still on screen"
+        );
+        assert_eq!(app.tab().unwrap().conn.host, "two");
+
+        // And off the end, which wraps the way stepping between them does.
+        app.move_tab(1);
+        assert_eq!(titles(&app), ["two", "one", "three"]);
+        assert_eq!(app.active, 0);
+
+        app.move_tab(-1);
+        assert_eq!(titles(&app), ["one", "three", "two"]);
+        assert_eq!(app.tab().unwrap().conn.host, "two");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn moving_a_tab_leaves_the_one_on_screen_on_screen() {
+        let dir = scratch("tab-move-other");
+        let mut app = app_in(&dir);
+        for host in ["one", "two", "three", "four"] {
+            fake_tab(&mut app, host, None);
+        }
+        app.goto_tab(3);
+
+        // A tab dragged past the one you are looking at must not carry the
+        // screen with it.
+        assert!(app.move_tab_to(0, 2));
+        assert_eq!(titles(&app), ["two", "three", "one", "four"]);
+        assert_eq!(app.tab().unwrap().conn.host, "four", "still on screen");
+
+        assert!(app.move_tab_to(3, 0));
+        assert_eq!(titles(&app), ["four", "two", "three", "one"]);
+        assert_eq!(app.active, 0, "and it followed itself to the front");
+
+        assert!(!app.move_tab_to(1, 1), "nowhere to move is not a move");
+        assert!(!app.move_tab_to(0, 9), "and neither is off the end");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn any_tab_can_be_closed_not_only_the_one_on_screen() {
+        let dir = scratch("tab-close-any");
+        let mut app = app_in(&dir);
+        for host in ["one", "two", "three"] {
+            fake_tab(&mut app, host, None);
+        }
+        app.goto_tab(2);
+        // The tab on screen keeps whatever was done to it right up to the
+        // moment another one is closed.
+        app.layout = Layout::sides(80);
+
+        app.close_tab_at(0);
+        assert_eq!(titles(&app), ["two", "three"]);
+        assert_eq!(app.active, 1, "what was on screen is still on screen");
+        assert_eq!(app.tab().unwrap().conn.host, "three");
+        assert_eq!(app.layout, Layout::sides(80), "and still looks like itself");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_zoom_belongs_to_the_tab_it_was_asked_for_on() {
+        let dir = scratch("tab-zoom");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", None);
+        fake_tab(&mut app, "two", None);
+
+        app.goto_tab(0);
+        app.toggle_zoom();
+        assert!(app.zoomed);
+
+        app.goto_tab(1);
+        assert!(!app.zoomed, "the other tab was never zoomed");
+        app.goto_tab(0);
+        assert!(app.zoomed, "and this one still is");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The tabs in the order the row draws them, by the host each is on.
+    fn titles(app: &App) -> Vec<String> {
+        app.tabs.iter().map(|t| t.conn.host.clone()).collect()
+    }
+
+    // ---- leaving -----------------------------------------------------------
+
+    #[test]
+    fn quitting_asks_first() {
+        let dir = scratch("quit-ask");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "web01", None);
+
+        press(&mut app, 'q');
+        assert_eq!(app.mode, Mode::Confirm);
+        assert!(app.pending_action.is_none(), "nothing has happened yet");
+        assert!(
+            app.confirm
+                .as_ref()
+                .unwrap()
+                .body
+                .iter()
+                .any(|l| l.contains("web01")),
+            "and it says what would go with it"
+        );
+
+        // Saying no puts everything back.
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.tabs.len(), 1, "and nothing was closed on the way");
+
+        // Asked again and meant: the same key is the answer.
+        press(&mut app, 'q');
+        press(&mut app, 'q');
+        assert!(matches!(app.pending_action, Some(UiAction::Quit)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn being_asked_about_quitting_does_not_close_what_you_were_looking_at() {
+        let dir = scratch("quit-return");
+        let mut app = app_in(&dir);
+        app.open_workspaces();
+        assert_eq!(app.mode, Mode::Workspaces);
+
+        app.ask_quit();
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.mode,
+            Mode::Workspaces,
+            "cancelling puts you back where you were asked"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- an editor pane on its own -----------------------------------------
+
+    #[test]
+    fn an_editor_pane_opens_and_closes_on_one_key() {
+        let dir = scratch("editor-pane");
+        let mut app = app_in(&dir);
+        assert!(app.editor_pane(Side::Local).is_none());
+
+        press(&mut app, 'i');
+        let pane = app.editor_pane(Side::Local).expect("an editor pane");
+        assert!(app.layout.contains(pane));
+        assert!(
+            app.term(pane).is_some_and(Term::is_editor),
+            "and the file lists know to send files to it"
+        );
+        assert_eq!(app.focus, here(), "the keyboard stays on the files");
+
+        press(&mut app, 'i');
+        assert!(
+            app.editor_pane(Side::Local).is_none(),
+            "the same key takes it away again"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- what a workspace writes down --------------------------------------
+
+    #[test]
+    fn a_workspace_writes_down_where_every_pane_was_pointed() {
+        let dir = scratch("ws-dirs");
+        std::fs::create_dir_all(dir.join("dst/deep")).unwrap();
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "web01", None);
+
+        // A second list on this machine, pointed somewhere else.
+        let second = app.add_tree(here()).expect("another list");
+        app.goto_local(second, dir.join("dst"));
+        // And a second on the server.
+        let far = app
+            .add_tree(Slot::files(Side::Remote))
+            .expect("another list");
+        app.tabs[0].tree_mut(far.id()).unwrap().cwd = "/var/log".into();
+
+        let dirs = app.local_pane_dirs();
+        assert_eq!(
+            dirs.tree(second.id()).map(std::path::PathBuf::from),
+            Some(dir.join("dst")),
+            "this machine's second list says where it is"
+        );
+        let item = workspace_item_for(&app.tabs[0]).expect("a saveable tab");
+        assert_eq!(
+            item.dirs().tree(far.id()),
+            Some("/var/log"),
+            "and so does the server's"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_shell_is_written_down_with_the_directory_it_is_in() {
+        let dir = scratch("ws-shell-dir");
+        let mut app = app_in(&dir);
+        let slot = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+
+        let dirs = app.local_pane_dirs();
+        assert_eq!(
+            dirs.shell(slot.id()).map(std::path::PathBuf::from),
+            Some(dir.clone()),
+            "a shell that has not moved is written down where it started"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pane_a_workspace_named_opens_where_the_workspace_left_it() {
+        let dir = scratch("ws-restore-dir");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        let mut app = app_in(&dir);
+
+        // What launching a workspace leaves behind for the panes to read.
+        app.wants_dirs = PaneDirs {
+            trees: vec![PaneDir {
+                id: 7,
+                path: dir.join("dst").display().to_string(),
+            }],
+            shells: vec![PaneDir {
+                id: 8,
+                path: dir.join("dst").display().to_string(),
+            }],
+        };
+        app.layout
+            .split(here(), Dir::Across, Slot::tree(Side::Local, 7), 50);
+        app.layout
+            .split(here(), Dir::Down, Slot::term(Side::Local, 8), 50);
+        app.settle_focus();
+
+        let tree = app.local.iter().find(|t| t.id == 7).expect("the list");
+        assert_eq!(tree.cwd, dir.join("dst"), "the list opened where it was");
+        assert_eq!(
+            app.term_start_dir(0, Side::Local, 8)
+                .parse::<std::path::PathBuf>()
+                .unwrap(),
+            dir.join("dst"),
+            "and so did the shell"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_directory_that_has_gone_does_not_stop_a_pane_opening() {
+        let dir = scratch("ws-restore-gone");
+        let mut app = app_in(&dir);
+        app.wants_dirs = PaneDirs {
+            trees: vec![PaneDir {
+                id: 7,
+                path: "/no/such/place".into(),
+            }],
+            shells: vec![PaneDir {
+                id: 8,
+                path: "/no/such/place".into(),
+            }],
+        };
+        app.layout
+            .split(here(), Dir::Across, Slot::tree(Side::Local, 7), 50);
+        app.settle_focus();
+
+        assert_eq!(
+            app.local.iter().find(|t| t.id == 7).expect("the list").cwd,
+            dir,
+            "a list falls back to where this machine is"
+        );
+        assert_eq!(
+            app.term_start_dir(0, Side::Local, 8),
+            dir.display().to_string(),
+            "and so does a shell, which would not start at all otherwise"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_shell_a_workspace_asked_for_starts_on_every_tab_not_only_the_one_on_screen() {
+        let dir = scratch("ws-background-shells");
+        let mut app = app_in(&dir);
+        let cwd = dir.display().to_string();
+        fake_local_tab(&mut app, &cwd);
+        fake_local_tab(&mut app, &cwd);
+
+        // What a restored workspace leaves behind: a pane for a terminal that
+        // has not been started yet, on a tab that is not on screen.
+        let far = Slot::term(Side::Remote, 41);
+        let near = Slot::term(Side::Remote, 42);
+        app.tabs[0]
+            .layout
+            .split(Slot::files(Side::Remote), Dir::Down, far, 60);
+        app.layout
+            .split(Slot::files(Side::Remote), Dir::Down, near, 60);
+        app.stash_layout();
+        assert_eq!(app.active, 1, "the second tab is the one on screen");
+
+        app.settle_focus();
+
+        assert!(
+            app.tabs[1].terms.iter().any(|t| t.id == 42),
+            "the tab on screen gets its shell"
+        );
+        assert!(
+            app.tabs[0].terms.iter().any(|t| t.id == 41),
+            "and so does the one behind it, rather than waiting to be looked at"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- the session --------------------------------------------------------
+
+    #[test]
+    fn the_session_is_written_down_in_the_shape_a_workspace_takes() {
+        let dir = scratch("session-shape");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "web01", None);
+        app.tabs[0].trees[0].cwd = "/etc".into();
+
+        let snapshot = app.session_snapshot();
+        assert_eq!(snapshot.name, crate::workspace::SESSION_NAME);
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].path(), Some("/etc"));
+        assert_eq!(
+            snapshot.local_path,
+            Some(dir.display().to_string()),
+            "and this machine's half of it"
+        );
+
+        // It round-trips through the file it is kept in.
+        let text = serde_json::to_string(&snapshot).unwrap();
+        let back: crate::workspace::Workspace = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.items[0].path(), Some("/etc"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_previous_session_sits_at_the_top_of_the_workspace_list() {
+        let dir = scratch("session-row");
+        let mut app = app_in(&dir);
+        // Pushed rather than saved: a test has no business writing over the
+        // list this machine actually keeps.
+        app.workspaces.entries.push(crate::workspace::Workspace {
+            name: "prod".into(),
+            local_path: None,
+            local_editors: Vec::new(),
+            local_dirs: PaneDirs::default(),
+            items: Vec::new(),
+            saved_at: 0,
+        });
+        assert_eq!(app.workspace_rows(), 1);
+        assert_eq!(
+            app.workspace_at(0),
+            Some(0),
+            "with none, row 0 is a saved one"
+        );
+
+        app.previous_session = Some(app.session_snapshot());
+        assert_eq!(app.workspace_rows(), 2);
+        assert_eq!(app.workspace_at(0), None, "the session goes above them");
+        assert_eq!(app.workspace_at(1), Some(0));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn coming_back_to_the_previous_session_reconnects_what_it_held() {
+        let dir = scratch("session-restore");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "web01", None);
+        app.tabs[0].trees[0].cwd = "/srv".into();
+        // Taken before anything else happens, the way startup takes it.
+        app.previous_session = Some(app.session_snapshot());
+        app.tabs.clear();
+        app.pending.clear();
+
+        app.restore_previous_session();
+        assert_eq!(app.pending.len(), 1, "it starts connecting again");
+        assert_eq!(
+            app.pending[0].initial_dir.as_deref(),
+            Some("/srv"),
+            "and opens where it was left"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -59,6 +59,7 @@ pub enum Action {
     Split,
     SplitDown,
     NewList,
+    EditorPane,
     ClosePane,
     EnterShell,
     Zoom,
@@ -90,6 +91,8 @@ pub enum Action {
     CloseTab,
     NextTab,
     PreviousTab,
+    MoveTabLeft,
+    MoveTabRight,
 
     // sshman itself
     Settings,
@@ -136,6 +139,7 @@ impl Action {
         Action::Split,
         Action::SplitDown,
         Action::NewList,
+        Action::EditorPane,
         Action::ClosePane,
         Action::EnterShell,
         Action::Zoom,
@@ -165,6 +169,8 @@ impl Action {
         Action::CloseTab,
         Action::NextTab,
         Action::PreviousTab,
+        Action::MoveTabLeft,
+        Action::MoveTabRight,
         Action::Settings,
         Action::Help,
         Action::Quit,
@@ -208,6 +214,7 @@ impl Action {
             Self::Split => "split",
             Self::SplitDown => "split-down",
             Self::NewList => "new-list",
+            Self::EditorPane => "editor-pane",
             Self::ClosePane => "close-pane",
             Self::EnterShell => "enter-shell",
             Self::Zoom => "zoom",
@@ -237,6 +244,8 @@ impl Action {
             Self::CloseTab => "close-tab",
             Self::NextTab => "next-tab",
             Self::PreviousTab => "previous-tab",
+            Self::MoveTabLeft => "move-tab-left",
+            Self::MoveTabRight => "move-tab-right",
             Self::Settings => "settings",
             Self::Help => "help",
             Self::Quit => "quit",
@@ -281,6 +290,7 @@ impl Action {
             Self::Split => "a shell beside this pane",
             Self::SplitDown => "a shell below, closing nothing",
             Self::NewList => "another file list beside this pane",
+            Self::EditorPane => "an editor pane beside this one, or close it",
             Self::ClosePane => "close the focused pane",
             Self::EnterShell => "in and out of a shell",
             Self::Zoom => "give the whole screen to this pane",
@@ -310,6 +320,8 @@ impl Action {
             Self::CloseTab => "close the tab on screen",
             Self::NextTab => "the next tab",
             Self::PreviousTab => "the tab before it",
+            Self::MoveTabLeft => "move this tab one place left",
+            Self::MoveTabRight => "move it one place right",
             Self::Settings => "what sshman remembers between sessions",
             Self::Help => "the help",
             Self::Quit => "leave sshman",
@@ -354,6 +366,7 @@ impl Action {
             | Self::Split
             | Self::SplitDown
             | Self::NewList
+            | Self::EditorPane
             | Self::ClosePane
             | Self::EnterShell
             | Self::Zoom
@@ -382,7 +395,9 @@ impl Action {
             | Self::LocalTab
             | Self::CloseTab
             | Self::NextTab
-            | Self::PreviousTab => "Servers and tabs",
+            | Self::PreviousTab
+            | Self::MoveTabLeft
+            | Self::MoveTabRight => "Servers and tabs",
             Self::Settings | Self::Help | Self::Quit => "sshman",
         }
     }
@@ -567,6 +582,7 @@ const DEFAULTS: &[(Action, &[&str])] = &[
     (Action::Split, &["|"]),
     (Action::SplitDown, &["_"]),
     (Action::NewList, &["T"]),
+    (Action::EditorPane, &["i"]),
     (Action::ClosePane, &["F9"]),
     (Action::EnterShell, &["F6"]),
     (Action::Zoom, &["m", "F3"]),
@@ -596,6 +612,8 @@ const DEFAULTS: &[(Action, &[&str])] = &[
     (Action::CloseTab, &["W"]),
     (Action::NextTab, &["ctrl-right"]),
     (Action::PreviousTab, &["ctrl-left"]),
+    (Action::MoveTabLeft, &["ctrl-shift-left"]),
+    (Action::MoveTabRight, &["ctrl-shift-right"]),
     (Action::Settings, &[","]),
     (Action::Help, &["?", "F1"]),
     (Action::Quit, &["q"]),

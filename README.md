@@ -7,10 +7,13 @@ paths. **Split any pane** for a real shell — local or on the server, as many a
 you like, with text you can select and copy out — or arrange a tab as a file
 tree, your editor and a terminal, where clicking a file opens it in the editor
 beside you. Open **several servers at once in tabs**, each with its own
-directory, panes and sudo state. Servers you connect to are remembered, so next
-time you pick one from a list, and a dropped connection comes back on its own. **Docker containers work as
-targets too** — local ones or ones running on a server — and behave exactly
-like a host — Docker or Podman.
+directory, panes and sudo state, and drag them into whatever order you want.
+Servers you connect to are remembered, so next time you pick one from a list,
+and a dropped connection comes back on its own. **Everything that was open
+comes back** — `sshman --resume` reopens the last session down to which
+directory each pane and each shell was in, whether or not you saved anything.
+**Docker containers work as targets too** — local ones or ones running on a
+server — and behave exactly like a host — Docker or Podman.
 
 Single self-contained binary, no runtime dependencies, no agent to install on
 the server.
@@ -51,6 +54,7 @@ cargo build --release --features vendored
 ```sh
 sshman                          # connection form
 sshman --local                  # a tab on this machine, no server involved
+sshman --resume                 # everything that was open last time
 sshman web01                    # a ~/.ssh/config alias, resolved like ssh does
 sshman deploy@10.0.0.5 -p 2222
 sshman web01 -i ~/.ssh/deploy_key --remote-path /etc/nginx
@@ -105,6 +109,8 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `w` | workspaces: saved sets of connections |
 | `W` | close the tab on screen |
 | `Ctrl-←` / `Ctrl-→`, `Alt-1`…`Alt-9` | move between tabs |
+| `Ctrl-Shift-←` / `Ctrl-Shift-→` | move this tab along the row |
+| `i` | an editor pane beside this one, or close the one there is |
 | `S` | cut the focused pane in two, with a terminal below — or close the last one |
 | `\|` | a terminal beside the focused pane, closing nothing |
 | `_` | a terminal below it, closing nothing |
@@ -123,12 +129,13 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `n` / `F7`, `r` / `F2`, `d` / `F8` | mkdir, rename, delete |
 | `C` | connection screen: connect to a server, always in a new tab |
 | `?` | help |
-| `q` | quit |
+| `q` | quit — it asks first, and the same key again is yes |
 
 The mouse works too: scroll wheel, click to focus a pane and select a row, drag
 any border between panes to resize, click the `[⤢]` in a pane's corner to
 maximise it or the `[✕]` beside it to close it, and click the `[+]` at the
-right of the top bar for a new tab on this machine. Dragging across a shell
+right of the top bar for a new tab on this machine. Each tab's chip carries a
+`✕` of its own, and dragging a chip along the row moves that tab. Dragging across a shell
 pane picks text out and copies it when the button comes up. In a shell pane a
 program that has asked for the mouse gets it instead — btop's clicks, a pager's
 wheel — and holding `Shift` is the way past that, to the pane's own scrollback
@@ -373,13 +380,18 @@ belongs to the shell — including `m`.
 A zoomed shell is resized on the far end like any other, so full-screen `top`
 or `vim` gets the whole terminal.
 
-Each tab remembers which pane had the keyboard. Switching tabs while zoomed
-into a shell shows the other tab's shell, or its file list when that tab has
-none — and coming back puts you in the shell you left, still running. Unzoomed
-both are on screen either way, so switching tabs there leaves the keyboard on
-the file list rather than dropping it into a shell that would swallow the
-`Ctrl-←`/`Ctrl-→` you are cycling with. The local file list is the same pane on
-every tab, so being on it when you switch means staying on it.
+**The zoom belongs to the tab**, along with its arrangement: a tab left full
+screen on a log stays that way while the tab beside it stays split, and coming
+back to it is coming back to what you left rather than to whatever the last tab
+happened to be doing.
+
+Each tab also remembers which pane had the keyboard. Switching tabs while
+zoomed into a shell shows the other tab's shell, or its file list when that tab
+has none — and coming back puts you in the shell you left, still running.
+Unzoomed both are on screen either way, so switching tabs there leaves the
+keyboard on the file list rather than dropping it into a shell that would
+swallow the `Ctrl-←`/`Ctrl-→` you are cycling with. The local file list is the
+same pane on every tab, so being on it when you switch means staying on it.
 
 ## Keeping up with changes
 
@@ -578,24 +590,79 @@ and `Enter` on one to open it again.
 ╰─────────────────────────────────────────────────────────────────────╯
 ```
 
-Each member remembers **which directory it was showing** and **the panes it was
-arranged into**, so reopening puts you back where you were rather than at three
-home directories in three identical panes — and the local pane's directory is
-restored too. A workspace saved by an older version simply has no panes in it,
-and opens at whatever is on screen. Containers are saved by name rather than by
-the id they happened to have, so a workspace survives them being recreated.
+Each member remembers **the panes it was arranged into** and **the directory
+every one of them was pointed at**, so reopening puts you back where you were
+rather than at three home directories in three identical panes. That is every
+pane, not just the first: a tab split into two file lists comes back with both
+of them where you left them, and the lists and shells on your own machine are
+restored the same way. A workspace saved by an older version simply has no
+panes in it, and opens at whatever is on screen. Containers are saved by name
+rather than by the id they happened to have, so a workspace survives them being
+recreated.
 
-**Shells come back too.** The arrangement includes the terminal panes, so a tab
-you left split with a shell on the server opens split with a shell on the
-server, in the same place and the same directory — and a pane that was your
-[editor](#the-editor-pane) opens as an editor again. What cannot come back is
-the *session*: a pty whose process has ended is gone, so what you get is a
-fresh shell where the old one was. The part a workspace can keep is the part
-that was yours to arrange rather than the shell's to remember.
+**Shells come back too, running.** The arrangement includes the terminal panes,
+so a tab you left split with a shell on the server opens split with a shell on
+the server — in the same place, and in the directory that shell was in rather
+than the one it was started in. A pane that was your
+[editor](#the-editor-pane) opens as an editor again. They open on every tab a
+workspace holds rather than only the one you happen to look at first, so a
+workspace of four servers with a shell each comes back as four running shells.
+What cannot come back is the *session*: a pty whose process has ended is gone,
+so what you get is a fresh shell where the old one was. The part a workspace
+can keep is the part that was yours to arrange rather than the shell's to
+remember.
 
 A remote shell waits for its tab to say where it is before opening, so a
 workspace of five servers does not try to start shells on connections that are
 still being made.
+
+### How sshman knows where a shell is
+
+A pane is a pty, and a pty carries characters rather than state, so a shell's
+directory cannot simply be read off. sshman finds it three ways, in the order
+it trusts them:
+
+- **Asking the kernel.** For a shell on this machine, `/proc` says exactly
+  where the process is. Always right, and always available on Linux.
+- **`OSC 7`.** The escape sequence whose whole meaning is "I am in this
+  directory". Right wherever it arrives — a server as readily as here — but
+  only sent by shells whose prompt has been set up to send it.
+- **The window title.** Most shells set it from their prompt, and the
+  convention is `user@host: directory` — which is what the stock prompt does on
+  every Debian- and Fedora-descended system. A guess rather than a report, so
+  it is only read when the title takes that shape exactly, and never over
+  either of the above.
+
+Failing all three the shell is written down where it was started, which is
+still the right answer for a shell nobody has `cd`-ed anywhere. If you want
+this exact on a server whose shell says nothing, add `OSC 7` to its prompt:
+
+```sh
+# ~/.bashrc on the server
+PROMPT_COMMAND='printf "\033]7;file://%s%s\033\\" "$HOSTNAME" "$PWD"'
+```
+
+## The previous session
+
+You do not have to have saved anything. sshman writes down where the session
+got to as you work — the same tabs, panes and directories a workspace holds —
+so it survives being closed any way at all: quitting, a terminal window shut on
+it, a laptop that went to sleep and never woke up.
+
+```sh
+sshman --resume            # everything that was open last time
+```
+
+It also sits at the top of the workspace list as **previous session**, so `w`
+and `Enter` brings it back without leaving the keyboard, and `Del` on that row
+forgets it. It is exactly a workspace you never had to name, and holds no more
+than one does: no passwords, and no shell history.
+
+The record is kept up to date as you go rather than written on the way out,
+because there is no way out to hook — a closed window never comes back to
+sshman at all. Whatever is on disk when the process stops is what comes back.
+Nothing is written while nothing is open, so quitting an empty sshman does not
+throw away the session before it.
 
 ```sh
 sshman -w morning          # open a workspace straight away
@@ -620,14 +687,22 @@ Clicking the `[+]` at the right of the top bar opens a tab straight away, on
 this machine, in the directory you were looking at — a new tab asks you
 nothing, and `L` does the same from the keyboard. `C` opens the connection
 screen instead, and the server you pick arrives as its own tab. `W` closes the
-one on screen. `Ctrl-←`/`Ctrl-→` move between them, `Alt-1`
+one on screen, and each chip carries a `✕` that closes that tab whether or not
+it is the one you are looking at. `Ctrl-←`/`Ctrl-→` move between them, `Alt-1`
 … `Alt-9` jump straight to one, and clicking a tab works too. The bar only
 appears once you have more than one.
 
 ```
  sshman  deploy@web01  tab 1/3
- 1 deploy@web01    2 root@db1:2222 #    3 me@10.0.0.5 ⟳    + or L new tab · C connect · W close · Ctrl-←/→ switch
+ 1 deploy@web01 ✕   2 root@db1:2222 # ✕   3 me@10.0.0.5 ⟳ ✕   + new tab · ✕ or W close · Ctrl-←/→ switch
 ```
+
+**Tabs move.** `Ctrl-Shift-←` and `Ctrl-Shift-→` shove the one on screen a
+place along the row, wrapping at the ends the way stepping between them does,
+and dragging a chip with the mouse does the same — the tabs change places as
+the pointer crosses them, so what is under it is where the tab lands. Whichever
+way you move one, the tab you were looking at is still the tab you are looking
+at.
 
 With more tabs than the row can hold it becomes a window on to them, always
 showing the one you are on, with `‹3` and `4›` at the ends saying how many did
@@ -1062,9 +1137,10 @@ returns immediately and sshman will think you made no changes.
 ### The editor pane
 
 All of that is sshman standing aside for your editor. The other way is to give
-the editor a pane and leave it there: press `A`, pick **Editor**, and the tab
-becomes a file list down the left, your editor beside it, and a terminal
-underneath.
+the editor a pane and leave it there. Press `i` and one opens beside the pane
+you are on, and `i` again takes it away — the same key either way, the way `S`
+works for a shell. `A` then **Editor** builds a whole tab around one instead: a
+file list down the left, your editor beside it, and a terminal underneath.
 
 ```
 ┌ THIS MACHINE ~/src ──[⤢]┐┌ EDITOR ────────────────────────────[⤢]┐
@@ -1140,6 +1216,17 @@ disk or passed on a command line, and is fed to `sudo -S` on stdin. File data is
 never mixed into that stdin stream: `sudo` reads its password with a buffered
 read that can swallow whatever follows it, which is exactly why transfers are
 staged instead of piped.
+
+## Leaving
+
+`q` asks before it goes, because it sits one key away from half the file keys
+and everything open goes with it — the shells, the connections, and anything
+still transferring. The dialog names the tabs it would close and says what is
+still running; pressing `q` again is the answer to it, so the second press
+leaves. `Ctrl-C` behaves the same way from anywhere.
+
+Nothing is lost either way: the session is [written down as you
+go](#the-previous-session), and `sshman --resume` brings it back.
 
 ## Notes
 
