@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use base64::Engine as _;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -805,8 +806,50 @@ impl Hvp {
 // ---- where the shell is ----------------------------------------------------
 
 /// The most an OSC payload may run to before we stop keeping it. Paths are
-/// well under this; a clipboard sequence is not, and is none of our business.
+/// well under this.
 const MAX_OSC: usize = 4096;
+
+/// The same, for `OSC 52`, which carries base64 rather than a path and so is
+/// as long as whatever was copied. Comfortably past what the terminal will
+/// take on the way back out — `to_clipboard` is where a very large copy is
+/// actually trimmed — so nothing usable is dropped here for being long.
+const MAX_OSC_CLIPBOARD: usize = 128 * 1024;
+
+/// The last thing a program inside a pane asked to put on the system
+/// clipboard, waiting for the main loop to hand it to the terminal.
+///
+/// One process, one terminal, one clipboard, so this is shared rather than
+/// carried per pane: whichever pane copied last is the one that copied.
+static COPIED: Mutex<Option<String>> = Mutex::new(None);
+
+/// Take whatever a program inside a pane has copied since this was last
+/// asked, if anything.
+pub fn take_copied() -> Option<String> {
+    COPIED.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// The text an `OSC 52` sequence is asking to put on the clipboard, if that
+/// is what the payload is.
+///
+/// The shape is `52 ; <selection> ; <base64>`, where the selection names
+/// which of the X selections is meant — sshman has only the one clipboard to
+/// offer, so it is read past rather than honoured. A payload of `?` is the
+/// question rather than the statement: the program asking what is *on* the
+/// clipboard, which cannot be answered from here, since sshman has no
+/// clipboard of its own to read.
+fn clipboard_text(payload: &[u8]) -> Option<String> {
+    let rest = payload.strip_prefix(b"52;")?;
+    let split = rest.iter().position(|&b| b == b';')?;
+    let data = &rest[split + 1..];
+    if data == b"?" {
+        return None;
+    }
+    // Emitters differ on whether they pad, and neither spelling is wrong.
+    let decoded = base64::engine::general_purpose::STANDARD_PAD_INDIFFERENT
+        .decode(data)
+        .ok()?;
+    Some(String::from_utf8_lossy(&decoded).into_owned())
+}
 
 /// What a shell has let slip about where it is. See [`Shell::cwd`], which
 /// decides what to make of it.
@@ -829,8 +872,12 @@ struct Reported {
 /// hears is a bonus on top of the directory the shell was started in rather
 /// than a replacement for it.
 ///
-/// It only listens. Every byte it sees has already been passed on to the
-/// screen, since a terminal has its own uses for the same sequences.
+/// It also hears `OSC 52`, which is a program asking for something to go on
+/// the system clipboard. That one has nowhere else to go — see
+/// [`clipboard_text`].
+///
+/// Nothing here is swallowed. Every byte it sees has already been passed on
+/// to the screen, since a terminal has its own uses for the same sequences.
 struct OscWatch {
     /// The payload of an OSC sequence as it arrives; `None` between them.
     partial: Option<Vec<u8>>,
@@ -873,9 +920,14 @@ impl OscWatch {
                         continue;
                     }
                     self.esc = byte == 0x1b;
-                    if buf.len() >= MAX_OSC {
-                        // Far too long to be a path. Whatever this is, it is
-                        // not ours, and holding on to it would be a leak.
+                    // A clipboard sequence is as long as what was copied; a
+                    // path is not. Past whichever cap applies we are not
+                    // looking at either, and holding on would be a leak.
+                    let cap = match buf.starts_with(b"52;") {
+                        true => MAX_OSC_CLIPBOARD,
+                        false => MAX_OSC,
+                    };
+                    if buf.len() >= cap {
                         self.partial = None;
                         self.esc = false;
                         continue;
@@ -889,6 +941,15 @@ impl OscWatch {
     /// Take a finished OSC payload and keep whatever it said about where the
     /// shell is.
     fn note(&mut self, payload: &[u8]) {
+        // A program asking for something to go on the system clipboard.
+        // sshman has no clipboard of its own — the terminal it is running in
+        // owns that — so this is caught here and passed along. Nothing else
+        // would: the screen has already seen the sequence and made nothing of
+        // it, which is exactly why `y` inside vim used to do nothing at all.
+        if let Some(text) = clipboard_text(payload) {
+            *COPIED.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+            return;
+        }
         let Ok(text) = std::str::from_utf8(payload) else {
             return;
         };
@@ -1559,13 +1620,12 @@ mod tests {
 
     #[test]
     fn nothing_else_a_program_paints_is_taken_for_a_directory() {
+        // One of these is a copy, and the clipboard is one per process.
+        let _turn = CLIP.lock().unwrap_or_else(|e| e.into_inner());
         // A window title, which is a guess rather than a report.
         assert_eq!(heard(&[b"\x1b]0;me@web01: ~\x07"]), None);
-        // A clipboard sequence, which is long and none of our business.
-        let mut long = b"\x1b]52;c;".to_vec();
-        long.extend(std::iter::repeat_n(b'A', MAX_OSC * 2));
-        long.extend(b"\x07");
-        assert_eq!(heard(&[&long]), None);
+        // A clipboard sequence, which is not a place.
+        assert_eq!(heard(&[b"\x1b]52;c;L2V0Yy9uZ2lueA==\x07"]), None);
         // Ordinary output that happens to mention one.
         assert_eq!(heard(&[b"7;file:///etc\n"]), None);
     }
@@ -1606,6 +1666,67 @@ mod tests {
         shell.home = None;
         assert_eq!(shell.at_home("~/work"), None, "with no home to stand on");
         shell.type_in("exit\n");
+    }
+
+    /// The clipboard a program copies to is one per process, so the tests
+    /// that look at it take turns.
+    static CLIP: Mutex<()> = Mutex::new(());
+
+    /// What a stream of bytes asked to put on the clipboard.
+    fn copied(chunks: &[&[u8]]) -> Option<String> {
+        let seen = Arc::new(Mutex::new(Reported::default()));
+        let mut watch = OscWatch::new(seen);
+        take_copied();
+        for chunk in chunks {
+            watch.feed(chunk);
+        }
+        take_copied()
+    }
+
+    #[test]
+    fn a_program_copying_to_the_clipboard_is_heard() {
+        let _turn = CLIP.lock().unwrap_or_else(|e| e.into_inner());
+        // What vim writes for `"+yy` with `clipboard=osc52`.
+        assert_eq!(copied(&[b"\x1b]52;c;aGVsbG8=\x07"]), Some("hello".into()));
+        // The other terminator, and the selection nobody but X cares about.
+        assert_eq!(copied(&[b"\x1b]52;p;aGVsbG8=\x1b\\"]), Some("hello".into()));
+        // Split across two reads, the way a long one arrives.
+        assert_eq!(
+            copied(&[b"\x1b]52;c;aGVs", b"bG8=\x07"]),
+            Some("hello".into())
+        );
+        // Emitters differ on padding, and neither spelling is wrong.
+        assert_eq!(copied(&[b"\x1b]52;c;aGVsbG8\x07"]), Some("hello".into()));
+    }
+
+    #[test]
+    fn a_program_asking_what_is_on_the_clipboard_gets_no_answer() {
+        let _turn = CLIP.lock().unwrap_or_else(|e| e.into_inner());
+        // sshman has no clipboard of its own to read back.
+        assert_eq!(copied(&[b"\x1b]52;c;?\x07"]), None);
+        // Nor is anything else an OSC says a copy.
+        assert_eq!(copied(&[b"\x1b]0;me@web01: ~\x07"]), None);
+        assert_eq!(copied(&[b"\x1b]7;file://h/etc\x07"]), None);
+        // Not base64 at all, so not something to hand on.
+        assert_eq!(copied(&[b"\x1b]52;c;not base64!\x07"]), None);
+    }
+
+    #[test]
+    fn a_copy_too_large_to_pass_on_is_dropped_rather_than_held() {
+        let _turn = CLIP.lock().unwrap_or_else(|e| e.into_inner());
+        let mut huge = b"\x1b]52;c;".to_vec();
+        huge.extend(std::iter::repeat_n(b'A', MAX_OSC_CLIPBOARD * 2));
+        huge.extend(b"\x07");
+        assert_eq!(copied(&[&huge]), None);
+    }
+
+    #[test]
+    fn a_copy_reaches_the_screen_as_well() {
+        let _turn = CLIP.lock().unwrap_or_else(|e| e.into_inner());
+        // A terminal that does understand OSC 52 is downstream of this one,
+        // so the sequence is passed on rather than eaten.
+        let out = fixed(b"\x1b]52;c;aGVsbG8=\x07ok");
+        assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07ok");
     }
 
     #[test]

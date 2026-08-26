@@ -181,6 +181,11 @@ fn main() -> Result<()> {
         (None, false) => None,
     };
 
+    // Whether sshman was started with nothing in particular to open, and so
+    // lands on the connection screen with the whole of it to choose from.
+    let requested_nothing =
+        requested.is_none() && args.target.is_none() && !args.docker && !args.local;
+
     let mut app = App::new(
         opts,
         local_start,
@@ -204,6 +209,14 @@ fn main() -> Result<()> {
     }
     if args.local {
         app.open_local_tab();
+    }
+
+    // Nothing was asked for, so ask about the obvious thing: the session this
+    // one follows. Anything on the command line — a server, a workspace,
+    // `--resume`, a container, `--local` — has already said what to open, and
+    // is not second-guessed.
+    if requested_nothing && app.config.offering_resume() {
+        app.offer_previous_session();
     }
 
     let mut terminal = setup_terminal().context("cannot set up the terminal")?;
@@ -393,6 +406,10 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
                 _ => {}
             }
         }
+
+        // A program inside a pane asking for the clipboard is the same
+        // request as sshman's own copy, and leaves by the same door.
+        app.take_shell_clipboard();
 
         // Anything copied out of a shell goes to the terminal now, between
         // frames, so it cannot land in the middle of one.

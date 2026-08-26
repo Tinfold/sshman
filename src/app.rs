@@ -168,6 +168,9 @@ pub enum ConfirmAction {
     /// phrase, because the innocent explanation and an attack look identical
     /// from here.
     ReplaceHostKey,
+    /// Open everything the last session had open. Asked on the way in, so
+    /// that coming back does not depend on remembering a flag.
+    RestoreSession,
 }
 
 pub struct ConfirmState {
@@ -3282,6 +3285,18 @@ impl App {
         self.clipboard_out.take()
     }
 
+    /// Pick up anything a program inside a pane asked to put on the
+    /// clipboard — `y` in vim, `tmux copy-selection`, anything else that
+    /// speaks `OSC 52`.
+    ///
+    /// It is the same request as sshman's own copy and takes the same route
+    /// out, so it also becomes what [`Action::PasteText`] types into a pane.
+    pub fn take_shell_clipboard(&mut self) {
+        if let Some(text) = crate::shell::take_copied() {
+            self.copy(text);
+        }
+    }
+
     /// Type what was copied into the focused terminal. The system clipboard
     /// is the terminal's own business; this is the way that works when it
     /// cannot be reached at all.
@@ -3832,7 +3847,7 @@ impl App {
             Setting::Keys => self.open_keys(),
             // There are only two answers, so opening it is the same as
             // stepping it: a list of two would be a list for its own sake.
-            Setting::Background | Setting::ShellColours | Setting::Watch => {
+            Setting::Background | Setting::ShellColours | Setting::Watch | Setting::Resume => {
                 self.change_setting(setting, 1)
             }
             Setting::Editor | Setting::EditorOpen | Setting::Shell => self.ask_for_setting(setting),
@@ -3986,6 +4001,7 @@ impl App {
                 Setting::Background => self.toggle_background(),
                 Setting::ShellColours => self.toggle_shell_colours(),
                 Setting::Watch => self.toggle_watch(),
+                Setting::Resume => self.toggle_resume(),
                 Setting::Keys => self.open_keys(),
                 Setting::Editor | Setting::EditorOpen | Setting::Shell => {}
             },
@@ -4018,6 +4034,7 @@ impl App {
             | Setting::Background
             | Setting::ShellColours
             | Setting::Watch
+            | Setting::Resume
             | Setting::Keys => {
                 return;
             }
@@ -4041,6 +4058,10 @@ impl App {
             Setting::Watch => {
                 self.config.watch = None;
                 self.save_config("the file lists follow their directories again".into());
+            }
+            Setting::Resume => {
+                self.config.resume = None;
+                self.save_config("starting up offers the last session again".into());
             }
             Setting::Keys => {
                 self.keymap = Keymap::default();
@@ -4105,6 +4126,23 @@ impl App {
             false => format!(
                 "the file lists hold still — {} refreshes them",
                 self.keymap.shown(Action::Reload)
+            ),
+        };
+        self.save_config(done);
+    }
+
+    /// Whether starting up asks about the session before this one.
+    fn toggle_resume(&mut self) {
+        let offer = !self.config.offering_resume();
+        self.config.resume = Some(match offer {
+            true => "on".into(),
+            false => "off".into(),
+        });
+        let done = match offer {
+            true => "starting up offers the session before this one".to_string(),
+            false => format!(
+                "starting up says nothing — {} still has it, or `sshman --resume`",
+                self.keymap.shown(Action::Workspaces)
             ),
         };
         self.save_config(done);
@@ -4311,6 +4349,7 @@ impl App {
                         );
                         self.start_connect();
                     }
+                    ConfirmAction::RestoreSession => self.restore_previous_session(),
                 }
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -4835,7 +4874,7 @@ impl App {
             }
             KeyCode::Char('a') => self.open_prompt(
                 PromptKind::AddForward,
-                "Forward port (3000, or 8080:3000, or 8080:host:3000)".into(),
+                "Forward port (3000, 8080:3000, 8080:host:3000, 0.0.0.0:8080:host:3000)".into(),
                 String::new(),
             ),
             KeyCode::Delete | KeyCode::Char('d') => {
@@ -4876,7 +4915,7 @@ impl App {
         if tab
             .forwards
             .iter()
-            .any(|f| f.spec.local_port == spec.local_port)
+            .any(|f| f.spec.local_port == spec.local_port && f.spec.local_host == spec.local_host)
         {
             self.set_status(
                 format!("port {} is already forwarded here", spec.local_port),
@@ -4890,7 +4929,19 @@ impl App {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.forwards.push(forward);
                 }
-                self.set_status(format!("forwarding {}", spec.describe()), Level::Good);
+                // Binding past loopback is worth saying out loud: it is the
+                // difference between a port for you and a port for the
+                // network you are on.
+                self.set_status(
+                    match spec.is_public() {
+                        true => format!(
+                            "forwarding {} — reachable from the network",
+                            spec.describe()
+                        ),
+                        false => format!("forwarding {}", spec.describe()),
+                    },
+                    Level::Good,
+                );
             }
             Err(e) => self.set_status(e.to_string(), Level::Bad),
         }
@@ -5030,6 +5081,64 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Ask, on the way in, whether to pick up where the last session left
+    /// off.
+    ///
+    /// The session is written down as you work, so there is always something
+    /// to come back to; what there was not, until this, was any reminder of
+    /// it. `--resume` only helps someone who remembered to type it, which is
+    /// nobody at the moment they wanted it. Saying no leaves the session
+    /// where it is — it is still the first row of the workspace list (`w`)
+    /// for the rest of the run.
+    pub fn offer_previous_session(&mut self) {
+        let Some(session) = self
+            .previous_session
+            .clone()
+            .filter(|s| !s.items.is_empty())
+        else {
+            return;
+        };
+        let mut body = vec![
+            format!(
+                "{}, last open {}:",
+                session.summary(),
+                crate::history::relative_time(session.saved_at)
+            ),
+            String::new(),
+        ];
+        // Name them rather than counting them: "3 connections" is not enough
+        // to decide by, and the names are what you remember them as. A very
+        // long session is summarised at the end instead of growing a dialog
+        // taller than the terminal.
+        const SHOWN: usize = 8;
+        for item in session.items.iter().take(SHOWN) {
+            body.push(format!(
+                "  {}",
+                crate::types::ellipsize(&item.describe(), 68)
+            ));
+        }
+        if let Some(rest) = session.items.len().checked_sub(SHOWN).filter(|n| *n > 0) {
+            body.push(format!("  … and {rest} more"));
+        }
+        body.push(String::new());
+        body.push(format!(
+            "n starts fresh — {} brings this back later either way.",
+            self.keymap.shown(Action::Workspaces)
+        ));
+
+        let mut state = ConfirmState::simple(
+            "Come back to your last session?",
+            body,
+            ConfirmAction::RestoreSession,
+            false,
+        );
+        // Asked over the connection screen, which is where saying no leaves
+        // you: there are no file panes to fall back to yet.
+        state.return_to = self.mode;
+        self.confirm = Some(state);
+        self.mode = Mode::Confirm;
     }
 
     /// Open everything the last session had open.
@@ -8977,6 +9086,89 @@ mod tests {
             Some("/srv"),
             "and opens where it was left"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn starting_up_offers_the_session_before_this_one() {
+        let dir = scratch("session-offer");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "web01", None);
+        // The fixture's tab has no options behind it, and the offer names
+        // what a real one would be reconnected as.
+        app.tabs[0].target = Target::Ssh(ConnectOpts {
+            user: "me".into(),
+            host: "web01".into(),
+            port: 22,
+            ..Default::default()
+        });
+        app.previous_session = Some(app.session_snapshot());
+        app.tabs.clear();
+        app.pending.clear();
+        app.mode = Mode::Connect;
+
+        app.offer_previous_session();
+        assert_eq!(app.mode, Mode::Confirm, "it asks rather than assuming");
+        let asked = app.confirm.as_ref().expect("a question");
+        assert!(matches!(asked.action, ConfirmAction::RestoreSession));
+        assert!(!asked.danger, "coming back is not a dangerous answer");
+        assert!(
+            asked.body.iter().any(|l| l.contains("me@web01")),
+            "it names what it would open: {:?}",
+            asked.body
+        );
+
+        // Yes opens it, exactly as `--resume` would have.
+        press(&mut app, 'y');
+        assert_eq!(app.pending.len(), 1);
+        assert!(app.confirm.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn saying_no_to_the_offer_leaves_the_session_where_it_was() {
+        let dir = scratch("session-declined");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "web01", None);
+        app.previous_session = Some(app.session_snapshot());
+        app.tabs.clear();
+        app.pending.clear();
+        app.mode = Mode::Connect;
+
+        app.offer_previous_session();
+        press(&mut app, 'n');
+        assert_eq!(
+            app.mode,
+            Mode::Connect,
+            "no goes back to the connection screen, not to panes that are not there"
+        );
+        assert!(app.pending.is_empty(), "and connects to nothing");
+        assert!(
+            app.previous_session.is_some(),
+            "the session is still there for w to reach"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_session_with_nothing_in_it_is_not_worth_asking_about() {
+        let dir = scratch("session-empty");
+        let mut app = app_in(&dir);
+        app.mode = Mode::Connect;
+
+        app.previous_session = None;
+        app.offer_previous_session();
+        assert_eq!(app.mode, Mode::Connect);
+
+        // Recorded, but with no connections to come back to.
+        app.previous_session = Some(app.session_snapshot());
+        assert!(app.previous_session.as_ref().unwrap().items.is_empty());
+        app.offer_previous_session();
+        assert_eq!(app.mode, Mode::Connect, "nothing to offer, so nothing said");
+        assert!(app.confirm.is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }

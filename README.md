@@ -10,7 +10,7 @@ beside you. Open **several servers at once in tabs**, each with its own
 directory, panes and sudo state, and drag them into whatever order you want.
 Servers you connect to are remembered, so next time you pick one from a list,
 and a dropped connection comes back on its own. **Everything that was open
-comes back** — `sshman --resume` reopens the last session down to which
+comes back** — starting sshman offers you the last session, down to which
 directory each pane and each shell was in, whether or not you saved anything.
 **Docker containers work as targets too** — local ones or ones running on a
 server — and behave exactly like a host — Docker or Podman.
@@ -52,9 +52,9 @@ cargo build --release --features vendored
 ## Use
 
 ```sh
-sshman                          # connection form
+sshman                          # connection form — offers the last session
 sshman --local                  # a tab on this machine, no server involved
-sshman --resume                 # everything that was open last time
+sshman --resume                 # everything that was open last time, no question
 sshman web01                    # a ~/.ssh/config alias, resolved like ssh does
 sshman deploy@10.0.0.5 -p 2222
 sshman web01 -i ~/.ssh/deploy_key --remote-path /etc/nginx
@@ -521,17 +521,26 @@ adds one, `d` stops it. The shorthand is what you would expect:
 | `3000` | `localhost:3000` here reaches port 3000 on the server |
 | `8080:3000` | `localhost:8080` here reaches port 3000 on the server |
 | `8080:db:5432` | `localhost:8080` here reaches `db:5432` **as the server sees it** |
+| `0.0.0.0:8080:db:5432` | the same, bound where the rest of your network can reach it |
+| `192.168.1.10:8080:db:5432` | the same, bound on one interface only |
+| `[::1]:8080:db:5432` | an IPv6 address, in brackets so its colons are not read as separators |
 
-That last form is the useful one: `db` is resolved by the server, so a database
-that only listens on a private network becomes reachable from a client here.
-The same goes for a service bound to the server's own loopback — invisible from
-outside, but a forward reaches it.
+The three-part form is the useful one: `db` is resolved by the server, so a
+database that only listens on a private network becomes reachable from a client
+here. The same goes for a service bound to the server's own loopback —
+invisible from outside, but a forward reaches it.
 
-Forwards bind `127.0.0.1` only, deliberately: a forward is for reaching
-something yourself, and binding every interface would quietly republish a
-private service to your whole network. The title bar shows `⇄ n` while any are
-running, the list counts the connections each has carried, and **they are saved
-with the workspace**, so reopening one brings its tunnels back up.
+**Forwards bind `127.0.0.1` unless you put an address in front of them.** A
+forward is usually for reaching something yourself, and binding every interface
+by default would quietly republish a private service to your whole network — so
+that is something you ask for rather than something you get. The four-part form
+is how you ask: an interface's address, or `*` (or `0.0.0.0`) for all of them,
+which is the same spelling `ssh -L` takes. One bound past loopback is drawn in
+the warning colour in the list, and says so when it starts.
+
+The title bar shows `⇄ n` while any are running, the list counts the
+connections each has carried, and **they are saved with the workspace** — bind
+address and all — so reopening one brings its tunnels back up.
 
 Each forward runs on its own SSH connection, for the same reason the shells do,
 so a busy tunnel never holds up a file transfer.
@@ -649,8 +658,18 @@ got to as you work — the same tabs, panes and directories a workspace holds �
 so it survives being closed any way at all: quitting, a terminal window shut on
 it, a laptop that went to sleep and never woke up.
 
+**Starting sshman with nothing in particular to open offers it.** Run `sshman`
+on its own and it asks — naming the servers it would reconnect and when they
+were last open — before you have touched anything; `y` brings them back, `n`
+starts fresh and leaves the session where it is. That is the point: coming back
+should not depend on remembering a flag at the one moment you wanted it.
+Anything on the command line has already said what to open, so a server, a
+workspace, `--resume`, `-d` or `-L` are taken at their word and nothing is
+asked. **Coming back** in the settings pane (`,`) turns the question off for
+good.
+
 ```sh
-sshman --resume            # everything that was open last time
+sshman --resume            # everything that was open last time, without asking
 ```
 
 It also sits at the top of the workspace list as **previous session**, so `w`
@@ -836,6 +855,14 @@ Some terminals need it turned on — `set-clipboard on` in tmux, `clipboard_cont
 in kitty. sshman keeps the text either way, so `Y` types it into any shell pane
 whether or not the clipboard could be reached — and `y` copies the selection
 again, for when a drag reached the clipboard but you would rather it had not.
+
+**A program inside a pane can copy too.** `"+y` in vim, `y` in a tmux copy
+mode, anything else that speaks OSC 52: sshman is the terminal for those panes,
+so the sequence stops there, and what it asks for is passed on to the terminal
+sshman is itself running in. Nothing is swallowed — a copy from inside a pane
+reaches the system clipboard by exactly the route a drag does, and is kept the
+same way, so `Y` types it into another pane. (Before this, those copies went
+nowhere at all.)
 
 Scrollback is included: scroll back with the wheel and drag over what you find
 there. A program that has asked for the mouse — `btop`, `vim`, a pager — gets

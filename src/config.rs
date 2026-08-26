@@ -75,6 +75,12 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch: Option<String>,
 
+    /// Whether starting sshman with nothing to open offers the session it was
+    /// in last time. Absent means it does; `off` means it does not, and
+    /// `--resume` or `w` is how you come back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
+
     /// Keys of your own, by what they do: `"quit": ["Q"]`.
     ///
     /// Only what you have changed is written here; everything else keeps the
@@ -168,6 +174,16 @@ impl Config {
         )
     }
 
+    /// Whether to ask, on the way in, about coming back to the last session.
+    /// Read the same forgiving way as the rest: only a word meaning no turns
+    /// it off.
+    pub fn offering_resume(&self) -> bool {
+        !matches!(
+            self.resume.as_deref().map(str::trim),
+            Some("off") | Some("no") | Some("never")
+        )
+    }
+
     pub fn paint_background(&self) -> bool {
         !matches!(
             self.background.as_deref().map(str::trim),
@@ -221,6 +237,7 @@ pub enum Setting {
     Background,
     ShellColours,
     Watch,
+    Resume,
     Keys,
 }
 
@@ -241,6 +258,7 @@ impl Setting {
         Setting::Background,
         Setting::ShellColours,
         Setting::Watch,
+        Setting::Resume,
         Setting::Keys,
     ];
 
@@ -253,6 +271,7 @@ impl Setting {
             Self::Background => "Background",
             Self::ShellColours => "Shell colours",
             Self::Watch => "Keeping up",
+            Self::Resume => "Coming back",
             Self::Keys => "Keys",
         }
     }
@@ -267,6 +286,7 @@ impl Setting {
             Self::Background => "the theme's own, or whatever the terminal is set to",
             Self::ShellColours => "what a shell pane's own output is coloured from",
             Self::Watch => "whether a list keeps up with changes from outside",
+            Self::Resume => "whether starting up offers the session before this one",
             Self::Keys => "which key asks for what",
         }
     }
@@ -274,9 +294,12 @@ impl Setting {
     pub fn kind(self) -> Kind {
         match self {
             Self::Editor | Self::EditorOpen | Self::Shell => Kind::Text,
-            Self::Theme | Self::Background | Self::ShellColours | Self::Watch | Self::Keys => {
-                Kind::Choice
-            }
+            Self::Theme
+            | Self::Background
+            | Self::ShellColours
+            | Self::Watch
+            | Self::Resume
+            | Self::Keys => Kind::Choice,
         }
     }
 }
@@ -310,6 +333,10 @@ impl Config {
                 true => "lists follow their directories".into(),
                 false => "only when you ask".into(),
             },
+            Setting::Resume => match self.offering_resume() {
+                true => "asked on the way in".into(),
+                false => "only when you ask for it".into(),
+            },
             Setting::Keys => match self.keys.len() {
                 0 => "the ones sshman ships".into(),
                 1 => "1 key of your own".into(),
@@ -339,6 +366,10 @@ impl Config {
                 false => "the default",
             },
             Setting::Watch => match self.watch.is_some() {
+                true => "set here",
+                false => "the default",
+            },
+            Setting::Resume => match self.resume.is_some() {
                 true => "set here",
                 false => "the default",
             },
@@ -379,6 +410,7 @@ impl Config {
             Setting::Background => self.background.is_some(),
             Setting::ShellColours => self.shell_colours.is_some(),
             Setting::Watch => self.watch.is_some(),
+            Setting::Resume => self.resume.is_some(),
             Setting::Keys => !self.keys.is_empty(),
             Setting::Theme => self.theme_name().is_some(),
         }

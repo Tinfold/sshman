@@ -2089,9 +2089,14 @@ fn draw_forwards(f: &mut Frame, app: &App, area: Rect) {
                     Style::new().fg(theme.dim),
                 )),
                 Line::from(Span::styled(
-                    "a host the server can see. Saved with the workspace.",
+                    "a host the server can see. A forward binds 127.0.0.1 unless",
                     Style::new().fg(theme.dim),
                 )),
+                Line::from(Span::styled(
+                    "you put an address first: 0.0.0.0:8080:db:5432. Saved with",
+                    Style::new().fg(theme.dim),
+                )),
+                Line::from(Span::styled("the workspace.", Style::new().fg(theme.dim))),
             ]),
             inner,
         );
@@ -2109,8 +2114,13 @@ fn draw_forwards(f: &mut Frame, app: &App, area: Rect) {
             let carried = forward.connection_count();
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{:<34}", forward.spec.describe()),
-                    Style::new().fg(theme.text).bold(),
+                    format!("{:<40}", ellipsize(&forward.spec.describe(), 39)),
+                    // A forward the network can reach is not the usual case,
+                    // and is worth being able to see at a glance.
+                    match forward.spec.is_public() {
+                        true => Style::new().fg(theme.warn).bold(),
+                        false => Style::new().fg(theme.text).bold(),
+                    },
                 ),
                 Span::styled(format!("{:<12}", ellipsize(&state, 12)), style),
                 Span::styled(
@@ -2639,6 +2649,14 @@ pub const HELP: &[(&str, &str)] = &[
         "  that has asked for the mouse gets the drag instead; hold",
     ),
     ("", "  Shift to select over one of those."),
+    (
+        "",
+        "  A program inside a pane copying for itself — \"+y in vim, a",
+    ),
+    (
+        "",
+        "  tmux copy mode — reaches the same clipboard the same way.",
+    ),
     ("wheel", "scroll the shell's history"),
     (
         "",
@@ -2810,8 +2828,13 @@ pub const HELP: &[(&str, &str)] = &[
     ("", "  reaches a host only the server can see."),
     (
         "",
-        "  They bind 127.0.0.1 only, and are saved with the workspace.",
+        "  They bind 127.0.0.1 unless you put an address in front —",
     ),
+    (
+        "",
+        "  0.0.0.0:8080:db:5432 opens it to the network, [::1] for v6.",
+    ),
+    ("", "  They are saved with the workspace."),
     ("", ""),
     ("", "Names and workspaces"),
     ("N", "name the server on screen (empty clears it)"),
