@@ -68,6 +68,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.zoom_buttons.clear();
     app.close_buttons.clear();
     app.pane_titles.clear();
+    app.crumbs.clear();
 
     for (slot, rect) in app.areas.panes.clone() {
         draw_slot(f, app, slot, rect);
@@ -463,16 +464,22 @@ fn draw_files(
     let sudo = side == Side::Remote && app.sudo();
     let live = side == Side::Local || app.connected();
     let theme = app.theme;
+    let hovered = Hovered {
+        row: app.hovered_row(slot),
+        crumb: app.hovered_crumb(slot).map(str::to_string),
+    };
+    let trail = place_crumbs(app, slot, area, &label, &path, buttons);
     draw_pane(
         f,
         area,
         &label,
-        &path,
+        &trail,
         app.pane_mut(slot),
         focused,
         sudo,
         live,
         target,
+        hovered,
         buttons,
         theme,
     );
@@ -519,6 +526,8 @@ fn draw_shell(
     }
     title.push(Span::raw(" "));
 
+    // All the bottom edge has to say: how far back the view is scrolled,
+    // when it is scrolled at all.
     let mut hint = Vec::new();
     if scrolled > 0 {
         hint.push(Span::styled(
@@ -526,14 +535,6 @@ fn draw_shell(
             Style::new().fg(theme.warn),
         ));
     }
-    hint.push(Span::styled(
-        if focused {
-            " F6 back to files "
-        } else {
-            " F6 to focus "
-        },
-        Style::new().fg(theme.dim),
-    ));
 
     let block = Block::bordered()
         .border_type(if focused {
@@ -705,6 +706,132 @@ fn place_title(app: &mut App, slot: Slot, area: Rect, label: &str) {
     ));
 }
 
+/// One piece of the path drawn in a pane's title.
+struct Crumb {
+    /// What to draw, its separator included.
+    text: String,
+    /// The directory it names, or `None` for the `…` that stands in for the
+    /// pieces there was no room for — which names nothing and leads nowhere.
+    path: Option<String>,
+}
+
+/// What the pointer is resting on in one file list.
+#[derive(Default)]
+struct Hovered {
+    row: Option<usize>,
+    crumb: Option<String>,
+}
+
+/// How much of the top border is left for the path once the label, the
+/// corners and any buttons have taken theirs.
+fn path_room(area: Rect, label: &str, buttons: Buttons) -> usize {
+    let shown = u16::from(buttons.zoom) + u16::from(buttons.close);
+    let button_room = if shown > 0 { BUTTON_W * shown + 1 } else { 0 };
+    area.width
+        .saturating_sub(label.chars().count() as u16 + 6 + button_room) as usize
+}
+
+/// Lay the path out along the top border as a trail of clickable pieces, and
+/// write down where each one landed so a click can be turned back into the
+/// directory it names.
+///
+/// A path too long for the pane loses whole pieces from the front rather than
+/// characters from the middle: half a directory name is not something you can
+/// click on, and the end of a path is the part worth reading anyway.
+fn place_crumbs(
+    app: &mut App,
+    slot: Slot,
+    area: Rect,
+    label: &str,
+    path: &str,
+    buttons: Buttons,
+) -> Vec<Crumb> {
+    let room = path_room(area, label, buttons);
+    let plain = |text: String| vec![Crumb { text, path: None }];
+    // Anything that is not a path — "—" for a pane with nowhere to be — is
+    // drawn as it always was and leads nowhere.
+    if !path.starts_with('/') {
+        return plain(ellipsize(path, room.max(8)));
+    }
+    let pieces = crate::types::crumbs(path);
+    let Some((_, whole)) = pieces.last().cloned() else {
+        return plain(ellipsize(path, room.max(8)));
+    };
+
+    // Each piece carries the separator in front of it, except the first two:
+    // the root is a separator, so the piece after it needs none of its own.
+    let text_of = |i: usize, name: &str| match i {
+        0 | 1 => name.to_string(),
+        _ => format!("/{name}"),
+    };
+    let width_of = |text: &str| text.chars().count();
+
+    // Drop whole pieces off the front until what is left fits, counting the
+    // `…` that says some were dropped.
+    let mut start = 0;
+    let fits = loop {
+        let elided = usize::from(start > 0);
+        let width: usize = pieces[start..]
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| width_of(&text_of(start + i, name)))
+            .sum();
+        if width + elided <= room {
+            break true;
+        }
+        if start + 1 >= pieces.len() {
+            break false;
+        }
+        start += 1;
+    };
+    // Not even the last piece fits: there is no trail to draw, so fall back
+    // to the shortened path this always drew.
+    if !fits {
+        return plain(ellipsize(&whole, room.max(8)));
+    }
+
+    let mut trail = Vec::with_capacity(pieces.len() - start + 1);
+    if start > 0 {
+        trail.push(Crumb {
+            text: "…".to_string(),
+            path: None,
+        });
+    }
+    for (i, (name, leads_to)) in pieces.iter().enumerate().skip(start) {
+        let mut text = text_of(i, name);
+        // The first piece kept after an elision needs the separator the
+        // dropped ones were carrying, or it would run into the `…`.
+        if i == start && start > 0 && !text.starts_with('/') {
+            text.insert(0, '/');
+        }
+        trail.push(Crumb {
+            text,
+            path: Some(leads_to.clone()),
+        });
+    }
+
+    // Where each of them ended up. The title starts one cell in from the
+    // corner, after the label, which is how ratatui draws it.
+    let mut x = area.x + 1 + label.chars().count() as u16 + 2;
+    for crumb in &trail {
+        let width = width_of(&crumb.text) as u16;
+        if let Some(leads_to) = &crumb.path {
+            app.crumbs.push((
+                Rect {
+                    x,
+                    y: area.y,
+                    width,
+                    height: 1,
+                },
+                slot,
+                leads_to.clone(),
+            ));
+        }
+        x += width;
+    }
+    trail
+}
+
 fn place_buttons(app: &mut App, slot: Slot, area: Rect) -> Buttons {
     let buttons = Buttons {
         zoomed: app.zoomed,
@@ -782,13 +909,15 @@ fn draw_pane(
     f: &mut Frame,
     area: Rect,
     label: &str,
-    path: &str,
+    trail: &[Crumb],
     pane: &mut Pane,
     focused: bool,
     sudo: bool,
     live: bool,
     // This is the list `c` copies into.
     target: bool,
+    // What the pointer is over, drawn lit so a click can be aimed.
+    hovered: Hovered,
     buttons: Buttons,
     theme: Theme,
 ) {
@@ -805,21 +934,25 @@ fn draw_pane(
         Style::new().fg(theme.muted)
     };
 
-    // Reserve room for the label, the borders and the buttons when shortening
-    // the path, so a long one cannot push them off the end.
-    let shown = u16::from(buttons.zoom) + u16::from(buttons.close);
-    let button_room = if shown > 0 { BUTTON_W * shown + 1 } else { 0 };
-    let path_room = area
-        .width
-        .saturating_sub(label.len() as u16 + 6 + button_room) as usize;
-    let title = Line::from(vec![
-        Span::styled(format!(" {label} "), label_style),
+    let mut title = vec![Span::styled(format!(" {label} "), label_style)];
+    title.extend(trail.iter().map(|crumb| {
+        let style = match crumb.path.is_some() {
+            true => Style::new().fg(theme.text),
+            // The `…` standing in for the pieces that did not fit is not one
+            // of them, and must not look like something to click.
+            false => Style::new().fg(theme.dim),
+        };
+        let lit = crumb.path.as_deref() == hovered.crumb.as_deref() && crumb.path.is_some();
         Span::styled(
-            ellipsize(path, path_room.max(8)),
-            Style::new().fg(theme.text),
-        ),
-        Span::raw(" "),
-    ]);
+            crumb.text.clone(),
+            match lit {
+                true => style.add_modifier(Modifier::UNDERLINED),
+                false => style,
+            },
+        )
+    }));
+    title.push(Span::raw(" "));
+    let title = Line::from(title);
 
     let mut bottom = Vec::new();
     if !pane.filter.is_empty() {
@@ -917,7 +1050,17 @@ fn draw_pane(
     let items: Vec<ListItem> = pane
         .view
         .iter()
-        .map(|e| ListItem::new(entry_line(e, pane.marked.contains(&e.name), cols, theme)))
+        .enumerate()
+        .map(|(i, e)| {
+            let item = ListItem::new(entry_line(e, pane.marked.contains(&e.name), cols, theme));
+            // Under the pointer: underlined rather than filled in, so it
+            // cannot be mistaken for the cursor — which is the row the
+            // keyboard is on, and stays where it is while the mouse moves.
+            match Some(i) == hovered.row {
+                true => item.style(Style::new().add_modifier(Modifier::UNDERLINED)),
+                false => item,
+            }
+        })
         .collect();
 
     let list = List::new(items).highlight_style(
@@ -1132,14 +1275,12 @@ fn fit_hints(hints: &[Shown], width: u16) -> Vec<Shown> {
 /// Every hint list, in the order each is written: most useful first, ways out
 /// last, because [`fit_hints`] cuts from the end but keeps the tail.
 const SHELL_ZOOMED: &[Hint] = &[
-    ("@enter-shell", "back to files"),
     ("@command", "sshman keys"),
     ("@zoom", "unzoom"),
     ("@close-pane", "close this pane"),
     ("", "every other key goes to the shell"),
 ];
 const SHELL: &[Hint] = &[
-    ("@enter-shell", "back to files"),
     ("@command", "sshman keys"),
     ("drag", "select"),
     ("@zoom", "zoom"),
@@ -2452,10 +2593,7 @@ pub const HELP: &[(&str, &str)] = &[
         "m / F3",
         "give the whole screen to the focused pane, or undo that",
     ),
-    (
-        "",
-        "  The zoom follows the focus, so Tab and F6 keep working and",
-    ),
+    ("", "  The zoom follows the focus, so Tab keeps working and"),
     (
         "",
         "  m, F3 or Esc brings the other panes back. F3 works from",
@@ -2565,12 +2703,15 @@ pub const HELP: &[(&str, &str)] = &[
         "S",
         "open a shell under the focused pane, or close the last",
     ),
-    ("F6", "move the keyboard between the files and the shell"),
     (
         "",
         "  While the shell has focus every key goes to it, including",
     ),
-    ("", "  Ctrl-C and Esc. F6 is the way back out."),
+    (
+        "",
+        "  Ctrl-C and Esc. Ctrl-] is the way back out, and so is",
+    ),
+    ("", "  clicking another pane."),
     ("", ""),
     ("", "Command mode: every sshman key, from anywhere"),
     ("Ctrl-]", "hand the keyboard to sshman rather than the pane"),
@@ -3366,6 +3507,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_piece_of_a_path_is_clickable_where_it_is_drawn() {
+        // The trail is drawn as a title and clicked through rects worked out
+        // separately: if those two ever disagree, clicking a crumb quietly
+        // goes somewhere else.
+        let here = Slot::files(Side::Local);
+        let (app, rows) = frame(110, 30, |_| {});
+        let path = app.path_of(here);
+        let trail: Vec<(Rect, String)> = app
+            .crumbs
+            .iter()
+            .filter(|(_, slot, _)| *slot == here)
+            .map(|(rect, _, path)| (*rect, path.clone()))
+            .collect();
+
+        let want = crate::types::crumbs(&path);
+        assert!(!want.is_empty(), "the pane is somewhere: {path}");
+        assert_eq!(trail.len(), want.len(), "a crumb per piece of {path}");
+
+        for (i, ((rect, leads_to), (name, wanted))) in trail.iter().zip(&want).enumerate() {
+            let drawn = button_text(&rows, *rect);
+            assert_eq!(
+                drawn.trim_start_matches('/'),
+                match i {
+                    0 => "",
+                    _ => name.as_str(),
+                },
+                "piece {i} of {path} is drawn as {drawn:?}"
+            );
+            assert_eq!(leads_to, wanted, "and leads where it is drawn");
+        }
+
+        // Side by side along the top border, never on top of one another.
+        for (a, _) in &trail {
+            assert_eq!(a.y, app.areas.of(here).unwrap().y);
+            for (b, _) in &trail {
+                assert!(
+                    a == b || a.right() <= b.x || b.right() <= a.x,
+                    "{a:?} {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_path_too_long_for_the_pane_loses_whole_pieces() {
+        let root = std::env::temp_dir().join(format!("sshman-crumbs-{}", std::process::id()));
+        let deep = root.join("one/two/three/four/five/six/seven/eight/nine/ten");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let here = Slot::files(Side::Local);
+        let (app, rows) = frame(60, 30, |app| {
+            app.goto(here, deep.display().to_string());
+        });
+        let shown = app.path_of(here);
+        let trail: Vec<(Rect, String)> = app
+            .crumbs
+            .iter()
+            .filter(|(_, slot, _)| *slot == here)
+            .map(|(rect, _, path)| (*rect, path.clone()))
+            .collect();
+
+        assert!(!trail.is_empty(), "the end of the path is still a trail");
+        assert!(
+            trail.len() < crate::types::crumbs(&shown).len(),
+            "and not all of {shown} fits in half of 60 columns"
+        );
+        // Whatever is left is whole pieces of the real path rather than
+        // halves of names, which is the point of dropping them from the front.
+        for (rect, path) in &trail {
+            let drawn = button_text(&rows, *rect);
+            assert!(
+                shown.contains(drawn.trim_start_matches('/')),
+                "{drawn:?} is not a piece of {shown}"
+            );
+            assert!(shown.starts_with(path.as_str()), "{path} is not a prefix");
+        }
+        assert_eq!(
+            trail.last().map(|(_, p)| p.as_str()),
+            Some(shown.as_str()),
+            "and the last piece is where the pane actually is"
+        );
+        // The pieces that did not fit say so.
+        let border: String = rows[app.areas.of(here).unwrap().y as usize].clone();
+        assert!(border.contains('…'), "{border}");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

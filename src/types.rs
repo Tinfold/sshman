@@ -136,6 +136,28 @@ pub fn rparent(path: &str) -> String {
     }
 }
 
+/// A path broken into the pieces it is made of, each with the directory that
+/// piece names: `/etc/nginx` is `/` then `etc` then `nginx`, leading to `/`,
+/// `/etc` and `/etc/nginx`.
+///
+/// This is what makes the path in a pane's title a trail you can click your
+/// way back along. Local paths are POSIX here as well — sshman runs on
+/// systems where they are — so one function does for both sides.
+pub fn crumbs(path: &str) -> Vec<(String, String)> {
+    let trimmed = path.trim_end_matches('/');
+    // The root is a piece of every absolute path, and the whole of one path.
+    let mut out = match path.starts_with('/') {
+        true => vec![("/".to_string(), "/".to_string())],
+        false => Vec::new(),
+    };
+    let mut so_far = String::new();
+    for name in trimmed.split('/').filter(|p| !p.is_empty()) {
+        so_far = rjoin(&so_far, name);
+        out.push((name.to_string(), so_far.clone()));
+    }
+    out
+}
+
 pub fn rbasename(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     match trimmed.rfind('/') {
@@ -171,6 +193,45 @@ pub fn ellipsize(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_breaks_into_the_directories_it_names() {
+        assert_eq!(
+            crumbs("/etc/nginx/sites"),
+            [
+                ("/", "/"),
+                ("etc", "/etc"),
+                ("nginx", "/etc/nginx"),
+                ("sites", "/etc/nginx/sites"),
+            ]
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+        );
+    }
+
+    #[test]
+    fn the_root_is_a_path_of_one_piece() {
+        assert_eq!(crumbs("/"), [("/".to_string(), "/".to_string())]);
+        assert!(crumbs("").is_empty());
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_add_a_piece() {
+        assert_eq!(crumbs("/etc/"), crumbs("/etc"));
+        assert_eq!(crumbs("//etc//nginx"), crumbs("/etc/nginx"));
+    }
+
+    #[test]
+    fn every_piece_leads_where_it_says() {
+        for (name, path) in crumbs("/home/me/work/src") {
+            assert!(
+                path.ends_with(&name) || name == "/",
+                "{name} leads to {path}"
+            );
+        }
+        let deep = crumbs("/home/me/work/src");
+        assert_eq!(deep.last().unwrap().1, "/home/me/work/src");
+        assert_eq!(rparent(&deep.last().unwrap().1), deep[deep.len() - 2].1);
+    }
 
     #[test]
     fn remote_paths_join_and_split() {

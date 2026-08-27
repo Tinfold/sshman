@@ -45,7 +45,7 @@ use ratatui::crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
     enable_raw_mode, supports_keyboard_enhancement,
 };
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 
 use app::{App, Mode, UiAction};
 use backend::Target;
@@ -566,6 +566,22 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         }
     }
 
+    // The path along a pane's top border is a trail of the directories it is
+    // inside, and each piece of it points at its own. Tested before the
+    // borders for the same reason the pane's name is: it is drawn on one.
+    if let Some((_, slot, path)) = app
+        .crumbs
+        .iter()
+        .find(|(rect, ..)| rect.contains(at))
+        .cloned()
+    {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.click_crumb(slot, path.clone());
+        }
+        app.hover_crumb(slot, path);
+        return;
+    }
+
     // A pane is picked up by its name, which is why the name is drawn where
     // it is. Tested before the borders: the name sits on one, and a pane you
     // meant to move is not a border you meant to drag.
@@ -632,10 +648,16 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
     }
 
     let Some(slot) = app.areas.at(m.column, m.row) else {
+        // Over no pane at all — the tab bar, the footer — so there is no row
+        // under the pointer to light up.
+        app.clear_hover();
         return;
     };
 
     if slot.is_term() {
+        // A terminal has no rows to aim at, and a highlight left behind in
+        // the list next door would be pointing at nothing.
+        app.clear_hover();
         // Clicking in a terminal puts the keyboard there, the same as clicking
         // in a file list does — whether or not the program inside then gets
         // the click as well.
@@ -700,6 +722,7 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
     }
 
     let Some(area) = app.areas.of(slot) else {
+        app.clear_hover();
         return;
     };
     match m.kind {
@@ -707,16 +730,139 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         MouseEventKind::ScrollUp => app.pane_mut(slot).move_by(-3),
         MouseEventKind::Down(MouseButton::Left) => {
             app.focus_pane(slot);
-            // The first row inside the block sits just below its border.
-            if m.row > area.y {
-                let offset = app.pane(slot).state.offset();
-                let index = offset + (m.row - area.y - 1) as usize;
-                if index < app.pane(slot).view.len() {
-                    app.click_row(slot, index);
-                }
+            if let Some(index) = row_in(app, slot, area, m.row) {
+                app.click_row(slot, index);
             }
         }
         _ => {}
+    }
+    // Whatever the event was, light the row the pointer is over now: the
+    // wheel moves the list under a pointer that has not moved at all, so the
+    // answer has to be worked out after the fact rather than before it.
+    match row_in(app, slot, area, m.row) {
+        Some(index) => app.hover_row(slot, index),
+        None => app.clear_hover(),
+    }
+}
+
+/// The entry a file list is showing on a row of the screen, if it is showing
+/// one there.
+fn row_in(app: &App, slot: layout::Slot, area: Rect, row: u16) -> Option<usize> {
+    let pane = app.pane(slot);
+    row_at(pane.state.offset(), pane.view.len(), area, row)
+}
+
+/// The same, as arithmetic: the entry `row` is showing in a list of `len`
+/// scrolled to `offset` and drawn in `area`.
+///
+/// The borders are not rows, and neither is the space past the last entry in
+/// a short listing — a click on either of those means nothing, which is
+/// exactly what it should do.
+fn row_at(offset: usize, len: usize, area: Rect, row: u16) -> Option<usize> {
+    // The first entry sits just below the top border and the last just above
+    // the bottom one.
+    if row <= area.y || row + 1 >= area.y + area.height {
+        return None;
+    }
+    let index = offset + (row - area.y - 1) as usize;
+    (index < len).then_some(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyModifiers, MouseEvent};
+
+    /// An app drawn once at this size, so everything the mouse aims at — the
+    /// pane areas, the buttons, the crumbs along a title — has been placed.
+    fn drawn(width: u16, height: u16, setup: impl FnOnce(&mut App)) -> App {
+        let dir = std::env::temp_dir().join(format!("sshman-mouse-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        let mut app = App::new(ConnectOpts::default(), dir.clone(), None, false);
+        app.mode = Mode::Browse;
+        setup(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        app
+    }
+
+    fn at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_click_on_a_crumb_lands_on_the_directory_it_names() {
+        let here = layout::Slot::files(app::Side::Local);
+        let mut app = drawn(110, 30, |_| {});
+        let (rect, _, path) = app
+            .crumbs
+            .iter()
+            .find(|(_, slot, path)| *slot == here && path.as_str() == "/tmp")
+            .cloned()
+            .expect("/tmp is a piece of the path this test runs in");
+
+        handle_mouse(&mut app, at(MouseEventKind::Moved, rect.x, rect.y));
+        assert_eq!(
+            app.hovered_crumb(here),
+            Some(path.as_str()),
+            "the pointer lights the crumb it is over"
+        );
+
+        handle_mouse(
+            &mut app,
+            at(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y),
+        );
+        assert_eq!(app.path_of(here), "/tmp", "and a click goes there");
+    }
+
+    /// A pane ten rows tall at the top left: one border row, eight rows of
+    /// entries, one border row.
+    const PANE: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 10,
+    };
+
+    #[test]
+    fn a_row_of_the_screen_is_the_entry_drawn_on_it() {
+        assert_eq!(row_at(0, 20, PANE, 1), Some(0), "the first row inside");
+        assert_eq!(row_at(0, 20, PANE, 8), Some(7), "the last row inside");
+        // Scrolled, the same rows are showing entries further down.
+        assert_eq!(row_at(5, 20, PANE, 1), Some(5));
+        assert_eq!(row_at(5, 20, PANE, 8), Some(12));
+    }
+
+    #[test]
+    fn the_borders_are_not_entries() {
+        assert_eq!(row_at(0, 20, PANE, 0), None, "the top border");
+        assert_eq!(row_at(0, 20, PANE, 9), None, "the bottom border");
+        assert_eq!(row_at(0, 20, PANE, 10), None, "past the pane entirely");
+    }
+
+    #[test]
+    fn the_space_below_a_short_listing_is_not_an_entry() {
+        // Three entries in a pane with room for eight: the rows below them
+        // are drawn empty, and a click on one of those means nothing.
+        assert_eq!(row_at(0, 3, PANE, 3), Some(2), "the last one there is");
+        assert_eq!(row_at(0, 3, PANE, 4), None);
+        assert_eq!(row_at(0, 3, PANE, 8), None);
+        assert_eq!(row_at(0, 0, PANE, 1), None, "and an empty list has none");
+    }
+
+    #[test]
+    fn a_pane_too_small_to_hold_a_row_offers_none() {
+        let sliver = Rect { height: 2, ..PANE };
+        assert_eq!(row_at(0, 20, sliver, 0), None);
+        assert_eq!(row_at(0, 20, sliver, 1), None);
     }
 }
 

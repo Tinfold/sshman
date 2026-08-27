@@ -61,7 +61,6 @@ pub enum Action {
     NewList,
     EditorPane,
     ClosePane,
-    EnterShell,
     Zoom,
     Even,
     Arrange,
@@ -141,7 +140,6 @@ impl Action {
         Action::NewList,
         Action::EditorPane,
         Action::ClosePane,
-        Action::EnterShell,
         Action::Zoom,
         Action::Even,
         Action::Arrange,
@@ -216,7 +214,6 @@ impl Action {
             Self::NewList => "new-list",
             Self::EditorPane => "editor-pane",
             Self::ClosePane => "close-pane",
-            Self::EnterShell => "enter-shell",
             Self::Zoom => "zoom",
             Self::Even => "even",
             Self::Arrange => "arrange",
@@ -292,7 +289,6 @@ impl Action {
             Self::NewList => "another file list beside this pane",
             Self::EditorPane => "an editor pane beside this one, or close it",
             Self::ClosePane => "close the focused pane",
-            Self::EnterShell => "in and out of a shell",
             Self::Zoom => "give the whole screen to this pane",
             Self::Even => "even the borders up again",
             Self::Arrange => "pick a ready-made arrangement",
@@ -368,7 +364,6 @@ impl Action {
             | Self::NewList
             | Self::EditorPane
             | Self::ClosePane
-            | Self::EnterShell
             | Self::Zoom
             | Self::Even
             | Self::Arrange
@@ -584,7 +579,6 @@ const DEFAULTS: &[(Action, &[&str])] = &[
     (Action::NewList, &["T"]),
     (Action::EditorPane, &["i"]),
     (Action::ClosePane, &["F9"]),
-    (Action::EnterShell, &["F6"]),
     (Action::Zoom, &["m", "F3"]),
     (Action::Even, &["="]),
     (Action::Arrange, &["A"]),

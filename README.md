@@ -29,10 +29,10 @@ the server.
 │ $ git status --short                     │┃ deploy@web01:/etc/nginx$ nginx -t        ┃
 │  M app.conf                              │┃ syntax is ok, test is successful         ┃
 │ $ █                                      │┃ deploy@web01:/etc/nginx$ █               ┃
-└─────────────────────────── F6 to focus ──┘┗━━━━━━━━━━━━━━━━━━━ F6 back to files ━━━━━┛
+└──────────────────────────────────────────┘┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
  ↑ app.conf  1.4M / 2.1M  (67%)
 ✓ 1 item(s) copied to remote
- F6  back to files   Ctrl-]  sshman keys   drag  select   every other key goes to the shell
+ Ctrl-]  sshman keys   drag  select   every other key goes to the shell
 ```
 
 ## Build
@@ -117,7 +117,6 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `T` | another file list beside it, closing nothing |
 | `F9` | close the focused pane, from anywhere |
 | `A` | pick a ready-made arrangement for this tab |
-| `F6` | move the keyboard between the file list and the shell |
 | `Ctrl-]` | command mode: hand the keyboard to sshman (see below) |
 | `Alt-↑↓←→` | move the keyboard to the pane that way |
 | `Alt-Shift-↑↓←→` | move the border nearest the focused pane |
@@ -131,15 +130,21 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `?` | help |
 | `q` | quit — it asks first, and the same key again is yes |
 
-The mouse works too: scroll wheel, click to focus a pane and select a row, drag
-any border between panes to resize, click the `[⤢]` in a pane's corner to
-maximise it or the `[✕]` beside it to close it, and click the `[+]` at the
-right of the top bar for a new tab on this machine. Each tab's chip carries a
-`✕` of its own, and dragging a chip along the row moves that tab. Dragging across a shell
-pane picks text out and copies it when the button comes up. In a shell pane a
-program that has asked for the mouse gets it instead — btop's clicks, a pager's
-wheel — and holding `Shift` is the way past that, to the pane's own scrollback
-and to selecting over it.
+The mouse works too: the row under the pointer lights up as you move over a
+file list, one click focuses that pane and puts the cursor on the row, and two
+clicks mean the row — a directory opens, a file goes to your editor, exactly as
+`Enter` would. The path along a pane's top edge is a trail you can click your
+way back along: every piece of it points at the directory it names, so
+`/etc/nginx/sites` is three steps back up to `/etc` in one click, and a path
+too long for the pane loses whole pieces off the front rather than characters
+out of the middle. The wheel scrolls, dragging any border between panes resizes
+them, the `[⤢]` in a pane's corner maximises it and the `[✕]` beside it closes
+it, and the `[+]` at the right of the top bar opens a new tab on this machine.
+Each tab's chip carries a `✕` of its own, and dragging a chip along the row
+moves that tab. Dragging across a shell pane picks text out and copies it when
+the button comes up. In a shell pane a program that has asked for the mouse
+gets it instead — btop's clicks, a pager's wheel — and holding `Shift` is the
+way past that, to the pane's own scrollback and to selecting over it.
 
 Every one of these can be [something else](#keys-of-your-own).
 
@@ -309,8 +314,9 @@ has. The last pane on a tab cannot be closed; `W` closes the tab.
 **Moving between them.** `Tab` steps through the file lists in the order they
 are drawn, so with the two sshman opens with it crosses the middle, and with
 more it reaches every one of them. `Alt-↑↓←→` moves to the pane across the
-nearest border that way, and clicking one does the same. `F6` goes in and out
-of a terminal in one press, and `Ctrl-]` is [command mode](#command-mode).
+nearest border that way, and clicking one does the same. `Ctrl-]` is
+[command mode](#command-mode), which reaches every pane and every other
+sshman key from inside a terminal.
 
 ### More than one file list
 
@@ -372,8 +378,8 @@ the other panes back. Every pane also carries a button in its top-right corner
 — `[⤢]` to maximise, `[⤡]` to put it back — so the mouse can do it too, and
 clicking another pane's button blows up that pane rather than the focused one.
 
-The zoom follows the focus rather than pinning one pane, so `Tab` and `F6` work
-zoomed exactly as they do at any other size: you stay zoomed, on whatever you
+The zoom follows the focus rather than pinning one pane, so `Tab` works
+zoomed exactly as it does at any other size: you stay zoomed, on whatever you
 moved to. `F3` does the same job from inside a shell, where every other key
 belongs to the shell — including `m`.
 
@@ -751,11 +757,11 @@ like, on either machine. They are proper
 terminals, not a command box: `vim`, `top`, `less`, colours and Ctrl-C all
 behave, because each one runs on a pty with a terminal emulator behind it.
 
-`F6` moves the keyboard between the file list and the shell. While the shell
-has focus **every** key goes to it, including `Ctrl-C`, `Esc` and `q` — `F6` is
-the way back out, and `Ctrl-]` is [command mode](#command-mode), which reaches
-the rest of sshman without leaving the shell at all. The footer says so
-whenever a shell is focused.
+Clicking a pane moves the keyboard into it, and out of it again. While the
+shell has focus **every** key goes to it, including `Ctrl-C`, `Esc` and `q` —
+`Ctrl-]` is [command mode](#command-mode), which hands the keyboard back to
+sshman and reaches the rest of it without leaving the shell at all. The footer
+lists the keys the shell does not swallow whenever one is focused.
 
 - The local shell starts in the local pane's directory, running `$SHELL` — or
   [whichever shell you named](#which-shell-a-pane-starts).
@@ -1174,15 +1180,17 @@ file list down the left, your editor beside it, and a terminal underneath.
 │ drwxr-xr-x  <DIR> src/  ││ 1 # sshman                            │
 │ -rw-r--r--  30.5K README││ 2                                     │
 │ ...                     ││ ...                                   │
-└─────────────── 7 items ─┘└──────────────────────── F6 to focus ──┘
+└─────────────── 7 items ─┘└───────────────────────────────────────┘
                            ┌ SHELL ─────────────────────────────[⤢]┐
                            │ ~/src$ cargo test                     │
-                           └──────────────────────── F6 to focus ──┘
+                           └───────────────────────────────────────┘
 ```
 
 Clicking a file in the list opens it in that pane, and `e` does the same from
-the keyboard. With no editor pane open a click only moves the cursor, as it
-always has — opening a file on a single click would be a surprise otherwise.
+the keyboard. With no editor pane open a single click only moves the cursor —
+opening a file on one click would be a surprise otherwise — and it takes two to
+open the file, which stands your editor up over the whole screen the way `Enter`
+does.
 
 The pane is a terminal on **the machine whose file list you are in**. Arrange
 the remote pane that way and the editor is running on the server, over that

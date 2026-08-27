@@ -475,6 +475,17 @@ impl RemoteTree {
     }
 }
 
+/// What the mouse is resting on, when it is resting on something a click
+/// would act upon. Only one thing can be under the pointer at a time, which
+/// is why this is one value rather than a flag per kind of target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Hover {
+    /// A row of a file list, by the pane it is in and its place in the view.
+    Row(Slot, usize),
+    /// One piece of the path in a pane's title, by the directory it names.
+    Crumb(Slot, String),
+}
+
 /// One embedded terminal, and what it is there for.
 pub struct Term {
     pub id: TermId,
@@ -918,6 +929,16 @@ pub struct App {
     /// The pane a selection is being dragged out in. The drag lives across
     /// events, and follows the mouse out of the pane it started in.
     pub selecting: Option<Slot>,
+    /// What the pointer is over, drawn lit so you can see what a click would
+    /// land on before you make it. Nothing to do with the cursor: hovering
+    /// never moves it.
+    pub hover: Option<Hover>,
+    /// Where each piece of each pane's path is drawn, so a click on one can
+    /// be turned back into the directory it names. Rebuilt every frame.
+    pub crumbs: Vec<(Rect, Slot, String)>,
+    /// The last click on a file list, so a second one on the same row soon
+    /// enough can be told from two separate clicks. See [`App::click_row`].
+    last_click: Option<(Slot, usize, Instant)>,
 
     pub cmd_history: Vec<String>,
     /// Settings that outlive the session. The editor in use is derived from
@@ -1016,6 +1037,9 @@ impl App {
             zoomed: false,
             panes_area: Rect::ZERO,
             drag: None,
+            hover: None,
+            crumbs: Vec::new(),
+            last_click: None,
             clip: None,
             local: vec![LocalTree::new(layout::MAIN, local_start)],
             local_terms: Vec::new(),
@@ -2783,6 +2807,10 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        // The pointer's highlight is about where the pointer is, and a key
+        // can move the list out from under it. Anyone typing has stopped
+        // aiming with the mouse anyway.
+        self.hover = None;
 
         // With the keyboard handed over, every key is sshman's — including
         // the ones a shell would otherwise swallow.
@@ -2809,15 +2837,10 @@ impl App {
         // to interrupt the running command, not quit sshman — so the escape
         // key is checked first and is the only way back out.
         if self.mode == Mode::Browse && self.in_term() {
-            // The two keys it is the shell's business to let go of, asked of
-            // the keymap like any other — so rebinding one rebinds it here as
+            // The one key it is the shell's business to let go of, asked of
+            // the keymap like any other — so rebinding it rebinds it here as
             // well as in a file list.
-            let asks_for = self.keymap.action(&key);
-            if asks_for == Some(Action::EnterShell) {
-                self.focus = self.files_pane(self.host());
-                self.settle_focus();
-                self.set_status("file list — F6 goes back to the shell", Level::Info);
-            } else if asks_for == Some(Action::Command) {
+            if self.keymap.action(&key) == Some(Action::Command) {
                 self.enter_command();
             } else if let Some(shell) = self.shell_mut(self.focus) {
                 shell.send_key(key);
@@ -3084,11 +3107,6 @@ impl App {
             KeyCode::Esc => return self.leave_command(true),
             _ if self.keymap.action(&key) == Some(Action::Command) => {
                 return self.leave_command(true);
-            }
-            // Whatever asks for the shell means the shell, wherever it is said.
-            _ if self.keymap.action(&key) == Some(Action::EnterShell) => {
-                self.enter_shell();
-                return self.leave_command(false);
             }
             _ => {}
         }
@@ -3527,7 +3545,6 @@ impl App {
             Action::PasteText => self.paste_copied(),
 
             Action::Shell => self.toggle_shell(),
-            Action::EnterShell => self.enter_shell(),
             Action::Sudo => self.toggle_sudo(),
             Action::Mirror => self.mirror_path(),
             Action::Output => {
@@ -5897,7 +5914,7 @@ impl App {
         self.stash_layout();
         let name = self.pane_name(slot);
         self.set_status(
-            format!("{name} open — F6 or Ctrl-] returns to the files"),
+            format!("{name} open — Ctrl-] returns to the files"),
             Level::Good,
         );
     }
@@ -6085,18 +6102,6 @@ impl App {
             .find(|s| s.is_files() && s.host() == host)
             .or_else(|| self.layout.find(Slot::is_files))
             .unwrap_or_else(|| self.layout.first())
-    }
-
-    /// Put the keyboard in a terminal on this machine, starting one first if
-    /// there is none.
-    fn enter_shell(&mut self) {
-        let host = self.host();
-        if let Some(slot) = self.layout.find(|s| s.is_term() && s.host() == host) {
-            self.focus = slot;
-            self.set_status("shell — F6 or Ctrl-] returns to the files", Level::Info);
-            return;
-        }
-        self.split_with_term(Dir::Down, 70);
     }
 
     /// Close a pane; its neighbour takes the space back.
@@ -6373,12 +6378,33 @@ impl App {
 
     /// A click on a row of a file list.
     ///
-    /// With an editor pane open, clicking a file opens it there — the way
-    /// clicking in a file tree works everywhere else. With no editor pane it
-    /// only moves the cursor, since opening a file would be a surprise.
+    /// One click moves the cursor there and nothing else — except with an
+    /// editor pane open, where clicking a file opens it there, the way
+    /// clicking in a file tree works everywhere else.
+    ///
+    /// Two clicks on the same row mean the row: a directory opens, a file
+    /// goes to your editor. That is `Enter` under the pointer, and it is
+    /// deliberately not what one click does — a list you cannot put the
+    /// cursor on without going somewhere is a list you cannot look at.
     pub fn click_row(&mut self, slot: Slot, index: usize) {
+        /// Long enough not to need a steady hand, short enough that two
+        /// deliberate clicks on one row are still two clicks.
+        const AGAIN_WITHIN: Duration = Duration::from_millis(400);
+
+        let now = Instant::now();
+        let again = self
+            .last_click
+            .is_some_and(|(s, i, at)| s == slot && i == index && now - at < AGAIN_WITHIN);
+        // A double click is finished business: the third click of three
+        // starts again rather than opening the row a second time.
+        self.last_click = (!again).then_some((slot, index, now));
+
         self.focus_pane(slot);
         self.pane_mut(slot).select_index(index);
+        if again {
+            self.activate(slot);
+            return;
+        }
         if self.editor_pane(slot.host()).is_none() {
             return;
         }
@@ -6387,6 +6413,56 @@ impl App {
         };
         if !entry.is_dir_like() {
             self.send_to_editor(slot, &entry.name);
+        }
+    }
+
+    /// The pointer is over a row of a file list.
+    pub fn hover_row(&mut self, slot: Slot, index: usize) {
+        self.hover = Some(Hover::Row(slot, index));
+    }
+
+    /// The pointer is over one piece of a pane's path.
+    pub fn hover_crumb(&mut self, slot: Slot, path: String) {
+        self.hover = Some(Hover::Crumb(slot, path));
+    }
+
+    /// The pointer is over nothing a click would land on — a border, a
+    /// terminal, the space below the last entry.
+    pub fn clear_hover(&mut self) {
+        self.hover = None;
+    }
+
+    /// The row of a file list the pointer is lighting up, if it is this one.
+    pub fn hovered_row(&self, slot: Slot) -> Option<usize> {
+        match &self.hover {
+            Some(Hover::Row(s, i)) if *s == slot => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// The piece of this pane's path the pointer is lighting up.
+    pub fn hovered_crumb(&self, slot: Slot) -> Option<&str> {
+        match &self.hover {
+            Some(Hover::Crumb(s, path)) if *s == slot => Some(path.as_str()),
+            _ => None,
+        }
+    }
+
+    /// A click on one piece of the path in a pane's title: the pane goes
+    /// there, however far back up the trail it is.
+    pub fn click_crumb(&mut self, slot: Slot, path: String) {
+        self.focus_pane(slot);
+        self.goto(slot, path);
+    }
+
+    /// Point a file list at a directory, by whichever route its machine
+    /// needs. The two halves of this are not interchangeable: one is a path
+    /// on the filesystem sshman is running on, the other a string that only
+    /// means anything to the server.
+    pub fn goto(&mut self, slot: Slot, path: String) {
+        match slot.host() {
+            Side::Local => self.goto_local(slot, PathBuf::from(path)),
+            Side::Remote => self.goto_remote(slot, path),
         }
     }
 
@@ -7256,8 +7332,8 @@ mod tests {
         assert_eq!(app.tabs[0].terms.len(), 1);
 
         // A focused terminal owns the keyboard, so S only means "close it"
-        // once you have stepped back out to the files.
-        key(&mut app, KeyCode::F(6));
+        // once you have clicked back onto the files.
+        app.focus_pane(Slot::files(Side::Remote));
         assert!(!app.in_term());
         press(&mut app, 'S');
         assert_eq!(app.layout.panes(), 2);
@@ -7278,7 +7354,7 @@ mod tests {
         assert_eq!(app.layout.panes(), 3, "a shell beside the files");
         // S here would close that one again, which is exactly what these two
         // keys are for.
-        key(&mut app, KeyCode::F(6));
+        app.focus_pane(Slot::files(Side::Remote));
         press(&mut app, '_');
         assert_eq!(app.layout.panes(), 4, "and one below, the other still up");
         assert_eq!(app.tabs[0].terms.len(), 2, "both still running");
@@ -7538,8 +7614,101 @@ mod tests {
 
         let slot = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
         app.term_mut(slot).expect("just made").opens = Some(String::new());
+        // A click of its own rather than the second half of a double, which
+        // would be testing the other door into the editor.
+        app.last_click = None;
         app.click_row(files, at);
         assert!(app.status.contains("editor pane"), "{}", app.status);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_clicks_on_a_directory_open_it_and_one_click_does_not() {
+        let dir = scratch("click-through");
+        let mut app = app_in(&dir);
+        let files = Slot::files(Side::Local);
+        let at = app
+            .pane(here())
+            .view
+            .iter()
+            .position(|e| e.name == "dst")
+            .expect("the scratch directory");
+
+        // One click is aim, not action: the cursor moves and the list stays.
+        app.click_row(files, at);
+        assert_eq!(app.pane(here()).selected_name().as_deref(), Some("dst"));
+        assert!(
+            !app.local_cwd().ends_with("dst"),
+            "one click must not walk into it"
+        );
+
+        // The second, soon enough and on the same row, means the row.
+        app.click_row(files, at);
+        assert!(
+            app.local_cwd().ends_with("dst"),
+            "two clicks open it, at {}",
+            app.local_cwd().display()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_clicks_far_enough_apart_are_two_clicks() {
+        let dir = scratch("click-slow");
+        let mut app = app_in(&dir);
+        let files = Slot::files(Side::Local);
+        let at = app
+            .pane(here())
+            .view
+            .iter()
+            .position(|e| e.name == "dst")
+            .expect("the scratch directory");
+
+        app.click_row(files, at);
+        // The same row again, but long enough afterwards to be a second
+        // approach rather than a double click.
+        app.last_click = Some((files, at, Instant::now() - Duration::from_secs(5)));
+        app.click_row(files, at);
+        assert!(
+            !app.local_cwd().ends_with("dst"),
+            "a slow second click is still one click"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_pointer_lights_a_row_without_taking_the_cursor_off_its_own() {
+        let dir = scratch("hover");
+        let mut app = app_in(&dir);
+        let files = Slot::files(Side::Local);
+        let on = app.pane(here()).selected_name();
+        let at = app
+            .pane(here())
+            .view
+            .iter()
+            .position(|e| e.name == "one.txt")
+            .expect("the scratch file");
+
+        app.hover_row(files, at);
+        assert_eq!(app.hovered_row(files), Some(at));
+        assert_eq!(
+            app.hovered_row(Slot::files(Side::Remote)),
+            None,
+            "the row belongs to the list it is in"
+        );
+        assert_eq!(
+            app.pane(here()).selected_name(),
+            on,
+            "hovering is not selecting"
+        );
+
+        // A key can move the list out from under the pointer, so the light
+        // goes out rather than pointing at whatever slid under it.
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.hovered_row(files), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }
