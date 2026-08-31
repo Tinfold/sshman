@@ -1,0 +1,18 @@
+{
+  "name": "ayu",
+  "about": "Ayu Dark, from dempfi/ayu.",
+
+  "accent": "#ffb454",
+  "dim": "#5c6773",
+  "text": "#bfbdb6",
+  "muted": "#8a9199",
+  "good": "#aad94c",
+  "warn": "#e6b673",
+  "bad": "#f07178",
+  "dir": "#59c2ff",
+  "link": "#d2a6ff",
+  "exec": "#aad94c",
+  "info": "#39bae6",
+  "bg": "#0b0e14",
+  "on_accent": "#0b0e14"
+}

@@ -1,0 +1,18 @@
+{
+  "name": "zenburn",
+  "about": "Zenburn, the low-contrast one from 2003 that every other muted theme is a descendant of.",
+
+  "accent": "#8cd0d3",
+  "dim": "#83898d",
+  "text": "#dcdccc",
+  "muted": "#9fafaf",
+  "good": "#7f9f7f",
+  "warn": "#e0cf9f",
+  "bad": "#cc9393",
+  "dir": "#8cd0d3",
+  "link": "#dca3a3",
+  "exec": "#7f9f7f",
+  "info": "#dfaf8f",
+  "bg": "#3f3f3f",
+  "on_accent": "#3f3f3f"
+}

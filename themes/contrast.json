@@ -1,0 +1,18 @@
+{
+  "name": "contrast",
+  "about": "Black and bright, after Modus Vivendi \u2014 for a screen in daylight, or eyes that would rather not squint at a low-contrast palette. Everything it draws clears 7:1 against the background, which is the strictest readability bar anybody sets.",
+
+  "accent": "#79a8ff",
+  "dim": "#989898",
+  "text": "#ffffff",
+  "muted": "#a8a8a8",
+  "good": "#44bc44",
+  "warn": "#d0bc00",
+  "bad": "#ff5f59",
+  "dir": "#00bcff",
+  "link": "#b6a0ff",
+  "exec": "#44bc44",
+  "info": "#00d3d0",
+  "bg": "#000000",
+  "on_accent": "#000000"
+}

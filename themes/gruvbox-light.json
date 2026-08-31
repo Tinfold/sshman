@@ -1,0 +1,18 @@
+{
+  "name": "gruvbox-light",
+  "about": "Gruvbox Light, the warm half of gruvbox \u2014 the same retro groove on paper.",
+
+  "accent": "#076678",
+  "dim": "#928374",
+  "text": "#3c3836",
+  "muted": "#665c54",
+  "good": "#79740e",
+  "warn": "#b57614",
+  "bad": "#9d0006",
+  "dir": "#076678",
+  "link": "#8f3f71",
+  "exec": "#79740e",
+  "info": "#427b58",
+  "bg": "#fbf1c7",
+  "on_accent": "#fbf1c7"
+}

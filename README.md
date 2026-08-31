@@ -946,7 +946,7 @@ Press `,`, pick **Theme**, and `↵` opens the chooser:
 │  ▸ solarized    ██████████  Solarized Dark, from Ethan Schoonover's…     │
 │    onedark      ██████████  One Dark, as Atom drew it and half the…      │
 │    monokai      ██████████  Monokai, as everyone remembers it.           │
-╰──────── ↑↓ look · ↵ keeps it · Esc puts the old one back · 17 themes ────╯
+╰──────── ↑↓ look · ↵ keeps it · Esc puts the old one back · 24 themes ────╯
 ```
 
 Each row carries its own palette as a row of blocks, so you can scan the list
@@ -957,8 +957,8 @@ going to read it at. `↵` keeps the one you are looking at and writes it down;
 scrolls, so there can be as many themes as you like.
 
 `←`/`→` on the **Theme** row still steps through them in place, for when you
-know which way you are going. These are the sixteen it ships with, and any of
-your own:
+know which way you are going. These are the twenty-four it ships with, and any
+of your own:
 
 | | |
 |---|---|
@@ -977,12 +977,24 @@ your own:
 | `mariana` | Mariana, the one Sublime Text ships |
 | `afterglow` | Afterglow |
 | `darcula` | Darcula, as IntelliJ draws it |
+| `ayu` | Ayu Dark, near-black and orange |
+| `github` | GitHub Dark |
+| `material` | Material Palenight, the purple one |
+| `zenburn` | Zenburn, the low-contrast one everything muted descends from |
+| `contrast` | black and bright, for daylight or for eyes that would rather not squint |
 | `solarized-light` | **Solarized Light**, a light one |
 | `latte` | **Catppuccin Latte**, a light one |
+| `github-light` | **GitHub Light**, a light one |
+| `gruvbox-light` | **Gruvbox Light**, a light one |
 
-The last two are **light**: they paint a light background and dark text, so
+The last four are **light**: they paint a light background and dark text, so
 they work on any terminal rather than only a light one. They are last in the
 list because most terminals are dark.
+
+`contrast` is the one to reach for when the others are too quiet. Everything in
+it clears 7:1 against black, which is the strictest readability bar anybody
+sets — it is picked for how far apart the colours are rather than for how they
+sit together.
 
 Each palette is taken from the theme's own source rather than from memory:
 Nord from `nordtheme.com`, Dracula from the specification at
@@ -992,7 +1004,10 @@ Pine from `rose-pine/palette`, Kanagawa from `rebelot/kanagawa.nvim`, gruvbox
 from `morhetz/gruvbox`, Mariana from the scheme in Sublime's own packages (its
 values are HSL there, converted here), Afterglow from
 `YabataDesign/afterglow-theme`, Darcula from the colour scheme in
-`JetBrains/intellij-community`. Where a theme names no secondary text colour,
+`JetBrains/intellij-community`, Ayu from `dempfi/ayu`, GitHub's two from the
+primer palette GitHub publishes, Material Palenight from `material-theme/vsc-material-theme`, Zenburn
+from Jani Nurminen's original, and `contrast` from Protesilaos Stavrou's Modus
+Vivendi. Where a theme names no secondary text colour,
 `muted` is a blend of its comment and foreground; where a role is a judgement
 call rather than a value, the file's `about` line says so.
 

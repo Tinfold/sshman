@@ -1,0 +1,18 @@
+{
+  "name": "github",
+  "about": "GitHub Dark, from the colours GitHub publishes as its primer palette.",
+
+  "accent": "#58a6ff",
+  "dim": "#6e7681",
+  "text": "#e6edf3",
+  "muted": "#8b949e",
+  "good": "#3fb950",
+  "warn": "#d29922",
+  "bad": "#f85149",
+  "dir": "#79c0ff",
+  "link": "#d2a8ff",
+  "exec": "#3fb950",
+  "info": "#ffa657",
+  "bg": "#0d1117",
+  "on_accent": "#0d1117"
+}

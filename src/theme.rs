@@ -153,6 +153,11 @@ const BUILT_IN: &[(&str, &str)] = &[
     ("mariana.json", include_str!("../themes/mariana.json")),
     ("afterglow.json", include_str!("../themes/afterglow.json")),
     ("darcula.json", include_str!("../themes/darcula.json")),
+    ("ayu.json", include_str!("../themes/ayu.json")),
+    ("github.json", include_str!("../themes/github.json")),
+    ("material.json", include_str!("../themes/material.json")),
+    ("zenburn.json", include_str!("../themes/zenburn.json")),
+    ("contrast.json", include_str!("../themes/contrast.json")),
     // The light ones last, since sshman paints no background of its own and
     // most terminals have a dark one.
     (
@@ -160,6 +165,14 @@ const BUILT_IN: &[(&str, &str)] = &[
         include_str!("../themes/solarized-light.json"),
     ),
     ("latte.json", include_str!("../themes/latte.json")),
+    (
+        "github-light.json",
+        include_str!("../themes/github-light.json"),
+    ),
+    (
+        "gruvbox-light.json",
+        include_str!("../themes/gruvbox-light.json"),
+    ),
 ];
 
 impl Themes {

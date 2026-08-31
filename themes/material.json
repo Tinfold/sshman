@@ -1,0 +1,18 @@
+{
+  "name": "material",
+  "about": "Material Palenight, the one most people mean by the purple one.",
+
+  "accent": "#82aaff",
+  "dim": "#676e95",
+  "text": "#a6accd",
+  "muted": "#8c92b3",
+  "good": "#c3e88d",
+  "warn": "#ffcb6b",
+  "bad": "#ff5370",
+  "dir": "#89ddff",
+  "link": "#c792ea",
+  "exec": "#c3e88d",
+  "info": "#f78c6c",
+  "bg": "#292d3e",
+  "on_accent": "#292d3e"
+}

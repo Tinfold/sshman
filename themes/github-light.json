@@ -1,0 +1,18 @@
+{
+  "name": "github-light",
+  "about": "GitHub Light, the same palette as github the other way up.",
+
+  "accent": "#0969da",
+  "dim": "#818b98",
+  "text": "#1f2328",
+  "muted": "#59636e",
+  "good": "#1a7f37",
+  "warn": "#9a6700",
+  "bad": "#cf222e",
+  "dir": "#0550ae",
+  "link": "#8250df",
+  "exec": "#1a7f37",
+  "info": "#953800",
+  "bg": "#ffffff",
+  "on_accent": "#ffffff"
+}
