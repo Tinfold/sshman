@@ -30,6 +30,12 @@ use crate::worker::{HostKeyIssue, Req, Resp};
 use crate::workspace::{Item as WorkspaceItem, PaneDirs, Workspaces};
 use ratatui::style::Color;
 
+/// How long the pointer has to sit on a tab before sshman says what it is.
+///
+/// Long enough that crossing the row on the way somewhere else says nothing,
+/// short enough that stopping to ask does not feel like waiting.
+const TAB_TIP_DELAY: Duration = Duration::from_millis(500);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Connect,
@@ -486,6 +492,99 @@ pub enum Hover {
     Crumb(Slot, String),
 }
 
+/// A menu of what can be done to what was right-clicked.
+///
+/// It belongs to the pane it was opened over rather than to the one with the
+/// keyboard, because a right click is a sentence about the thing under the
+/// pointer: opening the menu focuses that pane, and choosing a row runs
+/// against it.
+pub struct Menu {
+    pub at: Slot,
+    pub items: Vec<MenuItem>,
+    /// Which row is lit. Never a rule — see [`Menu::step`].
+    pub cursor: usize,
+    /// Where the click was, which is where the box wants its top-left corner.
+    /// The drawing may put it elsewhere to keep it on the screen.
+    pub anchor: (u16, u16),
+    /// Where the box actually landed, written down by the drawing so a click
+    /// can be matched to a row. Rebuilt every frame, like every other hit box.
+    pub area: Rect,
+    /// The first row shown, for a menu taller than the terminal it is in.
+    ///
+    /// Also written by the drawing, and for the same reason: how much of the
+    /// menu fits is a fact about the screen, and the screen is what the
+    /// drawing knows about. A twenty-row menu in an eighteen-row terminal has
+    /// to give somewhere, and rows you cannot reach are worse than rows you
+    /// have to walk to.
+    pub scroll: usize,
+}
+
+/// One row of a [`Menu`].
+pub enum MenuItem {
+    /// Something to do, and what to call it here.
+    ///
+    /// The label is the menu's rather than the action's: [`Action::blurb`] is
+    /// a sentence, written for a list of fifty where each one has to explain
+    /// itself, and a menu row wants a verb.
+    Do(&'static str, Action),
+    /// A line between groups. Never lit, never chosen.
+    Rule,
+}
+
+impl Menu {
+    /// Move the light, stepping over the rules and stopping at the ends.
+    ///
+    /// Stopping rather than wrapping: a menu of nine rows is short enough to
+    /// see all of at once, and a highlight that jumps from the bottom to the
+    /// top is a highlight you have to go looking for.
+    pub fn step(&mut self, by: isize) {
+        let mut at = self.cursor as isize;
+        loop {
+            at += by;
+            if at < 0 {
+                return;
+            }
+            match self.items.get(at as usize) {
+                None => return,
+                Some(MenuItem::Rule) => continue,
+                Some(MenuItem::Do(..)) => {
+                    self.cursor = at as usize;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// What choosing the lit row would do.
+    pub fn chosen(&self) -> Option<Action> {
+        match self.items.get(self.cursor) {
+            Some(MenuItem::Do(_, action)) => Some(*action),
+            _ => None,
+        }
+    }
+
+    /// The row a point on the screen is on, if it is on one at all. A rule is
+    /// not a row you can be on.
+    pub fn row_at(&self, column: u16, row: u16) -> Option<usize> {
+        if column < self.area.x
+            || column >= self.area.right()
+            || row <= self.area.y
+            || row + 1 >= self.area.bottom()
+        {
+            return None;
+        }
+        let at = self.scroll + (row - self.area.y - 1) as usize;
+        matches!(self.items.get(at), Some(MenuItem::Do(..))).then_some(at)
+    }
+
+    /// Whether a point is inside the box at all, border included. A click on
+    /// the frame has not left the menu.
+    pub fn hits(&self, column: u16, row: u16) -> bool {
+        self.area
+            .contains(ratatui::layout::Position::new(column, row))
+    }
+}
+
 /// One embedded terminal, and what it is there for.
 pub struct Term {
     pub id: TermId,
@@ -810,6 +909,15 @@ pub struct App {
     /// stays a plain "go here".
     pub tab_close_buttons: Vec<(u16, u16, usize)>,
     pub tab_bar_row: Option<u16>,
+    /// A tab the pointer has come to rest on, and since when.
+    ///
+    /// A chip is only as wide as the row can afford — with eight tabs open
+    /// that is six characters, and `web01.prod…` and `web01.stag…` are the
+    /// same six. Resting on one says the whole name. The clock is here rather
+    /// than in the drawing because the drawing happens sixteen times a second
+    /// whether anything moved or not, and "how long has the pointer been
+    /// there" is a fact about the pointer.
+    pub tab_rest: Option<(usize, Instant)>,
     /// A tab being dragged along the row by its chip. Holds where it is now,
     /// which moves as the pointer passes over its neighbours.
     pub tab_drag: Option<usize>,
@@ -933,6 +1041,8 @@ pub struct App {
     /// land on before you make it. Nothing to do with the cursor: hovering
     /// never moves it.
     pub hover: Option<Hover>,
+    /// The menu a right click opened, while one is open. See [`Menu`].
+    pub menu: Option<Menu>,
     /// Where each piece of each pane's path is drawn, so a click on one can
     /// be turned back into the directory it names. Rebuilt every frame.
     pub crumbs: Vec<(Rect, Slot, String)>,
@@ -1030,6 +1140,7 @@ impl App {
             tab_spans: Vec::new(),
             tab_close_buttons: Vec::new(),
             tab_bar_row: None,
+            tab_rest: None,
             tab_drag: None,
             output_view_height: 1,
             help_view_height: 1,
@@ -1038,6 +1149,7 @@ impl App {
             panes_area: Rect::ZERO,
             drag: None,
             hover: None,
+            menu: None,
             crumbs: Vec::new(),
             last_click: None,
             clip: None,
@@ -1955,11 +2067,14 @@ impl App {
     ) {
         self.local_tasks.push(label);
         let tx = self.local_tx.clone();
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         std::thread::Builder::new()
             .name("local-task".into())
             .spawn(move || {
-                let outcome = match std::process::Command::new(shell)
+                // `/bin/sh` and not `$SHELL`: what arrives here is one of
+                // sshman's own POSIX strings — a `tar` line, or the paste
+                // guard with its `for … do … done` in it. See
+                // [`crate::local::POSIX_SHELL`].
+                let outcome = match std::process::Command::new(crate::local::POSIX_SHELL)
                     .arg("-c")
                     .arg(&cmd)
                     .output()
@@ -2809,8 +2924,17 @@ impl App {
         }
         // The pointer's highlight is about where the pointer is, and a key
         // can move the list out from under it. Anyone typing has stopped
-        // aiming with the mouse anyway.
+        // aiming with the mouse anyway. The label naming a tab goes with it,
+        // and for a stronger reason: a key can close the tab it is about.
         self.hover = None;
+        self.tab_rest = None;
+
+        // A menu that is open has the keyboard. It is a question with the
+        // answers on the screen, and the list underneath is not what the
+        // arrows are for while it is there.
+        if self.menu.is_some() {
+            return self.menu_key(key);
+        }
 
         // With the keyboard handed over, every key is sshman's — including
         // the ones a shell would otherwise swallow.
@@ -6416,6 +6540,185 @@ impl App {
         }
     }
 
+    // ---- the menu a right click opens ------------------------------------
+
+    /// Right click in a file list: what can be done to what is under the
+    /// pointer.
+    ///
+    /// The row is aimed at first, the way it would be by a left click, so
+    /// that "Rename" renames what you pointed at rather than what the cursor
+    /// happened to be on. Marks are the exception: a right click on a row
+    /// that is *part of a selection* is about the selection, so the cursor is
+    /// left where it is and the marks stand. That is the rule every file
+    /// manager uses, and the one that makes "mark six, right click, delete"
+    /// mean what it looks like it means.
+    pub fn open_menu(&mut self, at: Slot, on: Option<usize>, column: u16, row: u16) {
+        if !at.is_files() {
+            return;
+        }
+        self.focus_pane(at);
+        if let Some(index) = on {
+            let name = self.pane(at).view.get(index).map(|e| e.name.clone());
+            let inside = name.is_some_and(|name| self.pane(at).marked.contains(&name));
+            if !inside {
+                self.pane_mut(at).select_index(index);
+            }
+        }
+        // A right click is not a click for the purposes of "twice quickly
+        // opens it": otherwise a left click, then a right click on the same
+        // row, then a left click would walk into a directory nobody asked to
+        // enter.
+        self.last_click = None;
+        let items = self.menu_items(at, on.is_some());
+        let cursor = items
+            .iter()
+            .position(|item| matches!(item, MenuItem::Do(..)))
+            .unwrap_or(0);
+        self.menu = Some(Menu {
+            at,
+            items,
+            cursor,
+            anchor: (column, row),
+            area: Rect::default(),
+            scroll: 0,
+        });
+    }
+
+    /// What goes in the menu, which depends on what was clicked.
+    ///
+    /// Rows that could not do anything are left out rather than greyed out.
+    /// A menu is a list of what is possible here; "Extract" over a text file
+    /// and "Paste" with an empty clipboard are not possibilities, and a row
+    /// that refuses to work is worse than one that was never offered.
+    fn menu_items(&self, at: Slot, on_row: bool) -> Vec<MenuItem> {
+        use MenuItem::{Do, Rule};
+        let mut items = Vec::new();
+        if on_row {
+            let entry = self.pane(at).selected();
+            let directory = entry.is_some_and(FileEntry::is_dir_like);
+            let archive = entry.is_some_and(|e| crate::archive::is_archive(&e.name));
+            items.push(Do(if directory { "Enter" } else { "Open" }, Action::Open));
+            if !directory {
+                items.push(Do("Edit", Action::Edit));
+                items.push(Do("View", Action::View));
+            }
+            items.push(Rule);
+            items.push(Do("Copy to the other list", Action::Copy));
+            items.push(Do("Cut", Action::Cut));
+            if self.clip.is_some() {
+                items.push(Do("Paste", Action::Paste));
+            }
+            items.push(Rule);
+            items.push(Do("Rename…", Action::Rename));
+            items.push(Do("Delete", Action::Delete));
+            items.push(Rule);
+            if archive {
+                items.push(Do("Extract…", Action::Extract));
+                items.push(Do("List what it holds", Action::ListArchive));
+            }
+            items.push(Do("Pack into an archive…", Action::Archive));
+            items.push(Rule);
+            items.push(Do("Mark", Action::Mark));
+            items.push(Do("Mark all", Action::MarkAll));
+        } else {
+            // The space below the last entry, which is about the directory
+            // rather than about anything in it.
+            if self.clip.is_some() {
+                items.push(Do("Paste", Action::Paste));
+                items.push(Rule);
+            }
+            items.push(Do("New directory…", Action::NewDirectory));
+            items.push(Do("Go to…", Action::GoTo));
+            items.push(Do("Home", Action::Home));
+            items.push(Do("The directory above", Action::Parent));
+            items.push(Rule);
+            items.push(Do("Mark all", Action::MarkAll));
+            items.push(Do("Show hidden files", Action::Hidden));
+            items.push(Do("Point the other list here", Action::Mirror));
+        }
+        items.push(Rule);
+        items.push(Do("A shell here", Action::Shell));
+        items.push(Do("Reload", Action::Reload));
+        items
+    }
+
+    pub fn close_menu(&mut self) {
+        self.menu = None;
+    }
+
+    /// Keys while the menu is open.
+    ///
+    /// It has them all, but only briefly: the keys that work a menu work it,
+    /// and every other key closes it and is swallowed. Modal in the sense
+    /// that a menu is a question, and not in the sense that you can get stuck
+    /// in one — a keyboard that had stopped answering would be a far worse
+    /// bug than a keystroke that did nothing but put a menu away.
+    pub fn menu_key(&mut self, key: KeyEvent) {
+        let Some(menu) = &mut self.menu else { return };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => menu.step(-1),
+            KeyCode::Down | KeyCode::Char('j') => menu.step(1),
+            KeyCode::Home => {
+                menu.cursor = 0;
+                if menu.chosen().is_none() {
+                    menu.step(1);
+                }
+            }
+            KeyCode::End => {
+                menu.cursor = menu.items.len().saturating_sub(1);
+                if menu.chosen().is_none() {
+                    menu.step(-1);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.choose_menu(),
+            _ => self.close_menu(),
+        }
+    }
+
+    /// Do what the lit row says, and close the menu.
+    ///
+    /// The menu goes first. Several of these open a box of their own — a
+    /// rename asks for a name — and a menu still on the screen behind it
+    /// would be a menu drawn over the question it asked.
+    pub fn choose_menu(&mut self) {
+        let Some(menu) = self.menu.take() else { return };
+        let Some(action) = menu.chosen() else { return };
+        self.focus_pane(menu.at);
+        self.run(action);
+    }
+
+    /// Choose the row a click landed on, or close the menu when it landed
+    /// somewhere else. Answers whether the click was the menu's business.
+    pub fn click_menu(&mut self, column: u16, row: u16) -> bool {
+        let Some(menu) = &mut self.menu else {
+            return false;
+        };
+        if !menu.hits(column, row) {
+            // A click outside is "not that, then". It closes the menu and
+            // does nothing else: a menu you dismissed should not also move
+            // your cursor to wherever you happened to dismiss it.
+            self.close_menu();
+            return true;
+        }
+        // A click on the border or on a rule is inside the menu, so it is
+        // not a dismissal and it is not a choice either.
+        if let Some(at) = menu.row_at(column, row) {
+            menu.cursor = at;
+            self.choose_menu();
+        }
+        true
+    }
+
+    /// The pointer moving over an open menu lights the row under it, the same
+    /// way it lights a row of a file list.
+    pub fn point_at_menu(&mut self, column: u16, row: u16) {
+        if let Some(menu) = &mut self.menu
+            && let Some(at) = menu.row_at(column, row)
+        {
+            menu.cursor = at;
+        }
+    }
+
     /// The pointer is over a row of a file list.
     pub fn hover_row(&mut self, slot: Slot, index: usize) {
         self.hover = Some(Hover::Row(slot, index));
@@ -6446,6 +6749,55 @@ impl App {
             Some(Hover::Crumb(s, path)) if *s == slot => Some(path.as_str()),
             _ => None,
         }
+    }
+
+    /// Which tab's chip is at a column of the tab row, if any.
+    ///
+    /// Only a chip. The chevrons at the ends of the row are in `tab_spans`
+    /// too — each stands for the tab just off screen that way, so a click on
+    /// one steps there — but a chevron is not that tab's chip, and pointing
+    /// at it is not pointing at the tab. A chip is one that got a close
+    /// button, which is only drawn on the ones actually on the row.
+    pub fn tab_index_at(&self, column: u16) -> Option<usize> {
+        let (_, _, index) = self
+            .tab_spans
+            .iter()
+            .find(|(start, end, _)| column >= *start && column < *end)
+            .copied()?;
+        self.tab_close_buttons
+            .iter()
+            .any(|(_, _, at)| *at == index)
+            .then_some(index)
+    }
+
+    /// The pointer is over a tab's chip. Starts the clock, or leaves it
+    /// running where it is already on this one — moving about inside a chip
+    /// is still resting on that chip.
+    pub fn rest_on_tab(&mut self, index: usize) {
+        if self.tab_rest.is_some_and(|(on, _)| on == index) {
+            return;
+        }
+        self.tab_rest = Some((index, Instant::now()));
+    }
+
+    /// The pointer is somewhere that is not a tab, or the keyboard has it.
+    pub fn clear_tab_rest(&mut self) {
+        self.tab_rest = None;
+    }
+
+    /// The tab whose full name is worth putting on the screen: one the
+    /// pointer has been sitting on long enough to be asking about, whose
+    /// chip could not show the whole of the name.
+    ///
+    /// The width is what the drawing shortened the name to, which is the only
+    /// thing that knows whether anything was lost.
+    pub fn tab_tip(&self, budget: usize) -> Option<(usize, String)> {
+        let (index, since) = self.tab_rest?;
+        if since.elapsed() < TAB_TIP_DELAY {
+            return None;
+        }
+        let title = self.tabs.get(index)?.title();
+        (title.chars().count() > budget).then_some((index, title))
     }
 
     /// A click on one piece of the path in a pane's title: the pane goes
@@ -7709,6 +8061,124 @@ mod tests {
         // goes out rather than pointing at whatever slid under it.
         key(&mut app, KeyCode::Down);
         assert_eq!(app.hovered_row(files), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resting_on_a_tab_says_the_whole_name_once_the_chip_has_cut_it() {
+        let dir = scratch("tab-tip");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "web01.production.example.com", None);
+        fake_tab(&mut app, "web02.production.example.com", None);
+        // What the drawing would have left behind: two chips, each with a
+        // close button, and a chevron standing for a tab off the end.
+        app.tab_spans = vec![(0, 12, 0), (13, 25, 1), (25, 29, 5)];
+        app.tab_close_buttons = vec![(10, 12, 0), (23, 25, 1)];
+        app.tab_bar_row = Some(1);
+
+        app.rest_on_tab(1);
+        // Not yet: crossing the row on the way somewhere else says nothing.
+        assert_eq!(app.tab_tip(8), None, "it spoke before it was asked");
+
+        app.tab_rest = Some((1, Instant::now() - Duration::from_secs(2)));
+        let (index, name) = app.tab_tip(8).expect("the name of the tab under it");
+        assert_eq!(index, 1);
+        assert_eq!(name, "me@web02.production.example.com");
+        // And nothing to say where the chip already showed the whole thing.
+        assert_eq!(app.tab_tip(80), None);
+
+        // A chevron is not a chip: it stands for a tab off the end of the row
+        // and pointing at it is not pointing at that tab.
+        assert_eq!(app.tab_index_at(26), None);
+        assert_eq!(app.tab_index_at(14), Some(1));
+
+        // A key can close the tab the label is about.
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.tab_tip(8), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_menu_over_a_marked_row_is_about_everything_that_is_marked() {
+        // The rule every file manager uses, and the one that makes "mark
+        // six, right click, delete" mean what it looks like it means: a right
+        // click *inside* a selection leaves the selection alone. On a row
+        // that is not part of one it aims first, so "Rename" renames what you
+        // pointed at rather than what the cursor happened to be sitting on.
+        let dir = scratch("menu-marks");
+        std::fs::write(dir.join("two.txt"), "x").unwrap();
+        let mut app = app_in(&dir);
+        let files = Slot::files(Side::Local);
+        app.pane_mut(files).set_entries(vec![
+            remote_entry("one.txt"),
+            remote_entry("two.txt"),
+            remote_entry("three.txt"),
+        ]);
+        app.pane_mut(files).select_index(0);
+        app.pane_mut(files).marked.insert("two.txt".into());
+        app.pane_mut(files).marked.insert("three.txt".into());
+
+        // Row 1 is `two.txt`, which is marked.
+        app.open_menu(files, Some(1), 4, 4);
+        assert_eq!(
+            app.pane(files).marked.len(),
+            2,
+            "a right click inside the selection threw it away"
+        );
+        assert_eq!(
+            app.pane(files).state.selected(),
+            Some(0),
+            "and it moved the cursor off it as well"
+        );
+        assert_eq!(app.pane(files).targets().len(), 2);
+
+        // Row 0 is not marked, so that one is aimed at.
+        app.close_menu();
+        app.open_menu(files, Some(0), 4, 4);
+        assert_eq!(app.pane(files).state.selected(), Some(0));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_keys_that_work_a_menu_work_it_and_the_rest_put_it_away() {
+        let dir = scratch("menu-keys");
+        let mut app = app_in(&dir);
+        let files = Slot::files(Side::Local);
+        app.pane_mut(files)
+            .set_entries(vec![remote_entry("one.txt")]);
+        app.pane_mut(files).select_index(0);
+
+        app.open_menu(files, Some(0), 4, 4);
+        let menu = app.menu.as_ref().expect("a menu");
+        let first = menu.chosen().expect("it opened on a rule");
+        assert_eq!(first, Action::Open, "the first row is the obvious one");
+
+        // Down walks to the next choice, stepping over the rules rather than
+        // stopping on one.
+        key(&mut app, KeyCode::Down);
+        let menu = app.menu.as_ref().expect("a menu");
+        assert!(menu.chosen().is_some(), "the light landed on a rule");
+        assert_ne!(menu.chosen(), Some(first));
+
+        // Up at the top stays at the top rather than wrapping round.
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.menu.as_ref().expect("a menu").chosen(), Some(first));
+
+        // Esc puts it away without doing anything.
+        key(&mut app, KeyCode::Esc);
+        assert!(app.menu.is_none());
+
+        // And so does any key that is not one of the menu's, rather than the
+        // keyboard going quiet until somebody guesses Esc.
+        app.open_menu(files, Some(0), 4, 4);
+        key(&mut app, KeyCode::Char('q'));
+        assert!(app.menu.is_none(), "a menu nothing would close");
+        assert!(app.confirm.is_none(), "and it quit on the way out");
 
         std::fs::remove_dir_all(&dir).ok();
     }

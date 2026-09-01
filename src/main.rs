@@ -470,6 +470,21 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
 
     let at = Position::new(m.column, m.row);
 
+    // A menu that is open is on top of everything, so it is asked first.
+    if app.menu.is_some() {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                app.click_menu(m.column, m.row);
+            }
+            // A second right click closes it, the way a second press of any
+            // key that opens something does.
+            MouseEventKind::Down(MouseButton::Right) => app.close_menu(),
+            MouseEventKind::Moved => app.point_at_menu(m.column, m.row),
+            _ => {}
+        }
+        return;
+    }
+
     // A selection being dragged owns the mouse until the button comes back
     // up, and follows it out of the pane it started in — a drag that stopped
     // at the border would be a drag you had to be careful with.
@@ -619,6 +634,13 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
 
     // The tab bar, when there is one.
     if Some(m.row) == app.tab_bar_row {
+        // A chip is only as wide as the row can afford, so sitting on one
+        // asks what it is. Anything but a move is an answer to that question
+        // rather than the question, so it takes the label away.
+        match app.tab_index_at(m.column) {
+            Some(index) if matches!(m.kind, MouseEventKind::Moved) => app.rest_on_tab(index),
+            _ => app.clear_tab_rest(),
+        }
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             // The `✕` first: it sits inside the chip it belongs to, and a
             // click on it is never a click on the rest of the chip.
@@ -646,6 +668,10 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         }
         return;
     }
+
+    // Off the row of tabs, so a label about one of them is about something
+    // nobody is pointing at.
+    app.clear_tab_rest();
 
     let Some(slot) = app.areas.at(m.column, m.row) else {
         // Over no pane at all — the tab bar, the footer — so there is no row
@@ -733,6 +759,14 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
             if let Some(index) = row_in(app, slot, area, m.row) {
                 app.click_row(slot, index);
             }
+        }
+        // The right button asks what can be done here. Over a row that is
+        // about the file; over the space below the last one it is about the
+        // directory, which is a shorter and different list.
+        MouseEventKind::Down(MouseButton::Right) => {
+            let on = row_in(app, slot, area, m.row);
+            app.open_menu(slot, on, m.column, m.row);
+            return;
         }
         _ => {}
     }
@@ -856,6 +890,151 @@ mod tests {
         assert_eq!(row_at(0, 3, PANE, 4), None);
         assert_eq!(row_at(0, 3, PANE, 8), None);
         assert_eq!(row_at(0, 0, PANE, 1), None, "and an empty list has none");
+    }
+
+    /// The app drawn twice, so the second draw sees whatever the first one
+    /// let the test set up — a menu, in particular, which has no area until
+    /// something has drawn it.
+    fn redraw(app: &mut App, width: u16, height: u16) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+    }
+
+    #[test]
+    fn the_right_button_asks_what_can_be_done_to_the_row_under_it() {
+        let here = layout::Slot::files(app::Side::Local);
+        let mut app = drawn(110, 30, |_| {});
+        let area = app.areas.of(here).expect("the local list is on screen");
+        let row = area.y + 1;
+
+        handle_mouse(
+            &mut app,
+            at(MouseEventKind::Down(MouseButton::Right), area.x + 4, row),
+        );
+        let menu = app.menu.as_ref().expect("no menu");
+        assert_eq!(menu.at, here, "the menu belongs to the pane it opened over");
+        assert!(
+            menu.chosen().is_some(),
+            "it opened with the light on a rule"
+        );
+        // Aimed first: the row that was clicked is the row it is about.
+        assert_eq!(app.pane(here).state.selected(), Some(0));
+        // A file has things done to it that a directory has not.
+        let labels = menu_labels(&app);
+        assert!(labels.contains(&"Rename…"), "{labels:?}");
+        assert!(labels.contains(&"Delete"), "{labels:?}");
+        // Nothing has been picked up, so there is nothing to put down.
+        assert!(!labels.contains(&"Paste"), "{labels:?}");
+
+        // A second right click puts it away.
+        handle_mouse(
+            &mut app,
+            at(MouseEventKind::Down(MouseButton::Right), area.x + 4, row),
+        );
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn the_space_below_the_last_entry_is_about_the_directory() {
+        let here = layout::Slot::files(app::Side::Local);
+        let mut app = drawn(110, 30, |_| {});
+        let area = app.areas.of(here).expect("the local list is on screen");
+        // Well below anything the scratch directory could be showing, and
+        // still inside the pane.
+        let empty = area.bottom() - 2;
+        assert_eq!(row_in(&app, here, area, empty), None, "not over an entry");
+
+        handle_mouse(
+            &mut app,
+            at(MouseEventKind::Down(MouseButton::Right), area.x + 4, empty),
+        );
+        let labels = menu_labels(&app);
+        assert!(labels.contains(&"New directory…"), "{labels:?}");
+        assert!(labels.contains(&"Go to…"), "{labels:?}");
+        // Nothing was pointed at, so nothing has a name to be renamed.
+        assert!(!labels.contains(&"Rename…"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_click_on_a_menu_row_does_what_it_says_and_a_click_away_does_not() {
+        let here = layout::Slot::files(app::Side::Local);
+        let mut app = drawn(110, 30, |_| {});
+        let area = app.areas.of(here).expect("the local list is on screen");
+
+        handle_mouse(
+            &mut app,
+            at(
+                MouseEventKind::Down(MouseButton::Right),
+                area.x + 4,
+                area.y + 1,
+            ),
+        );
+        redraw(&mut app, 110, 30);
+        let rect = app.menu.as_ref().expect("a menu").area;
+        assert!(rect.width > 0, "the menu was never drawn");
+
+        // Off the box entirely: the menu goes and nothing else happens.
+        let before = app.path_of(here);
+        handle_mouse(
+            &mut app,
+            at(
+                MouseEventKind::Down(MouseButton::Left),
+                rect.right() + 2,
+                rect.bottom() + 2,
+            ),
+        );
+        assert!(app.menu.is_none(), "clicking away left the menu up");
+        assert_eq!(app.path_of(here), before, "and it did something as well");
+
+        // And on a row: the pointer lights it, and a click runs it.
+        handle_mouse(
+            &mut app,
+            at(
+                MouseEventKind::Down(MouseButton::Right),
+                area.x + 4,
+                area.y + 1,
+            ),
+        );
+        redraw(&mut app, 110, 30);
+        let rect = app.menu.as_ref().expect("a menu").area;
+        // Where the row is in the box, rules included: they take a row each
+        // and are not choices.
+        let mark = app
+            .menu
+            .as_ref()
+            .expect("a menu")
+            .items
+            .iter()
+            .position(|item| matches!(item, app::MenuItem::Do("Mark", _)))
+            .expect("a menu with nothing to mark in it");
+        let row = rect.y + 1 + mark as u16;
+        handle_mouse(&mut app, at(MouseEventKind::Moved, rect.x + 1, row));
+        assert_eq!(app.menu.as_ref().expect("a menu").cursor, mark);
+        handle_mouse(
+            &mut app,
+            at(MouseEventKind::Down(MouseButton::Left), rect.x + 1, row),
+        );
+        assert!(app.menu.is_none(), "choosing a row left the menu up");
+        assert!(
+            !app.pane(here).marked.is_empty(),
+            "the row was never marked"
+        );
+    }
+
+    /// What the open menu offers, in order, for the rows that are choices.
+    fn menu_labels(app: &App) -> Vec<&'static str> {
+        app.menu
+            .as_ref()
+            .map(|menu| {
+                menu.items
+                    .iter()
+                    .filter_map(|item| match item {
+                        app::MenuItem::Do(label, _) => Some(*label),
+                        app::MenuItem::Rule => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[test]

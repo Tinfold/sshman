@@ -11,7 +11,9 @@ use ratatui::widgets::{
 
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, Arrangement, ConnectFocus, ConnectForm, Level, LinkState, Mode, Pane, Side};
+use crate::app::{
+    App, Arrangement, ConnectFocus, ConnectForm, Level, LinkState, MenuItem, Mode, Pane, Side,
+};
 use crate::config::Setting;
 use crate::keys::Action;
 use crate::layout::{Areas, Slot};
@@ -79,6 +81,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_status(f, app, rows[4]);
     draw_hints(f, app, rows[5]);
+
+    // Over the panes, under anything modal: a label about a tab is the
+    // smallest thing on the screen and the least entitled to be in the way of
+    // a box somebody opened.
+    draw_tab_tip(f, app, rows[1]);
+    // And over that: a menu is the thing being read.
+    draw_menu(f, app, area);
 
     match app.mode {
         Mode::Connect => draw_connect(f, app, area),
@@ -385,6 +394,173 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::styled(HINT, Style::new().fg(theme.dim)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The full name of the tab the pointer has been resting on.
+///
+/// Drawn after the panes rather than with the row it belongs to: it hangs
+/// below the row, over whatever is under it, and a box drawn before the thing
+/// it covers is a box nobody sees.
+fn draw_tab_tip(f: &mut Frame, app: &App, area: Rect) {
+    if app.tab_bar_row.is_none() {
+        return;
+    }
+    let budget = tab_title_budget(area.width, app.tabs.len());
+    let Some((index, title)) = app.tab_tip(budget) else {
+        return;
+    };
+    // Against the chip it is about, so it is obvious which tab is being
+    // named when there are eight of them.
+    let Some((start, ..)) = app
+        .tab_spans
+        .iter()
+        .find(|(_, _, at)| *at == index)
+        .copied()
+    else {
+        return;
+    };
+
+    let theme = app.theme;
+    let text = ellipsize(&title, area.width.saturating_sub(4) as usize);
+    let width = text.chars().count() as u16 + 4;
+    // Kept on the screen: a tab near the right-hand edge would otherwise hang
+    // its name off the side, which is the half you were asking about.
+    let x = start.min(area.right().saturating_sub(width));
+    let rect = Rect::new(x, area.y + 1, width, 3);
+    if rect.bottom() > area.bottom() {
+        return;
+    }
+    clear_under(f, rect, app.background());
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme.dim));
+    let inner = block.inner(rect).inner(Margin::new(1, 0));
+    f.render_widget(block, rect);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, Style::new().fg(theme.text)))),
+        inner,
+    );
+}
+
+/// The menu a right click opened: what can be done to what was pointed at.
+///
+/// Drawn where the click was, and moved only as far as it has to be to stay
+/// on the screen — a menu that jumped to the middle would be a menu you had
+/// to go and find, and the whole point of it is that it is under your hand.
+fn draw_menu(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(menu) = &app.menu else { return };
+    let theme = app.theme;
+    // Wide enough for the longest row and the key beside it. Worked out from
+    // the rows rather than fixed, because the rows differ: a menu over an
+    // archive has two more in it than one over a text file.
+    let widest = menu
+        .items
+        .iter()
+        .map(|item| match item {
+            MenuItem::Do(label, action) => {
+                label.chars().count() + 3 + app.keymap.shown(*action).chars().count()
+            }
+            MenuItem::Rule => 0,
+        })
+        .max()
+        .unwrap_or(10);
+    let width = (widest as u16 + 4).min(area.width);
+    let height = (menu.items.len() as u16 + 2).min(area.height);
+    // Below and to the right of the pointer where there is room, and back
+    // inside the screen where there is not.
+    let (x, y) = menu.anchor;
+    let x = x.min(area.right().saturating_sub(width)).max(area.x);
+    let y = match y + 1 + height <= area.bottom() {
+        true => y + 1,
+        // No room below, so above — and if there is no room there either,
+        // as high as it can go.
+        false => y.saturating_sub(height).max(area.y),
+    };
+    let rect = Rect::new(x, y, width, height);
+
+    clear_under(f, rect, app.background());
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme.accent));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    // How far down it starts, for a menu taller than the terminal it is in:
+    // far enough that the lit row is on the screen, and no further.
+    let shown = inner.height as usize;
+    let mut scroll = menu.scroll.min(menu.items.len().saturating_sub(shown));
+    if menu.cursor < scroll {
+        scroll = menu.cursor;
+    } else if menu.cursor >= scroll + shown {
+        scroll = menu.cursor + 1 - shown;
+    }
+
+    let room = inner.width as usize;
+    let lines: Vec<Line> = menu
+        .items
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(shown)
+        .map(|(at, item)| match item {
+            MenuItem::Rule => {
+                Line::from(Span::styled("─".repeat(room), Style::new().fg(theme.dim)))
+            }
+            MenuItem::Do(label, action) => {
+                let lit = at == menu.cursor;
+                let key = app.keymap.shown(*action);
+                // The key on the right, and the gap between stretched to fill
+                // the box, so the whole lit row is one bar rather than a word
+                // with a highlight round it.
+                let gap = room
+                    .saturating_sub(label.chars().count() + key.chars().count() + 2)
+                    .max(1);
+                let style = match lit {
+                    true => Style::new().fg(theme.on_accent).bg(theme.accent),
+                    false => Style::new().fg(theme.text),
+                };
+                let key_style = match lit {
+                    true => style,
+                    false => Style::new().fg(theme.dim),
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {label}"), style),
+                    Span::styled(" ".repeat(gap), style),
+                    Span::styled(format!("{key} "), key_style),
+                ])
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+
+    // The separators joined to the frame, so a rule reads as a line across
+    // the menu rather than as a row of dashes inside it. Done to the buffer
+    // afterwards because the border belongs to the block and the rules
+    // belong to the text, and this is the one place they meet.
+    let buf = f.buffer_mut();
+    for (at, _) in menu
+        .items
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(shown)
+        .filter(|(_, item)| matches!(item, MenuItem::Rule))
+    {
+        let y = inner.y + (at - scroll) as u16;
+        for (x, edge) in [(rect.x, "├"), (rect.right() - 1, "┤")] {
+            if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(x, y)) {
+                cell.set_symbol(edge).set_fg(theme.dim);
+            }
+        }
+    }
+
+    // Where it landed, for the mouse. Written back every frame, the way the
+    // tabs and the crumbs are.
+    if let Some(menu) = &mut app.menu {
+        menu.area = rect;
+        menu.scroll = scroll;
+    }
 }
 
 /// One pane, wherever the arrangement put it.
@@ -1374,6 +1550,7 @@ const CONNECT: &[Hint] = &[
 ];
 const PROMPT: &[Hint] = &[("↵", "confirm"), ("Esc", "cancel")];
 const CONFIRM_PHRASE: &[Hint] = &[("type the word", "then ↵"), ("Esc", "cancel")];
+const MENU: &[Hint] = &[("↑↓", "choose"), ("↵", "do it"), ("Esc", "put it away")];
 const CONFIRM: &[Hint] = &[("y", "yes"), ("n", "no")];
 const PICKER: &[Hint] = &[("↑↓", "choose"), ("↵", "open in a tab"), ("Esc", "cancel")];
 const FORWARDS: &[Hint] = &[
@@ -1440,6 +1617,9 @@ const ALL_HINTS: &[&[Hint]] = &[
 /// Which list belongs on screen right now.
 fn hints_for(app: &App) -> &'static [Hint<'static>] {
     match app.mode {
+        // A menu is a question with its answers on the screen; the keys that
+        // work it are the only ones worth naming while it is open.
+        Mode::Browse if app.menu.is_some() => MENU,
         // Waiting on the key after Ctrl-], the only useful thing to show is
         // what that key can be.
         Mode::Browse if app.carrying => CARRYING,
@@ -2512,6 +2692,37 @@ pub const HELP: &[(&str, &str)] = &[
         "reload both panes now — they follow changes on their own",
     ),
     ("", ""),
+    ("", "The mouse, in a file list"),
+    ("click", "focus that pane and put the cursor on the row"),
+    ("double click", "the same as ↵: enter it, or open it"),
+    (
+        "right click",
+        "a menu of what can be done to what is under it",
+    ),
+    ("", "  Over a row it is about the file — open, edit, copy,"),
+    (
+        "",
+        "  rename, delete, unpack; over the space below the last",
+    ),
+    (
+        "",
+        "  one it is about the directory. Every row carries the key",
+    ),
+    ("", "  that does the same thing, so the menu teaches the"),
+    (
+        "",
+        "  keyboard rather than replacing it. It aims at the row",
+    ),
+    (
+        "",
+        "  under the pointer first — unless that row is one you have",
+    ),
+    (
+        "",
+        "  marked, and then the marks stand and it is about all of",
+    ),
+    ("", "  them."),
+    ("", ""),
     ("", "Selecting and copying"),
     ("Space", "mark the file under the cursor"),
     ("a", "mark everything, or clear all marks"),
@@ -3071,6 +3282,10 @@ pub const HELP: &[(&str, &str)] = &[
         "close the tab on screen (ends that session and its shell)",
     ),
     ("✕", "the same for any tab, clicked on its own chip"),
+    (
+        "hover a chip",
+        "the whole name, where the row had to cut it short",
+    ),
     ("Ctrl-← / Ctrl-→", "move between tabs"),
     (
         "Ctrl-⇧-← / →",
@@ -3209,6 +3424,63 @@ mod tests {
             .collect();
         std::fs::remove_dir_all(&dir).ok();
         (app, rows)
+    }
+
+    /// A file list with one archive in it, and a menu open over that row.
+    fn menu_over_an_archive(width: u16, height: u16, cursor: usize) -> Vec<String> {
+        frame(width, height, |app| {
+            let files = Slot::files(Side::Local);
+            app.pane_mut(files).set_entries(vec![FileEntry {
+                name: "notes.tar.gz".into(),
+                kind: EntryKind::File,
+                size: 12,
+                mtime: 0,
+                perms: "-rw-r--r--".into(),
+                link_target: None,
+                points_to_dir: false,
+            }]);
+            app.pane_mut(files).select_index(0);
+            app.open_menu(files, Some(0), 6, 3);
+            if let Some(menu) = &mut app.menu {
+                menu.cursor = cursor;
+            }
+        })
+        .1
+    }
+
+    #[test]
+    fn the_menu_says_what_can_be_done_and_which_key_does_it() {
+        let rows = menu_over_an_archive(90, 24, 0);
+        let screen = rows.join("\n");
+        assert!(screen.contains("Rename…"), "{screen}");
+        // The key beside each row, so the menu teaches the keyboard rather
+        // than replacing it.
+        assert!(screen.contains("r / F2"), "{screen}");
+        // Only offered because this row is an archive.
+        assert!(screen.contains("Extract…"), "{screen}");
+        // The rules are joined to the frame rather than floating inside it.
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("├") && row.contains("┤")),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_menu_taller_than_the_terminal_still_reaches_its_last_row() {
+        // Twenty rows of menu in fourteen rows of terminal. Cut off at the
+        // bottom, the rows past the edge could never be chosen — so it
+        // follows the light down instead.
+        let rows = menu_over_an_archive(90, 14, 18);
+        let screen = rows.join("\n");
+        assert!(screen.contains("A shell here"), "{screen}");
+        assert!(
+            screen.contains("Reload"),
+            "the last row is still off: {screen}"
+        );
+        // And it went no further than it had to: the top of the menu is what
+        // scrolled away, not the row the light is on.
+        assert!(!screen.contains(" Open "), "it did not scroll: {screen}");
     }
 
     /// What is actually on the screen where a button was recorded.

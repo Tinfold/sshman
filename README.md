@@ -133,7 +133,15 @@ new one. `Esc` leaves `known_hosts` untouched.
 The mouse works too: the row under the pointer lights up as you move over a
 file list, one click focuses that pane and puts the cursor on the row, and two
 clicks mean the row — a directory opens, a file goes to your editor, exactly as
-`Enter` would. The path along a pane's top edge is a trail you can click your
+`Enter` would. **The right button asks what can be done here**, and gives you a
+menu of it: over a row that is about the file — open it, edit it, copy it,
+rename it, delete it, and unpack it when it is an archive — and over the space
+below the last one it is about the directory. Every row carries the key that
+does the same thing, so the menu teaches the keyboard rather than replacing it.
+A right click aims at the row under the pointer first, unless that row is one
+of the ones you have marked: then the marks stand and the menu is about all of
+them, so "mark six, right click, delete" means what it looks like it means.
+The path along a pane's top edge is a trail you can click your
 way back along: every piece of it points at the directory it names, so
 `/etc/nginx/sites` is three steps back up to `/etc` in one click, and a path
 too long for the pane loses whole pieces off the front rather than characters
@@ -728,6 +736,12 @@ and dragging a chip with the mouse does the same — the tabs change places as
 the pointer crosses them, so what is under it is where the tab lands. Whichever
 way you move one, the tab you were looking at is still the tab you are looking
 at.
+
+**Resting the pointer on a chip says what it is.** A chip is only as wide as
+the row can afford, and with eight tabs open `web01.produc…` and `web01.stagi…`
+are the same twelve characters; sitting on one for half a second puts the whole
+name below it. Only where the name was actually cut — a chip showing all of it
+has nothing to add.
 
 With more tabs than the row can hold it becomes a window on to them, always
 showing the one you are on, with `‹3` and `4›` at the ends saying how many did
