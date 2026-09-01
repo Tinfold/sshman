@@ -124,6 +124,30 @@ pub fn set_mode(path: &Path, mode: u32) {
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777));
 }
 
+/// The shell sshman's own commands run in on this machine.
+///
+/// Not `$SHELL`, and deliberately. Everything sshman builds for itself — the
+/// `tar` lines, the guard that refuses to overwrite a file on a paste, the
+/// `find` that lists a directory your account cannot open — is a *POSIX*
+/// shell string, written that way on purpose so that one builder serves both
+/// sides: here, and down the SSH channel where the far end is whatever `sh`
+/// that account has.
+///
+/// Handing one of those to `$SHELL` works right up until somebody's `$SHELL`
+/// is fish, which has no `for … do … done` and no `[ … ]`. Then copying two
+/// files between local panes fails with `Missing end to balance this for
+/// loop` — a complaint from a shell the person never asked sshman to use,
+/// about a line they never wrote.
+///
+/// A command *you* typed is the other thing entirely, and that one does go to
+/// your own shell. See [`LocalConn::run_yours`].
+pub const POSIX_SHELL: &str = "/bin/sh";
+
+/// The shell a command somebody typed runs in: theirs.
+fn your_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| POSIX_SHELL.to_string())
+}
+
 /// A tab pointed at this machine.
 ///
 /// There is nothing to connect to and nothing to drop, so the interesting
@@ -151,13 +175,29 @@ impl LocalConn {
         }
     }
 
-    /// Run a command through the shell, as root when asked.
+    /// Run one of sshman's own commands, as root when asked.
+    ///
+    /// In `/bin/sh`, because that is the language these are written in. See
+    /// [`POSIX_SHELL`].
     ///
     /// The password goes in on stdin and never onto a command line, where
     /// every other process on the machine could read it.
     pub fn run(&self, cmd: &str, elevated: bool) -> Result<(String, String, i32)> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let (program, args) = argv(&shell, cmd, elevated);
+        self.run_in(POSIX_SHELL, cmd, elevated)
+    }
+
+    /// Run a command *you* typed, in the shell you use.
+    ///
+    /// The one case where `$SHELL` is the right answer: you wrote the line,
+    /// so it is in whatever language you write lines in. It is also what the
+    /// far side does — a command sent down the SSH channel is run by that
+    /// account's login shell, not by a shell sshman chose.
+    pub fn run_yours(&self, cmd: &str, elevated: bool) -> Result<(String, String, i32)> {
+        self.run_in(&your_shell(), cmd, elevated)
+    }
+
+    fn run_in(&self, shell: &str, cmd: &str, elevated: bool) -> Result<(String, String, i32)> {
+        let (program, args) = argv(shell, cmd, elevated);
         let mut command = Command::new(program);
         command.args(args);
         let mut child = command
@@ -373,6 +413,57 @@ mod tests {
 
         let (program, args) = argv("/bin/sh", "id -u", false);
         assert_eq!((program.as_str(), args.len()), ("/bin/sh", 2));
+    }
+
+    #[test]
+    fn what_sshman_composed_runs_in_a_shell_that_can_read_it() {
+        // The paste guard is POSIX — `for … do … done`, `[ -e … ]` — because
+        // it is built once and run on both sides, and the far side is
+        // whatever `sh` that account has. Handing it to `$SHELL` was fine
+        // until somebody's `$SHELL` was fish, which has neither, and then
+        // copying two files between local panes failed with `Missing end to
+        // balance this for loop`: a complaint from a shell nobody asked
+        // sshman to use, about a line nobody wrote.
+        let dir = scratch("posix-shell");
+        let from = dir.join("from");
+        let into = dir.join("into");
+        fs::create_dir_all(&from).unwrap();
+        fs::create_dir_all(&into).unwrap();
+        fs::write(from.join("one.txt"), "hello").unwrap();
+
+        let cmd = crate::fileops::paste_command(
+            &from.display().to_string(),
+            &["one.txt".into()],
+            &into.display().to_string(),
+            crate::fileops::Action::Copy,
+        );
+        let (out, err, code) = conn(&dir).run(&cmd, false).expect("the shell ran");
+        assert_eq!(code, 0, "out: {out}\nerr: {err}");
+        assert!(into.join("one.txt").exists(), "the copy never landed");
+
+        // And the guard it carries still refuses to overwrite, which is the
+        // half of the command that needs the syntax in the first place.
+        let (_, _, again) = conn(&dir).run(&cmd, false).expect("the shell ran");
+        assert_ne!(again, 0, "it copied over a file that was already there");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_command_you_typed_is_read_by_the_shell_you_type_in() {
+        // The other half of the rule. A line sshman composed is POSIX and
+        // goes to `/bin/sh`; a line you typed is in whatever language you
+        // write lines in, and goes to yours — which is also what happens on
+        // the far side, where an exec channel is read by that account's own
+        // login shell.
+        let expected = std::env::var("SHELL").unwrap_or_else(|_| POSIX_SHELL.to_string());
+        assert_eq!(your_shell(), expected);
+
+        let dir = scratch("your-shell");
+        let (out, _, code) = conn(&dir).run_yours("echo hello", false).expect("it ran");
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "hello");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -1098,11 +1098,12 @@ fn run_local(
     let mut cmd = match &command {
         // Run through a shell so the command line can use the user's PATH and
         // ordinary shell syntax. Which shell is not the user's choice here:
-        // this is sshman running something it composed, and it composed it in
-        // the one language every shell in the family understands.
+        // this is sshman running something it composed — a `docker exec -it`,
+        // an editor — and it composed it in the one language every shell in
+        // the family understands, which is not the language fish speaks. See
+        // [`crate::local::POSIX_SHELL`].
         Some(line) => {
-            let mut c =
-                CommandBuilder::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
+            let mut c = CommandBuilder::new(crate::local::POSIX_SHELL);
             c.arg("-c");
             c.arg(line);
             c

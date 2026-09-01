@@ -952,9 +952,13 @@ fn force_full_redraw(terminal: &mut Tui) {
 
 /// Run `program` on `path` through a shell, so `EDITOR="code -w"` and friends
 /// work as written.
+///
+/// Through `/bin/sh` rather than `$SHELL`: the line is sshman's, and the path
+/// on the end of it is quoted by [`sh_quote`], so the shell that reads it has
+/// to be the one those rules are for. See [`sshman::local::POSIX_SHELL`].
 fn run_editor(program: &str, path: &std::path::Path) -> Result<()> {
     let line = format!("{program} {}", sh_quote(&path.to_string_lossy()));
-    let mut command = Command::new(shell());
+    let mut command = Command::new(local::POSIX_SHELL);
     command.arg("-c").arg(&line);
     // Start it in the file's own directory rather than wherever sshman was
     // launched from. Editors work out what project they are in by looking
@@ -972,8 +976,10 @@ fn run_editor(program: &str, path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Hand the whole terminal to the `ssh` (or `docker exec`) line sshman built.
+/// Its own line, so its own shell — see [`run_editor`].
 fn run_shell(cmd: &str) -> Result<()> {
-    Command::new(shell())
+    Command::new(local::POSIX_SHELL)
         .arg("-c")
         .arg(cmd)
         .status()
@@ -1055,8 +1061,4 @@ fn ssh_prefix(opts: &ConnectOpts) -> String {
     }
     cmd.push_str(&format!(" {}@{}", opts.user, opts.host));
     cmd
-}
-
-fn shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }

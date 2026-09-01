@@ -839,10 +839,20 @@ On a server the same name is used, **if the server has it**: sshman checks with
 in the login shell rather than in nothing at all. `!` — the full-screen shell —
 does the same.
 
-This is only ever the *interactive* shell in a pane. sshman's own work — listing
-a directory, unpacking an archive, running what `:` was given — keeps going
-through `$SHELL`, so naming a shell here that speaks a different language cannot
-break anything but your own prompt.
+This is only ever the *interactive* shell in a pane. **sshman's own work goes
+through `/bin/sh`**, whatever this says and whatever `$SHELL` says — listing a
+directory root cannot read, packing an archive, the guard that keeps a paste
+from overwriting anything. Those are one set of POSIX shell strings, built once
+and run on both sides, because the far end of a connection is whatever `sh`
+that account has. Handing them to `$SHELL` worked until somebody's `$SHELL` was
+fish, which has no `for … do … done`: copying two files between local panes
+failed with a complaint from a shell nobody had asked sshman to use, about a
+line nobody had written. So naming a shell here — or using one — cannot break
+anything but your own prompt, which is what it always should have meant.
+
+The exception is the line *you* typed. `:` runs a command in the shell you
+write commands in, because you wrote it; that is also what happens on the far
+side, where an exec channel is read by the account's own login shell.
 
 ### Selecting text in a shell
 

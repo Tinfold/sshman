@@ -695,7 +695,9 @@ fn handle_inner(
             // commands. Running inside the pane's directory is what users
             // expect from a file manager's command line.
             let full = format!("cd {} 2>/dev/null; {}", crate::types::sh_quote(&cwd), cmd);
-            match c.run(&full, sudo) {
+            // Yours rather than sshman's, so it is read by the shell you
+            // write in. See [`crate::local::POSIX_SHELL`].
+            match c.run_yours(&full, sudo) {
                 Ok((out, err, code)) => {
                     let mut output = out;
                     if !err.is_empty() {

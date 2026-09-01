@@ -117,6 +117,17 @@ pub trait Backend: Send {
     fn is_alive(&self) -> bool;
 
     fn run(&self, cmd: &str, elevated: bool) -> Result<(String, String, i32)>;
+
+    /// The same, for a line the person typed rather than one sshman built.
+    ///
+    /// Everything but a tab on this machine already runs a command in the
+    /// account's own shell — that is what an SSH exec channel does — so the
+    /// default is `run` and only the local backend has anything to say. See
+    /// [`crate::local::POSIX_SHELL`] for why it does.
+    fn run_yours(&self, cmd: &str, elevated: bool) -> Result<(String, String, i32)> {
+        self.run(cmd, elevated)
+    }
+
     fn list(&self, path: &str, elevated: bool) -> Result<Vec<FileEntry>>;
     fn resolve_dir(&self, path: &str, elevated: bool) -> Result<String>;
     fn mkdir(&self, path: &str, elevated: bool) -> Result<()>;
@@ -373,6 +384,10 @@ impl Backend for LocalConn {
 
     fn run(&self, cmd: &str, elevated: bool) -> Result<(String, String, i32)> {
         LocalConn::run(self, cmd, elevated)
+    }
+
+    fn run_yours(&self, cmd: &str, elevated: bool) -> Result<(String, String, i32)> {
+        LocalConn::run_yours(self, cmd, elevated)
     }
 
     fn list(&self, path: &str, elevated: bool) -> Result<Vec<FileEntry>> {
