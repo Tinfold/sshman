@@ -172,6 +172,25 @@ pub fn sh_quote(s: &str) -> String {
 }
 
 /// Shorten in the middle so both the start and the end stay readable.
+/// Cut a string to `max` characters, keeping the front.
+///
+/// What a command line wants, where [`ellipsize`] is what a path wants. Both
+/// ends of `/etc/nginx/sites-enabled` say something, so a path gives up its
+/// middle; a command line says what it is in the first few words and trails
+/// off into arguments, so `npm run dev --workspace…` beats `npm r…space api`.
+pub fn shorten(s: &str, max: usize) -> String {
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
 pub fn ellipsize(s: &str, max: usize) -> String {
     let len = s.chars().count();
     if len <= max {

@@ -95,6 +95,8 @@ pub enum PromptKind {
     SetEditorOpen,
     /// The shell a shell pane starts from now on, and next time.
     SetShell,
+    /// The command this terminal pane runs instead of opening a shell.
+    PaneCommand(Slot),
 }
 
 /// One of the ready-made ways to arrange a tab's panes.
@@ -594,6 +596,18 @@ pub struct Term {
     /// standing in for the name. An empty one means the pane is at a shell
     /// prompt, so the editor is run as a command instead.
     pub opens: Option<String>,
+    /// The command you told this pane to run instead of opening a shell.
+    ///
+    /// A pane with one is a pane that *is* that program — `tail -f` on a log,
+    /// `btop`, the dev server — rather than a prompt you typed it at. Kept on
+    /// the terminal rather than passed in and forgotten, because it is a fact
+    /// about the pane: a workspace writes it down, the session writes it
+    /// down, and both start it again when they bring the pane back.
+    ///
+    /// Not the editor pane's program, which is [`Term::opens`]'s business and
+    /// comes from the `editor` setting rather than from anything you said
+    /// about this pane. The two are exclusive by construction.
+    pub runs: Option<String>,
 }
 
 impl Term {
@@ -748,6 +762,9 @@ pub struct RemoteTab {
     /// Terminals a workspace said were editor panes, waiting to be opened.
     /// Emptied as they are, since after that each terminal says for itself.
     wants_editor: Vec<TermId>,
+    /// And what a workspace said this tab's terminals were running. Read as
+    /// each one is opened, and emptied the same way.
+    wants_run: Vec<crate::workspace::PaneRun>,
     /// Where a workspace said this tab's panes were pointed. Read as each
     /// pane is opened; a pane it says nothing about opens in the tab's own
     /// directory, which is what every tab did before this was written down.
@@ -852,6 +869,8 @@ pub struct PendingConnect {
     pub layout: Layout,
     /// Which of those panes' terminals were opening files, from a workspace.
     pub editors: Vec<TermId>,
+    /// And what any of them were told to run.
+    pub runs: Vec<crate::workspace::PaneRun>,
     /// Where a workspace said those panes were pointed.
     pub dirs: PaneDirs,
     /// What its worker is doing, if anything. Held here rather than in a list
@@ -879,6 +898,7 @@ pub struct Waiting {
     forwards: Vec<String>,
     layout: Layout,
     editors: Vec<TermId>,
+    runs: Vec<crate::workspace::PaneRun>,
     dirs: PaneDirs,
 }
 
@@ -947,6 +967,8 @@ pub struct App {
     pub local_terms: Vec<Term>,
     /// The same waiting list as a tab's, for this machine's terminals.
     wants_editor: Vec<TermId>,
+    /// And the same for what they were told to run.
+    wants_run: Vec<crate::workspace::PaneRun>,
     /// And the same for where this machine's panes were pointed. They are
     /// shared between the tabs, so this belongs to the session rather than to
     /// any one of them.
@@ -1156,6 +1178,7 @@ impl App {
             local: vec![LocalTree::new(layout::MAIN, local_start)],
             local_terms: Vec::new(),
             wants_editor: Vec::new(),
+            wants_run: Vec::new(),
             wants_dirs: PaneDirs::default(),
             next_term_id: 0,
             next_tree_id: layout::MAIN,
@@ -1402,13 +1425,28 @@ impl App {
                 }
                 None => false,
             };
-            let (run, opens) = match was_editor {
-                true => {
+            // And what it was told to run, taken off the list the same way,
+            // so a pane that has been opened once is not opened again on the
+            // strength of a workspace read half an hour ago.
+            let asked = match host {
+                Side::Local => &mut self.wants_run,
+                Side::Remote => match self.tabs.get_mut(index) {
+                    Some(tab) => &mut tab.wants_run,
+                    None => continue,
+                },
+            };
+            let told_to_run = asked
+                .iter()
+                .position(|w| w.id == id)
+                .map(|at| asked.remove(at).cmd);
+            let (run, opens) = match (was_editor, told_to_run) {
+                (true, _) => {
                     let program = self.editor.clone();
                     let opens = self.config.editor_open(&program);
                     (Some(program), Some(opens))
                 }
-                false => (None, None),
+                (false, Some(cmd)) => (Some(cmd), None),
+                (false, None) => (None, None),
             };
             self.open_term_in(index, host, id, here, run, opens);
         }
@@ -1947,6 +1985,7 @@ impl App {
                 w.forwards.clone(),
                 w.layout.clone(),
                 w.editors.clone(),
+                w.runs.clone(),
                 w.dirs.clone(),
             )
         });
@@ -1966,6 +2005,7 @@ impl App {
                 .filter(|n| !n.is_empty()),
             forwards: Vec::new(),
             editors: Vec::new(),
+            runs: Vec::new(),
             dirs: PaneDirs::default(),
             // The arrangement on screen, so opening a server does not throw
             // away the split you just set up — minus the panes belonging to
@@ -1990,13 +2030,14 @@ impl App {
             install_key: self.form.install_key,
         });
 
-        if let Some((path, forwards, layout, editors, dirs)) = asked_for
+        if let Some((path, forwards, layout, editors, runs, dirs)) = asked_for
             && let Some(pending) = self.pending.last_mut()
         {
             pending.initial_dir = path.or(pending.initial_dir.take());
             pending.forwards = forwards;
             pending.layout = layout;
             pending.editors = editors;
+            pending.runs = runs;
             pending.dirs = dirs;
         }
     }
@@ -2418,6 +2459,7 @@ impl App {
                     },
                     terms: Vec::new(),
                     wants_editor: pending.editors.clone(),
+                    wants_run: pending.runs.clone(),
                     wants_dir: pending.dirs.clone(),
                     focus: Slot::files(Side::Remote),
                     layout: pending.layout.clone(),
@@ -2498,6 +2540,7 @@ impl App {
                                 pending.forwards.clone(),
                                 pending.layout.clone(),
                                 pending.editors.clone(),
+                                pending.runs.clone(),
                                 pending.dirs.clone(),
                             );
                             (
@@ -2526,7 +2569,7 @@ impl App {
                             }
                         });
                         if !self.needs_password.iter().any(|w| w.label == label) {
-                            let (path, forwards, layout, editors, dirs) = asked_for;
+                            let (path, forwards, layout, editors, runs, dirs) = asked_for;
                             self.needs_password.push(Waiting {
                                 label,
                                 opts,
@@ -2534,6 +2577,7 @@ impl App {
                                 forwards,
                                 layout,
                                 editors,
+                                runs,
                                 dirs,
                             });
                         }
@@ -3685,6 +3729,7 @@ impl App {
             // A tab that needs no server at all.
             Action::LocalTab => self.open_local_tab(),
             Action::EditorPane => self.toggle_editor_pane(),
+            Action::PaneCommand => self.ask_pane_command(),
             Action::CloseTab => self.close_tab(),
             Action::NextTab => self.cycle_tab(1),
             Action::PreviousTab => self.cycle_tab(-1),
@@ -3932,6 +3977,7 @@ impl App {
             PromptKind::SetEditor => self.set_editor(value),
             PromptKind::SetEditorOpen => self.set_editor_open(value),
             PromptKind::SetShell => self.set_shell(value),
+            PromptKind::PaneCommand(at) => self.set_pane_command(at, value),
         }
     }
 
@@ -5318,21 +5364,10 @@ impl App {
             self.set_status("nothing open to save", Level::Bad);
             return;
         }
-        let items = self.workspace_items();
-        let skipped = self.tabs.len() - items.len();
-        let local = Some(self.local_cwd().display().to_string());
-        let local_editors = self
-            .local_terms
-            .iter()
-            .filter(|term| term.is_editor())
-            .map(|term| term.id)
-            .collect();
-        let local_dirs = self.local_pane_dirs();
+        let snapshot = self.snapshot(name);
+        let skipped = self.tabs.len() - snapshot.items.len();
 
-        match self
-            .workspaces
-            .save(name, local, local_editors, local_dirs, items)
-        {
+        match self.workspaces.save(snapshot) {
             Ok(replaced) => {
                 let verb = if replaced { "replaced" } else { "saved" };
                 let mut msg = format!("{verb} workspace {name}");
@@ -5347,14 +5382,22 @@ impl App {
         }
     }
 
-    /// How this session looks written down, in the shape a workspace takes.
+    /// Everything open right now, written down under a name.
     ///
-    /// Everything a workspace holds and nothing more: what each tab was
-    /// connected to, how its panes were arranged, and where every one of
-    /// them was pointed. No passwords, because none are kept anywhere.
-    pub fn session_snapshot(&self) -> crate::workspace::Workspace {
+    /// The one place that says what a workspace is made of: what each tab was
+    /// connected to, how its panes were arranged, where every one of them was
+    /// pointed, and what any of them were told to run. No passwords, because
+    /// none are kept anywhere.
+    ///
+    /// Both doors come through here — `w` saving a workspace and the session
+    /// being kept up to date — because they hold the same thing and there is
+    /// no version of "the same thing" that is worth writing down twice. A
+    /// field added to one and forgotten in the other is a workspace that
+    /// comes back right and a session that does not, which is the failure
+    /// nobody notices until the day they need it.
+    pub fn snapshot(&self, name: &str) -> crate::workspace::Workspace {
         crate::workspace::Workspace {
-            name: crate::workspace::SESSION_NAME.to_string(),
+            name: name.to_string(),
             local_path: Some(self.local_cwd().display().to_string())
                 .filter(|path| !path.is_empty()),
             local_editors: self
@@ -5363,10 +5406,16 @@ impl App {
                 .filter(|term| term.is_editor())
                 .map(|term| term.id)
                 .collect(),
+            local_runs: pane_runs(&self.local_terms),
             local_dirs: self.local_pane_dirs(),
             items: self.workspace_items(),
             saved_at: crate::workspace::now(),
         }
+    }
+
+    /// The session as it stands, under the name the session is kept under.
+    pub fn session_snapshot(&self) -> crate::workspace::Workspace {
+        self.snapshot(crate::workspace::SESSION_NAME)
     }
 
     /// Keep the file that says where this session got to up to date.
@@ -5435,6 +5484,7 @@ impl App {
         // where each of them was pointed are the workspace's to say rather
         // than any one tab's.
         self.wants_editor = workspace.local_editors.clone();
+        self.wants_run = workspace.local_runs.clone();
         self.wants_dirs = workspace.local_dirs.clone();
         if workspace.items.is_empty() {
             self.set_status(
@@ -5460,6 +5510,7 @@ impl App {
                     pending.layout = layout;
                 }
                 pending.editors = item.editors().to_vec();
+                pending.runs = item.runs().to_vec();
                 pending.dirs = item.dirs().clone();
             }
         }
@@ -5949,10 +6000,19 @@ impl App {
         let shell = match host {
             Side::Local => {
                 let cwd = here.map(PathBuf::from).unwrap_or_else(|| self.local_cwd());
-                match &run {
-                    None => Shell::spawn_local(&cwd, ROWS, COLS),
-                    Some(cmd) => {
+                match (&run, opens.is_some()) {
+                    (None, _) => Shell::spawn_local(&cwd, ROWS, COLS),
+                    // The editor: sshman's own line, built from the `editor`
+                    // setting and a path it quoted itself.
+                    (Some(cmd), true) => {
                         Shell::spawn_local_in("local".into(), &cwd, cmd.clone(), ROWS, COLS)
+                    }
+                    // Yours, so read by the shell you write lines in. The
+                    // remote side already does this — an `exec` down the
+                    // channel is read by that account's login shell — and
+                    // this is the near side agreeing.
+                    (Some(cmd), false) => {
+                        Shell::spawn_local_running("local".into(), &cwd, cmd.clone(), ROWS, COLS)
                     }
                 }
             }
@@ -5971,11 +6031,18 @@ impl App {
                 match (&tab.target, tab.ssh_opts()) {
                     // Already here: the same shell the local pane opens, in
                     // this tab's directory.
-                    (Target::Local, _) => match &run {
-                        None => Shell::spawn_local(Path::new(&cwd), ROWS, COLS),
-                        Some(cmd) => {
+                    (Target::Local, _) => match (&run, opens.is_some()) {
+                        (None, _) => Shell::spawn_local(Path::new(&cwd), ROWS, COLS),
+                        (Some(cmd), true) => {
                             Shell::spawn_local_in(label, Path::new(&cwd), cmd.clone(), ROWS, COLS)
                         }
+                        (Some(cmd), false) => Shell::spawn_local_running(
+                            label,
+                            Path::new(&cwd),
+                            cmd.clone(),
+                            ROWS,
+                            COLS,
+                        ),
                     },
                     // A container is entered with `docker exec -it`, run
                     // either here or on the server that hosts it.
@@ -6015,7 +6082,17 @@ impl App {
             }
         };
 
-        let term = Term { id, shell, opens };
+        // A command on a pane that is not the editor is a command you gave
+        // it, so it is written down and started again next time. The editor's
+        // is not: that one comes from the `editor` setting, and a workspace
+        // saying `nvim` would be a workspace overruling a setting you changed
+        // afterwards.
+        let term = Term {
+            id,
+            runs: run.filter(|_| opens.is_none()),
+            shell,
+            opens,
+        };
         match host {
             Side::Local => self.local_terms.push(term),
             Side::Remote => self.tabs.get_mut(index)?.terms.push(term),
@@ -6118,6 +6195,101 @@ impl App {
             Some(slot) => self.close_pane(*slot),
             None => self.split_with_term(Dir::Down, 70),
         }
+    }
+
+    // ---- what a pane runs ---------------------------------------------------
+
+    /// Ask what this terminal pane should run.
+    ///
+    /// Prefilled with whatever it runs now, so the key is "change it" as
+    /// readily as "set it", and clearing the box is how a pane goes back to
+    /// being an ordinary prompt.
+    fn ask_pane_command(&mut self) {
+        let at = self.focus;
+        if !at.is_term() {
+            self.set_status(
+                "a command belongs to a terminal pane — S opens one",
+                Level::Info,
+            );
+            return;
+        }
+        // The editor pane is spoken for: what it runs comes from the `editor`
+        // setting, and two answers to "what does this pane run" is one too
+        // many.
+        if self.term(at).is_some_and(Term::is_editor) {
+            self.set_status(
+                "the editor pane runs your editor — , → Editor changes it",
+                Level::Info,
+            );
+            return;
+        }
+        let now = self
+            .term(at)
+            .and_then(|term| term.runs.clone())
+            .unwrap_or_default();
+        self.open_prompt(
+            PromptKind::PaneCommand(at),
+            format!("Run in {} (empty for a shell)", self.pane_name(at)),
+            now,
+        );
+    }
+
+    /// Give a terminal pane a command, or take its command away.
+    ///
+    /// It happens now rather than next time: the pane restarts running what
+    /// you just said, which is the same road a workspace takes when it opens
+    /// one. One road, so a pane cannot behave one way when you set it up and
+    /// another way when it comes back — and you can see straight away that
+    /// you typed the command you meant.
+    fn set_pane_command(&mut self, at: Slot, command: String) {
+        let command = command.trim().to_string();
+        let command = (!command.is_empty()).then_some(command);
+        if self.term(at).is_none() {
+            return;
+        }
+        if !self.restart_term(at, command.clone()) {
+            self.set_status("that pane could not be restarted", Level::Bad);
+            return;
+        }
+        match &command {
+            Some(cmd) => self.set_status(
+                format!("{} runs {cmd} — saved with the session", self.pane_name(at)),
+                Level::Good,
+            ),
+            None => self.set_status(
+                format!("{} is a shell again", self.pane_name(at)),
+                Level::Info,
+            ),
+        }
+    }
+
+    /// Start a terminal pane over, running `run` — or a shell, where that is
+    /// `None`. Says whether it went.
+    ///
+    /// The pane keeps its number, which is what makes this a restart rather
+    /// than a replacement: the arrangement still names it, the keyboard stays
+    /// on it, and what a workspace wrote down about it still applies. The old
+    /// pty goes when the old terminal is dropped.
+    fn restart_term(&mut self, at: Slot, run: Option<String>) -> bool {
+        let Slot::Term { host, id } = at else {
+            return false;
+        };
+        let index = self.active;
+        // Where it is now, so a restarted pane opens where the old one had
+        // got to rather than back at the top of the project.
+        let here = self
+            .shell(at)
+            .and_then(crate::shell::Shell::cwd)
+            .unwrap_or_else(|| self.term_start_dir(index, host, id));
+        match host {
+            Side::Local => self.local_terms.retain(|t| t.id != id),
+            Side::Remote => match self.tabs.get_mut(index) {
+                Some(tab) => tab.terms.retain(|t| t.id != id),
+                None => return false,
+            },
+        }
+        self.open_term_in(index, host, id, here, run, None)
+            .is_some()
     }
 
     /// Open an editor pane beside the focused one, or close the one this
@@ -6920,6 +7092,7 @@ impl App {
             id,
             shell: Shell::spawn_local(cwd, 24, 80),
             opens: None,
+            runs: None,
         });
         let slot = Slot::term(Side::Local, id);
         self.layout
@@ -6957,6 +7130,7 @@ impl App {
             trees: vec![RemoteTree::new(layout::MAIN, "/home/me".into())],
             terms: Vec::new(),
             wants_editor: Vec::new(),
+            wants_run: Vec::new(),
             wants_dir: PaneDirs::default(),
             focus: Slot::files(Side::Remote),
             layout,
@@ -7023,6 +7197,7 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
         .filter(|term| term.is_editor())
         .map(|term| term.id)
         .collect();
+    let runs = pane_runs(&tab.terms);
     let dirs = pane_dirs(
         tab.trees.iter().map(|tree| (tree.id, tree.cwd.clone())),
         tab.terms.iter().map(|term| (term.id, term.shell.cwd())),
@@ -7033,6 +7208,7 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
             name: tab.name.clone(),
             layout: Some(tab.layout.clone()),
             editors,
+            runs,
             dirs,
         }),
         Target::Ssh(opts) => Some(WorkspaceItem::Ssh {
@@ -7045,6 +7221,7 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
             forwards: saved_forwards(tab),
             layout: Some(tab.layout.clone()),
             editors,
+            runs,
             dirs,
         }),
         Target::Docker {
@@ -7069,6 +7246,7 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
                     // reached, so it has no panes of its own.
                     layout: None,
                     editors: Vec::new(),
+                    runs: Vec::new(),
                     dirs: Default::default(),
                 })
             }),
@@ -7076,9 +7254,28 @@ fn workspace_item_for(tab: &RemoteTab) -> Option<WorkspaceItem> {
             forwards: saved_forwards(tab),
             layout: Some(tab.layout.clone()),
             editors,
+            runs,
             dirs,
         }),
     }
+}
+
+/// What a set of terminals were told to run, ready to be written down.
+///
+/// Only the ones that were told something. A pane you type in has nothing to
+/// say here, and writing it down as an empty command would be a workspace
+/// that reopens it running nothing — which is a different thing from a
+/// workspace that says nothing about it at all.
+fn pane_runs(terms: &[Term]) -> Vec<crate::workspace::PaneRun> {
+    terms
+        .iter()
+        .filter_map(|term| {
+            Some(crate::workspace::PaneRun {
+                id: term.id,
+                cmd: term.runs.clone()?,
+            })
+        })
+        .collect()
 }
 
 /// Gather where a set of panes were pointed, ready to be written down.
@@ -7387,6 +7584,7 @@ mod tests {
                 id,
                 shell,
                 opens: None,
+                runs: None,
             });
         let slot = Slot::term(host, id);
         let at = app.files_pane(host);
@@ -8719,6 +8917,7 @@ mod tests {
             name: None,
             forwards: Vec::new(),
             editors: Vec::new(),
+            runs: Vec::new(),
             dirs: PaneDirs::default(),
             layout: Layout::default(),
             task: None,
@@ -9651,6 +9850,144 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ---- what a pane runs ---------------------------------------------------
+
+    #[test]
+    fn a_pane_a_workspace_told_to_run_something_runs_it() {
+        // The whole point: a workspace of four servers with a log tailing in
+        // each comes back tailing, rather than as four blank prompts you have
+        // to type the same four commands into.
+        let dir = scratch("pane-run-restore");
+        let mut app = app_in(&dir);
+        let slot = Slot::term(Side::Local, 7);
+        app.layout
+            .split(Slot::files(Side::Local), Dir::Down, slot, 70);
+        app.wants_run = vec![crate::workspace::PaneRun {
+            id: 7,
+            cmd: "echo pane-command-ran".into(),
+        }];
+
+        app.settle_focus();
+        assert_eq!(
+            app.term(slot).and_then(|t| t.runs.as_deref()),
+            Some("echo pane-command-ran"),
+            "the pane opened without the command it was told to run"
+        );
+        // And it is a real process in a real pty, not a note on a struct.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ran = app
+                .shell(slot)
+                .is_some_and(|s| s.with_screen(|s| s.contents().contains("pane-command-ran")));
+            if ran {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the command never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Taken off the list as it is used, so a pane opened once is not
+        // started again on the strength of a workspace read an hour ago.
+        assert!(app.wants_run.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn what_a_pane_runs_is_written_down_with_everything_else() {
+        let dir = scratch("pane-run-saved");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "web01", None);
+        let here = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        let there = add_term(&mut app, Side::Remote, Shell::spawn_local(&dir, 24, 80));
+        let (Slot::Term { id: here_id, .. }, Slot::Term { id: there_id, .. }) = (here, there)
+        else {
+            panic!("not terminals");
+        };
+        for term in &mut app.local_terms {
+            term.runs = Some("btop".into());
+        }
+        for term in &mut app.tabs[0].terms {
+            term.runs = Some("tail -f /var/log/syslog".into());
+        }
+
+        let snapshot = app.snapshot("mine");
+        assert_eq!(
+            snapshot
+                .local_runs
+                .iter()
+                .find(|r| r.id == here_id)
+                .map(|r| r.cmd.as_str()),
+            Some("btop"),
+            "this machine's panes"
+        );
+        assert_eq!(
+            snapshot.items[0]
+                .runs()
+                .iter()
+                .find(|r| r.id == there_id)
+                .map(|r| r.cmd.as_str()),
+            Some("tail -f /var/log/syslog"),
+            "and the server's"
+        );
+        // The session and a saved workspace are the same snapshot, so neither
+        // can quietly hold less than the other.
+        assert_eq!(app.session_snapshot().local_runs, snapshot.local_runs);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn giving_a_pane_a_command_restarts_it_without_renumbering_it() {
+        // The pane keeps its number, which is what makes this a restart
+        // rather than a replacement: the arrangement still names it, the
+        // keyboard stays on it, and what a workspace wrote down still applies.
+        let dir = scratch("pane-run-set");
+        let mut app = app_in(&dir);
+        let slot = app.open_test_term(&dir);
+        app.focus = slot;
+
+        app.set_pane_command(slot, "  echo hello  ".into());
+        assert!(app.layout.contains(slot), "the pane was renumbered");
+        assert_eq!(
+            app.term(slot).and_then(|t| t.runs.as_deref()),
+            Some("echo hello"),
+            "and it is not trimmed"
+        );
+        assert!(app.status.contains("echo hello"), "{}", app.status);
+
+        // An empty one hands the pane back to you.
+        app.set_pane_command(slot, "   ".into());
+        assert!(app.layout.contains(slot));
+        assert_eq!(app.term(slot).and_then(|t| t.runs.as_deref()), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_editors_program_is_not_a_command_you_assigned() {
+        // The editor pane runs `$EDITOR`, which comes from a setting rather
+        // than from anything said about that pane — a workspace holding
+        // `nvim` would be a workspace overruling a setting changed since.
+        let dir = scratch("pane-run-editor");
+        let mut app = app_in(&dir);
+        let slot = app.open_test_term(&dir);
+        app.focus = slot;
+        if let Some(term) = app.local_terms.iter_mut().next() {
+            term.opens = Some(String::new());
+        }
+
+        assert!(app.term(slot).is_some_and(Term::is_editor));
+        app.ask_pane_command();
+        assert!(
+            app.prompt.is_none(),
+            "it offered to give the editor a command"
+        );
+        assert!(app.status.contains("editor"), "{}", app.status);
+        assert!(app.snapshot("mine").local_runs.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ---- the session --------------------------------------------------------
 
     #[test]
@@ -9688,6 +10025,7 @@ mod tests {
             name: "prod".into(),
             local_path: None,
             local_editors: Vec::new(),
+            local_runs: Vec::new(),
             local_dirs: PaneDirs::default(),
             items: Vec::new(),
             saved_at: 0,

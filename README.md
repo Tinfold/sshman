@@ -126,6 +126,7 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `=` | even the borders up again |
 | `s` | toggle sudo mode |
 | `n` / `F7`, `r` / `F2`, `d` / `F8` | mkdir, rename, delete |
+| `$` | give a shell pane a command to run — see [A pane that runs something](#a-pane-that-runs-something) |
 | `C` | connection screen: connect to a server, always in a new tab |
 | `?` | help |
 | `q` | quit — it asks first, and the same key again is yes |
@@ -630,10 +631,15 @@ than the one it was started in. A pane that was your
 [editor](#the-editor-pane) opens as an editor again. They open on every tab a
 workspace holds rather than only the one you happen to look at first, so a
 workspace of four servers with a shell each comes back as four running shells.
+A pane you [gave a command](#a-pane-that-runs-something) comes back running
+it, so the four logs you watch every morning are watching before you have
+touched anything.
+
 What cannot come back is the *session*: a pty whose process has ended is gone,
 so what you get is a fresh shell where the old one was. The part a workspace
-can keep is the part that was yours to arrange rather than the shell's to
-remember.
+can keep is the part that was yours to arrange — where the panes were, what
+they were pointed at, and what you told them to run — rather than the shell's
+to remember.
 
 A remote shell waits for its tab to say where it is before opening, so a
 workspace of five servers does not try to start shells on connections that are
@@ -797,6 +803,43 @@ lists the keys the shell does not swallow whenever one is focused.
   one.
 - A terminal belongs to the tab whose pane you opened it in. Switching tabs
   hides it rather than ending it, and it is still there when you come back.
+
+### A pane that runs something
+
+Half the panes anyone keeps open are not prompts. They are a log tailing, a
+build watching, `btop` on the box that keeps falling over — the same command
+typed into the same pane every morning. `$` gives a pane that command:
+
+```
+$  →  Run in shell 2 (empty for a shell):  tail -f /var/log/nginx/access.log
+```
+
+The pane restarts running it, and its border says what it is running, so a
+pane showing a log and a pane you typed in are no longer identical once the
+output has scrolled. From inside a focused shell, `Ctrl-]` first — the pane
+has the keyboard until you ask for it back.
+
+**It is saved with the workspace and with the session**, beside where each
+pane was pointed and how they were arranged. So a workspace of four servers
+with a log tailing in each comes back tailing rather than as four blank
+prompts you type the same four commands into, and so does the session after a
+terminal window closed on it. It is the same road either way: assigning a
+command restarts the pane exactly as reopening it will, so a pane cannot
+behave one way when you set it up and another way when it comes back.
+
+- The command **replaces** the shell rather than being typed into one. The
+  pane *is* `tail -f`, and when it ends the pane says `[exited]` the way any
+  shell that ends does.
+- `$` and `↵` on a pane that already has one **runs it again** — the box opens
+  prefilled, so the keystroke for "restart this" is two keys.
+- **Clearing the box** hands the pane back to you as an ordinary shell.
+- Your line, so **your shell reads it**: a command on this machine goes to
+  `$SHELL` (or [whichever shell you named](#which-shell-a-pane-starts)), and
+  one on a server is `exec`ed by that account's login shell. It is the same
+  rule `:` follows — see [that section](#which-shell-a-pane-starts).
+- The **editor pane** has no command to give: what it runs comes from the
+  `editor` setting, and a workspace holding `nvim` would be a workspace
+  overruling a setting you changed since.
 
 ### Keys that used to be the same key
 

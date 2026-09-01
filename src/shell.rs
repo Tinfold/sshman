@@ -161,13 +161,13 @@ impl Shell {
 
     /// A shell on this machine, started in `cwd`.
     pub fn spawn_local(cwd: &Path, rows: u16, cols: u16) -> Self {
-        Self::spawn_local_inner("local".into(), cwd, None, rows, cols)
+        Self::spawn_local_inner("local".into(), cwd, Start::Shell, rows, cols)
     }
 
     /// A local pty running a command line rather than a login shell — how a
     /// container on this machine is entered, via `docker exec -it`.
     pub fn spawn_local_command(label: String, cmdline: String, rows: u16, cols: u16) -> Self {
-        Self::spawn_local_inner(label, Path::new("."), Some(cmdline), rows, cols)
+        Self::spawn_local_inner(label, Path::new("."), Start::Composed(cmdline), rows, cols)
     }
 
     /// The same, but started in a directory of its own: how an editor pane on
@@ -179,28 +179,35 @@ impl Shell {
         rows: u16,
         cols: u16,
     ) -> Self {
-        Self::spawn_local_inner(label, cwd, Some(cmdline), rows, cols)
+        Self::spawn_local_inner(label, cwd, Start::Composed(cmdline), rows, cols)
     }
 
-    fn spawn_local_inner(
+    /// A pane running the command *you* gave it, in the shell you write
+    /// commands in. See [`Start::Yours`].
+    pub fn spawn_local_running(
         label: String,
         cwd: &Path,
-        command: Option<String>,
+        command: String,
         rows: u16,
         cols: u16,
     ) -> Self {
+        Self::spawn_local_inner(label, cwd, Start::Yours(command), rows, cols)
+    }
+
+    fn spawn_local_inner(label: String, cwd: &Path, command: Start, rows: u16, cols: u16) -> Self {
         let (mut shell, rx, parser) = Self::new(label, rows, cols);
         shell.start_dir = Some(cwd.display().to_string());
         shell.home = dirs::home_dir().map(|home| home.display().to_string());
         let alive = Arc::clone(&shell.alive);
         let kitty = Arc::clone(&shell.kitty);
         let reported = Arc::clone(&shell.reported_cwd);
-        // A shell of your own can be asked where it is directly; a command we
-        // composed — `docker exec`, an editor — is a process whose directory
-        // says nothing about the pane, so it is not asked.
+        // A shell of your own can be asked where it is directly; a pane
+        // running a command — `docker exec`, an editor, a `tail -f` you
+        // assigned — is a process whose directory says nothing about the
+        // pane, so it is not asked.
         let pid = match command {
-            None => Arc::clone(&shell.pid),
-            Some(_) => Arc::new(AtomicU32::new(0)),
+            Start::Shell => Arc::clone(&shell.pid),
+            Start::Composed(_) | Start::Yours(_) => Arc::new(AtomicU32::new(0)),
         };
         let tx = shell.tx.clone();
         let cwd = cwd.to_path_buf();
@@ -1072,13 +1079,26 @@ struct Wiring<'a> {
     pid: &'a Arc<AtomicU32>,
 }
 
-fn run_local(
-    cwd: &Path,
-    command: Option<String>,
-    rows: u16,
-    cols: u16,
-    w: &Wiring,
-) -> anyhow::Result<()> {
+/// What a pane on this machine starts.
+///
+/// Three things, and which shell reads them is the whole of the difference.
+/// See [`crate::local::POSIX_SHELL`], which is where this rule is written
+/// down for the commands that are not panes.
+pub enum Start {
+    /// Your shell, waiting for you to type in it. The ordinary pane.
+    Shell,
+    /// A line sshman composed: a `docker exec -it`, an editor on a file.
+    /// Read by `/bin/sh`, because that is the language it was written in.
+    Composed(String),
+    /// A line *you* wrote — the command a pane was assigned. Read by the
+    /// shell you write lines in, which is the one this pane would have opened
+    /// had you not given it anything to run. The far side does the same: a
+    /// command on a server is `exec`ed by that account's own login shell, so
+    /// this is the two halves agreeing rather than a special case.
+    Yours(String),
+}
+
+fn run_local(cwd: &Path, command: Start, rows: u16, cols: u16, w: &Wiring) -> anyhow::Result<()> {
     let Wiring {
         parser,
         rx,
@@ -1098,19 +1118,27 @@ fn run_local(
     let mut cmd = match &command {
         // Run through a shell so the command line can use the user's PATH and
         // ordinary shell syntax. Which shell is not the user's choice here:
-        // this is sshman running something it composed — a `docker exec -it`,
-        // an editor — and it composed it in the one language every shell in
-        // the family understands, which is not the language fish speaks. See
-        // [`crate::local::POSIX_SHELL`].
-        Some(line) => {
+        // this is sshman running something it composed, and it composed it in
+        // the one language every shell in the family understands, which is
+        // not the language fish speaks. See [`crate::local::POSIX_SHELL`].
+        Start::Composed(line) => {
             let mut c = CommandBuilder::new(crate::local::POSIX_SHELL);
+            c.arg("-c");
+            c.arg(line);
+            c
+        }
+        // Your line, so your shell — the same one this pane would have opened
+        // for you to type it into. A setting that says `fish` means a command
+        // you assigned is read by fish.
+        Start::Yours(line) => {
+            let mut c = argv_for(&local_shell());
             c.arg("-c");
             c.arg(line);
             c
         }
         // A prompt for the user, so it is their shell, and the setting is
         // where they said which one that is.
-        None => argv_for(&local_shell()),
+        Start::Shell => argv_for(&local_shell()),
     };
     cmd.cwd(cwd);
     cmd.env("TERM", "xterm-256color");

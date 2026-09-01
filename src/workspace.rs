@@ -65,6 +65,17 @@ impl PaneDirs {
     }
 }
 
+/// A command a pane was told to run, by the number the arrangement calls it.
+///
+/// The arrangement says where the pane was; this says what it was doing.
+/// Together they are the difference between a workspace that opens four
+/// empty shells and one that opens the four things you actually watch.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PaneRun {
+    pub id: TermId,
+    pub cmd: String,
+}
+
 /// One connection inside a workspace.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -93,6 +104,10 @@ pub enum Item {
         /// which of them was the editor.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         editors: Vec<TermId>,
+        /// What any of those terminals were told to run, so that opening this
+        /// again starts them rather than leaving you four blank prompts.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        runs: Vec<PaneRun>,
         /// What each of those panes was showing.
         #[serde(default, skip_serializing_if = "PaneDirs::is_empty")]
         dirs: PaneDirs,
@@ -108,6 +123,8 @@ pub enum Item {
         layout: Option<Layout>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         editors: Vec<TermId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        runs: Vec<PaneRun>,
         #[serde(default, skip_serializing_if = "PaneDirs::is_empty")]
         dirs: PaneDirs,
     },
@@ -126,6 +143,8 @@ pub enum Item {
         layout: Option<Layout>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         editors: Vec<TermId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        runs: Vec<PaneRun>,
         #[serde(default, skip_serializing_if = "PaneDirs::is_empty")]
         dirs: PaneDirs,
     },
@@ -218,6 +237,17 @@ impl Item {
         }
     }
 
+    /// What this tab's terminals were told to run. Empty for a workspace
+    /// saved before panes could be given a command, which opens them as
+    /// plain shells the way it always did.
+    pub fn runs(&self) -> &[PaneRun] {
+        match self {
+            Self::Ssh { runs, .. } | Self::Container { runs, .. } | Self::Local { runs, .. } => {
+                runs
+            }
+        }
+    }
+
     pub fn name(&self) -> Option<&str> {
         match self {
             Self::Ssh { name, .. } | Self::Local { name, .. } => name.as_deref(),
@@ -262,6 +292,10 @@ pub struct Workspace {
     /// decide which of this machine's panes they show.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_editors: Vec<TermId>,
+    /// And what this machine's terminals were told to run. Shared between the
+    /// tabs the same way the panes themselves are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_runs: Vec<PaneRun>,
     /// What this machine's panes were showing. Shared between the tabs the
     /// same way the panes themselves are, so it belongs to the workspace
     /// rather than to any one of them.
@@ -383,25 +417,20 @@ impl Workspaces {
             .find(|w| w.name.to_lowercase() == needle)
     }
 
-    /// Save a set of connections under a name, replacing any workspace already
-    /// using it. Returns whether an existing one was replaced.
-    pub fn save(
-        &mut self,
-        name: &str,
-        local_path: Option<String>,
-        local_editors: Vec<TermId>,
-        local_dirs: PaneDirs,
-        items: Vec<Item>,
-    ) -> std::io::Result<bool> {
-        let name = name.trim().to_string();
-        let workspace = Workspace {
-            name: name.clone(),
-            local_path,
-            local_editors,
-            local_dirs,
-            items,
-            saved_at: now(),
-        };
+    /// Save a set of connections under its name, replacing any workspace
+    /// already using it. Returns whether an existing one was replaced.
+    ///
+    /// Takes the whole thing rather than a field at a time, so that what a
+    /// workspace is made of is written down once — in
+    /// [`crate::app::App::snapshot`], which is also what the session is
+    /// written from. Two lists of fields to keep in step is one list too
+    /// many: the pane directories were nearly added to one and not the other,
+    /// and the commands panes run would have been next.
+    pub fn save(&mut self, workspace: Workspace) -> std::io::Result<bool> {
+        let mut workspace = workspace;
+        workspace.name = workspace.name.trim().to_string();
+        workspace.saved_at = now();
+        let name = workspace.name.clone();
         let replaced = match self
             .entries
             .iter_mut()
@@ -490,6 +519,19 @@ mod tests {
         }
     }
 
+    /// A workspace with nothing in it but a name and some connections.
+    fn named(name: &str, local: Option<&str>, items: Vec<Item>) -> Workspace {
+        Workspace {
+            name: name.into(),
+            local_path: local.map(String::from),
+            local_editors: Vec::new(),
+            local_runs: Vec::new(),
+            local_dirs: PaneDirs::default(),
+            items,
+            saved_at: 0,
+        }
+    }
+
     fn ssh_item(host: &str, path: Option<&str>) -> Item {
         Item::Ssh {
             user: "me".into(),
@@ -501,6 +543,7 @@ mod tests {
             forwards: Vec::new(),
             layout: None,
             editors: Vec::new(),
+            runs: Vec::new(),
             dirs: PaneDirs::default(),
         }
     }
@@ -512,6 +555,7 @@ mod tests {
             name: Some("logs".into()),
             layout: Some(Layout::sides(35)),
             editors: Vec::new(),
+            runs: Vec::new(),
             dirs: PaneDirs::default(),
         };
         let text = serde_json::to_string(&item).unwrap();
@@ -535,6 +579,7 @@ mod tests {
             name: None,
             layout: None,
             editors: Vec::new(),
+            runs: Vec::new(),
             dirs: PaneDirs::default(),
         };
         assert_eq!(item.describe(), "this machine");
@@ -560,6 +605,7 @@ mod tests {
             forwards: Vec::new(),
             layout: Some(arranged.clone()),
             editors: Vec::new(),
+            runs: Vec::new(),
             dirs: PaneDirs::default(),
         };
         let text = serde_json::to_string(&item).unwrap();
@@ -584,6 +630,10 @@ mod tests {
             forwards: Vec::new(),
             layout: Some(arranged),
             editors: vec![2],
+            runs: vec![PaneRun {
+                id: 3,
+                cmd: "tail -f /var/log/nginx/access.log".into(),
+            }],
             dirs: PaneDirs::default(),
         };
         let back: Item = serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
@@ -593,6 +643,14 @@ mod tests {
             "the terminal's pane survives the round trip"
         );
         assert_eq!(back.editors(), [2], "and which of them opened files");
+        // And what a pane was told to run, which is the other half of
+        // opening a tab as you left it rather than as four blank prompts.
+        let told = |id: TermId| back.runs().iter().find(|r| r.id == id);
+        assert_eq!(
+            told(3).map(|r| r.cmd.as_str()),
+            Some("tail -f /var/log/nginx/access.log")
+        );
+        assert!(told(2).is_none(), "a pane you type in has nothing to run");
     }
 
     #[test]
@@ -607,6 +665,7 @@ mod tests {
             forwards: Vec::new(),
             layout: None,
             editors: Vec::new(),
+            runs: Vec::new(),
             dirs: PaneDirs {
                 trees: vec![
                     PaneDir {
@@ -653,6 +712,7 @@ mod tests {
             name: SESSION_NAME.into(),
             local_path: Some("/tmp".into()),
             local_editors: Vec::new(),
+            local_runs: Vec::new(),
             local_dirs: PaneDirs {
                 trees: vec![PaneDir {
                     id: 0,
@@ -709,6 +769,7 @@ mod tests {
             // A hand-edited file, or one from a version that allowed more.
             layout: Some(serde_json::from_str(r#"{"split_pct": 99, "shell_height": 1}"#).unwrap()),
             editors: Vec::new(),
+            runs: Vec::new(),
             dirs: PaneDirs::default(),
         };
         let got = item.layout().unwrap();
@@ -721,13 +782,11 @@ mod tests {
     #[test]
     fn saving_then_finding_by_name() {
         let mut w = ws();
-        w.save(
+        w.save(named(
             "prod",
-            Some("/tmp".into()),
-            Vec::new(),
-            PaneDirs::default(),
+            Some("/tmp"),
             vec![ssh_item("web01", Some("/etc"))],
-        )
+        ))
         .unwrap();
         let found = w.find("prod").expect("saved workspace");
         assert_eq!(found.items.len(), 1);
@@ -741,22 +800,14 @@ mod tests {
     #[test]
     fn saving_the_same_name_replaces_rather_than_duplicates() {
         let mut w = ws();
-        w.save(
-            "prod",
-            None,
-            Vec::new(),
-            PaneDirs::default(),
-            vec![ssh_item("web01", None)],
-        )
-        .unwrap();
+        w.save(named("prod", None, vec![ssh_item("web01", None)]))
+            .unwrap();
         let replaced = w
-            .save(
+            .save(named(
                 "prod",
                 None,
-                Vec::new(),
-                PaneDirs::default(),
                 vec![ssh_item("web02", None), ssh_item("db", None)],
-            )
+            ))
             .unwrap();
         assert!(replaced);
         assert_eq!(w.len(), 1);
@@ -767,8 +818,7 @@ mod tests {
     fn entries_are_listed_alphabetically() {
         let mut w = ws();
         for name in ["staging", "Alpha", "prod"] {
-            w.save(name, None, Vec::new(), PaneDirs::default(), vec![])
-                .unwrap();
+            w.save(named(name, None, vec![])).unwrap();
         }
         let names: Vec<&str> = w.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["Alpha", "prod", "staging"]);
@@ -786,6 +836,7 @@ mod tests {
             forwards: vec!["3000".into(), "8080:db:5432".into()],
             layout: None,
             editors: Vec::new(),
+            runs: Vec::new(),
             dirs: PaneDirs::default(),
         };
         match item.to_target() {
@@ -818,6 +869,7 @@ mod tests {
             forwards: Vec::new(),
             layout: None,
             editors: Vec::new(),
+            runs: Vec::new(),
             dirs: PaneDirs::default(),
         };
         match item.to_target() {
@@ -845,6 +897,7 @@ mod tests {
             forwards: Vec::new(),
             layout: None,
             editors: Vec::new(),
+            runs: Vec::new(),
             dirs: PaneDirs::default(),
         };
         match item.to_target() {
@@ -857,8 +910,7 @@ mod tests {
     #[test]
     fn removing_is_bounds_checked() {
         let mut w = ws();
-        w.save("only", None, Vec::new(), PaneDirs::default(), vec![])
-            .unwrap();
+        w.save(named("only", None, vec![])).unwrap();
         assert!(w.remove(5).is_none());
         assert_eq!(w.remove(0).unwrap().name, "only");
         assert!(w.is_empty());
@@ -876,6 +928,7 @@ mod tests {
                 forwards: vec!["9000".into()],
                 layout: None,
                 editors: Vec::new(),
+                runs: Vec::new(),
                 dirs: PaneDirs::default(),
             },
         ];
@@ -887,23 +940,13 @@ mod tests {
     #[test]
     fn summaries_read_naturally() {
         let mut w = ws();
-        w.save("a", None, Vec::new(), PaneDirs::default(), vec![])
-            .unwrap();
-        w.save(
-            "b",
-            None,
-            Vec::new(),
-            PaneDirs::default(),
-            vec![ssh_item("x", None)],
-        )
-        .unwrap();
-        w.save(
+        w.save(named("a", None, vec![])).unwrap();
+        w.save(named("b", None, vec![ssh_item("x", None)])).unwrap();
+        w.save(named(
             "c",
             None,
-            Vec::new(),
-            PaneDirs::default(),
             vec![ssh_item("x", None), ssh_item("y", None)],
-        )
+        ))
         .unwrap();
         assert_eq!(w.find("a").unwrap().summary(), "empty");
         assert_eq!(w.find("b").unwrap().summary(), "1 connection");

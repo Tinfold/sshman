@@ -60,6 +60,7 @@ pub enum Action {
     SplitDown,
     NewList,
     EditorPane,
+    PaneCommand,
     ClosePane,
     Zoom,
     Even,
@@ -139,6 +140,7 @@ impl Action {
         Action::SplitDown,
         Action::NewList,
         Action::EditorPane,
+        Action::PaneCommand,
         Action::ClosePane,
         Action::Zoom,
         Action::Even,
@@ -213,6 +215,7 @@ impl Action {
             Self::SplitDown => "split-down",
             Self::NewList => "new-list",
             Self::EditorPane => "editor-pane",
+            Self::PaneCommand => "pane-command",
             Self::ClosePane => "close-pane",
             Self::Zoom => "zoom",
             Self::Even => "even",
@@ -288,6 +291,7 @@ impl Action {
             Self::SplitDown => "a shell below, closing nothing",
             Self::NewList => "another file list beside this pane",
             Self::EditorPane => "an editor pane beside this one, or close it",
+            Self::PaneCommand => "what this shell pane runs, and runs again on restore",
             Self::ClosePane => "close the focused pane",
             Self::Zoom => "give the whole screen to this pane",
             Self::Even => "even the borders up again",
@@ -363,6 +367,7 @@ impl Action {
             | Self::SplitDown
             | Self::NewList
             | Self::EditorPane
+            | Self::PaneCommand
             | Self::ClosePane
             | Self::Zoom
             | Self::Even
@@ -578,6 +583,7 @@ const DEFAULTS: &[(Action, &[&str])] = &[
     (Action::SplitDown, &["_"]),
     (Action::NewList, &["T"]),
     (Action::EditorPane, &["i"]),
+    (Action::PaneCommand, &["$"]),
     (Action::ClosePane, &["F9"]),
     (Action::Zoom, &["m", "F3"]),
     (Action::Even, &["="]),

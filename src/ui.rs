@@ -19,7 +19,7 @@ use crate::keys::Action;
 use crate::layout::{Areas, Slot};
 use crate::shell::Shell;
 use crate::theme::Theme;
-use crate::types::{EntryKind, FileEntry, ellipsize, fmt_time, human_size};
+use crate::types::{EntryKind, FileEntry, ellipsize, fmt_time, human_size, shorten};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -697,6 +697,20 @@ fn draw_shell(
         ),
         Span::styled(label, Style::new().fg(theme.text)),
     ];
+    // What it was told to run, where it was told to run anything. A pane
+    // showing a log and a pane you typed in look identical once the output
+    // has scrolled, and this is the one place that can say which is which —
+    // it is also what tells you the command came back with the workspace.
+    if let Some(cmd) = app.term(slot).and_then(|term| term.runs.as_deref()) {
+        // Half the border, and never less than enough to recognise a command
+        // by. Cut from the end rather than the middle: a command line says
+        // what it is in its first few words and trails off into arguments.
+        let room = (area.width / 2).max(12) as usize;
+        title.push(Span::styled(
+            format!("  {}", shorten(cmd, room)),
+            Style::new().fg(theme.dim).italic(),
+        ));
+    }
     if !alive {
         title.push(Span::styled(" [exited]", Style::new().fg(theme.dim)));
     }
@@ -1471,6 +1485,7 @@ const COMMAND: &[Hint] = &[
     ("Shift-↑↓←→", "resize"),
     ("g", "move it"),
     ("@shell", "shell"),
+    ("@pane-command", "runs"),
     ("@new-list", "list"),
     ("@close-pane", "close"),
     ("@zoom", "zoom"),
@@ -2923,6 +2938,27 @@ pub const HELP: &[(&str, &str)] = &[
         "  Ctrl-C and Esc. Ctrl-] is the way back out, and so is",
     ),
     ("", "  clicking another pane."),
+    ("$", "give this pane a command to run instead of a shell"),
+    (
+        "",
+        "  A pane that tails a log, watches a build, or runs btop.",
+    ),
+    (
+        "",
+        "  It is saved with the workspace and with the session, so",
+    ),
+    (
+        "",
+        "  coming back starts it again rather than leaving you a",
+    ),
+    (
+        "",
+        "  blank prompt where the log used to be. The border says",
+    ),
+    (
+        "",
+        "  what it runs. Clearing the box makes it a shell again.",
+    ),
     ("", ""),
     ("", "Command mode: every sshman key, from anywhere"),
     ("Ctrl-]", "hand the keyboard to sshman rather than the pane"),
@@ -3483,7 +3519,36 @@ mod tests {
         assert!(!screen.contains(" Open "), "it did not scroll: {screen}");
     }
 
-    /// What is actually on the screen where a button was recorded.
+    #[test]
+    fn a_pane_says_along_its_border_what_it_was_told_to_run() {
+        // A pane showing a log and a pane you typed in look identical once
+        // the output has scrolled, and the border is the one place that can
+        // say which is which — and that the command came back with the
+        // workspace rather than being typed again.
+        let (_, rows) = frame(90, 20, |app| {
+            let slot = app.open_test_term(&std::env::temp_dir());
+            if let Some(term) = app
+                .local_terms
+                .iter_mut()
+                .find(|t| Slot::term(Side::Local, t.id) == slot)
+            {
+                term.runs = Some("tail -f /var/log/nginx/access.log".into());
+            }
+        });
+        let border = rows
+            .iter()
+            .find(|row| row.contains("SHELL"))
+            .expect("no shell pane was drawn");
+        // Cut from the end rather than the middle: the first few words are
+        // what say which command this is.
+        assert!(border.contains("tail -f /var/log"), "{border}");
+        assert!(
+            border.contains('…'),
+            "it was not shortened at all: {border}"
+        );
+    }
+
+    /// What is actually on the screen where a button was recorded.    /// What is actually on the screen where a button was recorded.
     fn button_text(rows: &[String], rect: Rect) -> String {
         rows[rect.y as usize]
             .chars()
