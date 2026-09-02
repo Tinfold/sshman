@@ -8,7 +8,7 @@
 FROM debian:bookworm-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssh-server sudo \
+ && apt-get install -y --no-install-recommends openssh-server sudo fish \
  && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir /var/run/sshd \
@@ -16,6 +16,14 @@ RUN mkdir /var/run/sshd \
  && echo 'tester:testpass' | chpasswd \
  && adduser tester sudo \
  && echo 'root:rootpass' | chpasswd
+
+# A user whose login shell is not a POSIX shell. sshd runs a channel `exec`
+# through the login user's shell, so every command sshman sends is read by
+# fish unless it is wrapped — and fish does not have `if …; then …; fi`, which
+# is what installing a key is written in. This user is here so that the
+# wrapping stays wrapped.
+RUN useradd -m -s /usr/bin/fish fishy \
+ && echo 'fishy:testpass' | chpasswd
 
 # Files the login user cannot read, so tests can prove sudo mode reaches them.
 RUN mkdir -p /root/secretdir \

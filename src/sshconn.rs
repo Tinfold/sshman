@@ -173,9 +173,22 @@ impl Conn {
     // ---- command execution -------------------------------------------------
 
     /// Run a command and collect its output. `(stdout, stderr, exit code)`.
+    ///
+    /// Through `/bin/sh` rather than straight at the channel, because a
+    /// channel `exec` is run by the *login user's shell* — and every command
+    /// in this file is written in POSIX shell. On a server whose user has
+    /// `fish` or `csh` as their login shell, `if …; then …; fi` is not a
+    /// script with a bug in it, it is not a script at all: fish answers
+    /// `expected end of the statement`, which is a message about sshman that
+    /// looks like a message about the key you were installing.
+    ///
+    /// The login shell is still what a *terminal* gets — see
+    /// [`crate::shell`], which opens its channel itself. That is the one
+    /// place the user's own shell is the point rather than an obstacle.
     pub fn exec(&self, cmd: &str) -> Result<(String, String, i32)> {
         let mut ch = self.sess.channel_session().context("open channel")?;
-        ch.exec(cmd).context("exec")?;
+        ch.exec(&format!("/bin/sh -c {}", sh_quote(cmd)))
+            .context("exec")?;
         let mut out = Vec::new();
         ch.read_to_end(&mut out).ok();
         let mut err = Vec::new();
@@ -1264,13 +1277,19 @@ mod live {
     }
 
     fn connect() -> Option<Conn> {
+        connect_as(&env("SSHMAN_TEST_USER").unwrap_or_else(|| "tester".into()))
+    }
+
+    /// The same, as a named user. The test server has more than one, because
+    /// what their login shell is turns out to matter.
+    fn connect_as(user: &str) -> Option<Conn> {
         let host = env("SSHMAN_TEST_HOST")?;
         let opts = ConnectOpts {
             host,
             port: env("SSHMAN_TEST_PORT")
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(22),
-            user: env("SSHMAN_TEST_USER").unwrap_or_else(|| "tester".into()),
+            user: user.to_string(),
             password: env("SSHMAN_TEST_PASS"),
             key_path: None,
             key_passphrase: None,
@@ -1290,6 +1309,48 @@ mod live {
             Ok(_) => panic!("{why}"),
             Err(e) => e,
         }
+    }
+
+    #[test]
+    #[ignore = "needs a live SSH server"]
+    fn a_key_installs_where_the_login_shell_is_not_a_posix_shell() {
+        // sshd runs a channel `exec` through the *login user's* shell, and
+        // every command in this file is written in POSIX shell. Against a
+        // user whose shell is fish, installing a key used to come back as
+        // `fish: expected end of the statement but found string` — a message
+        // about sshman wearing the clothes of a message about your key.
+        let Some(c) = connect_as("fishy") else { return };
+
+        // Its own shell really is fish, or this test is proving nothing.
+        let (shell, _, _) = c.exec("getent passwd $(id -un) | cut -d: -f7").unwrap();
+        assert_eq!(shell.trim(), "/usr/bin/fish", "the test user changed");
+
+        c.exec("rm -f ~/.ssh/authorized_keys").ok();
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIsshmantestkeysshmantestkeysshmantest                    sshman@test";
+        assert!(
+            c.install_public_key(key).expect("the key would not install"),
+            "it said the key was already there"
+        );
+
+        // Exactly once, and again without adding a second copy.
+        let count = c
+            .exec(&format!(
+                "grep -c -F -- {} ~/.ssh/authorized_keys",
+                sh_quote(key)
+            ))
+            .unwrap();
+        assert_eq!(count.0.trim(), "1");
+        assert!(
+            !c.install_public_key(key).expect("the second install failed"),
+            "a second install duplicated the entry"
+        );
+
+        // And with the permissions sshd insists on, or it ignores the file.
+        let (modes, _, _) = c
+            .exec("stat -c '%a' ~/.ssh ~/.ssh/authorized_keys")
+            .unwrap();
+        assert_eq!(modes.split_whitespace().collect::<Vec<_>>(), ["700", "600"]);
+        c.exec("rm -f ~/.ssh/authorized_keys").ok();
     }
 
     #[test]
