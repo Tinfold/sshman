@@ -85,7 +85,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Over the panes, under anything modal: a label about a tab is the
     // smallest thing on the screen and the least entitled to be in the way of
     // a box somebody opened.
-    draw_tab_tip(f, app, rows[1]);
+    //
+    // Given the whole screen rather than the row it belongs to. The label
+    // hangs *below* that row, and a row is one cell tall — so measuring the
+    // fit against the row is measuring a three-line box against one line,
+    // which never fits and never drew.
+    draw_tab_tip(f, app, area);
     // And over that: a menu is the thing being read.
     draw_menu(f, app, area);
 
@@ -402,9 +407,9 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
 /// below the row, over whatever is under it, and a box drawn before the thing
 /// it covers is a box nobody sees.
 fn draw_tab_tip(f: &mut Frame, app: &App, area: Rect) {
-    if app.tab_bar_row.is_none() {
+    let Some(row) = app.tab_bar_row else {
         return;
-    }
+    };
     let budget = tab_title_budget(area.width, app.tabs.len());
     let Some((index, title)) = app.tab_tip(budget) else {
         return;
@@ -426,7 +431,9 @@ fn draw_tab_tip(f: &mut Frame, app: &App, area: Rect) {
     // Kept on the screen: a tab near the right-hand edge would otherwise hang
     // its name off the side, which is the half you were asking about.
     let x = start.min(area.right().saturating_sub(width));
-    let rect = Rect::new(x, area.y + 1, width, 3);
+    // Directly under the chip's own row, and only where the screen has room
+    // for the whole box below it.
+    let rect = Rect::new(x, row + 1, width, 3);
     if rect.bottom() > area.bottom() {
         return;
     }
@@ -3460,6 +3467,47 @@ mod tests {
             .collect();
         std::fs::remove_dir_all(&dir).ok();
         (app, rows)
+    }
+
+    #[test]
+    fn resting_on_a_tab_draws_the_whole_name_under_its_chip() {
+        // The label is worked out, and then it has to actually appear. It did
+        // not: it was measured against the tab bar's own rect, which is one
+        // cell tall, and a three-line box never fits inside one line — so
+        // every hover returned before drawing anything, at every size of
+        // terminal, while the model underneath said the right thing.
+        let long = "web01.production.example.com";
+        let (_, rows) = frame(60, 20, |app| {
+            app.fake_tab(long);
+            app.fake_tab("web02.production.example.com");
+            app.tab_rest = Some((
+                0,
+                std::time::Instant::now() - std::time::Duration::from_secs(2),
+            ));
+        });
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains(long),
+            "the whole name was never drawn:\n{screen}"
+        );
+        // Under the row of chips rather than over it, so the chip you are
+        // pointing at is still visible.
+        let at = rows
+            .iter()
+            .position(|row| row.contains(long))
+            .expect("drawn somewhere");
+        assert!(at >= 2, "it covered the tab bar it belongs to");
+
+        // And nothing before the pointer has been there long enough.
+        let (_, rows) = frame(60, 20, |app| {
+            app.fake_tab(long);
+            app.fake_tab("web02.production.example.com");
+            app.rest_on_tab(0);
+        });
+        assert!(
+            !rows.join("\n").contains(long),
+            "it spoke before it was asked"
+        );
     }
 
     /// A file list with one archive in it, and a menu open over that row.
