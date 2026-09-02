@@ -7,6 +7,7 @@
 mod app;
 mod archive;
 mod backend;
+mod clip;
 mod config;
 mod docker;
 mod fileops;
@@ -808,6 +809,7 @@ mod tests {
 
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyModifiers, MouseEvent};
+    use std::time::Instant;
 
     /// An app drawn once at this size, so everything the mouse aims at — the
     /// pane areas, the buttons, the crumbs along a title — has been placed.
@@ -830,6 +832,80 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    /// Draw, hand the app a mouse event, draw again, and say what is on the
+    /// screen. The two draws are the point: what the mouse can aim at is
+    /// recorded by the first one, and what the event changed is only visible
+    /// in the second.
+    fn after_mouse(
+        width: u16,
+        height: u16,
+        setup: impl FnOnce(&mut App),
+        m: MouseEvent,
+    ) -> (App, Vec<String>) {
+        let dir = std::env::temp_dir().join(format!("sshman-hover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(ConnectOpts::default(), dir.clone(), None, false);
+        app.mode = Mode::Browse;
+        setup(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        handle_mouse(&mut app, m);
+        // Long enough ago to have been asked, without a test that sleeps.
+        if let Some((index, _)) = app.tab_rest {
+            app.tab_rest = Some((index, Instant::now() - Duration::from_secs(2)));
+        }
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+        (app, rows)
+    }
+
+    #[test]
+    fn the_pointer_resting_on_a_chip_asks_what_the_tab_is() {
+        // The whole way through, from a mouse event to something on the
+        // screen: the row has to be recognised as the tab bar, the column has
+        // to land on a chip rather than a chevron, the clock has to start, and
+        // the label has to be drawn somewhere a person can read it.
+        let long = "web01.production.example.com";
+        let setup = |app: &mut App| {
+            app.fake_tab(long);
+            app.fake_tab("web02.production.example.com");
+            app.fake_tab("web03.production.example.com");
+        };
+
+        // Where the first chip actually is, taken from the draw rather than
+        // guessed at.
+        let placed = drawn(90, 30, setup);
+        let row = placed.tab_bar_row.expect("a tab bar with three tabs");
+        let (start, end, _) = placed
+            .tab_spans
+            .iter()
+            .find(|(_, _, index)| *index == 0)
+            .copied()
+            .expect("the first tab has a chip");
+        let column = start + (end - start) / 2;
+
+        let (app, rows) = after_mouse(90, 30, setup, at(MouseEventKind::Moved, column, row));
+        assert_eq!(app.tab_rest.map(|(index, _)| index), Some(0), "the clock never started");
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains(&format!("me@{long}")),
+            "resting on a chip said nothing:\n{screen}"
+        );
+
+        // And moving off the row takes it away again.
+        let (app, rows) = after_mouse(90, 30, setup, at(MouseEventKind::Moved, column, row + 4));
+        assert!(app.tab_rest.is_none());
+        assert!(!rows.join("\n").contains(&format!("me@{long}")));
     }
 
     #[test]
@@ -1063,18 +1139,20 @@ fn cell_in(app: &App, slot: layout::Slot, m: &event::MouseEvent) -> Option<(u16,
 /// OSC 52 is the only way that works from inside a terminal that may itself be
 /// at the far end of an SSH connection: there is no display to talk to, only
 /// the terminal, and it is the terminal that owns the clipboard.
+/// Put a copy on the system clipboard, by both of the ways there are.
+///
+/// The escape sequence goes through the terminal so that it lands between
+/// frames rather than in the middle of one, and is wrapped for a multiplexer
+/// if there is one in the way. The desktop's own tool is asked as well, and
+/// is the half that works in a terminal which does not implement `OSC 52` —
+/// every VTE one, which is most of what a Linux desktop ships. See
+/// [`crate::clip`].
 fn to_clipboard(terminal: &mut Tui, text: &str) -> Result<()> {
-    use base64::Engine;
-
-    // Terminals cap what they will take — tmux's default is around 74k — so
-    // more than this is sent as much as fits rather than being dropped whole.
-    const LIMIT: usize = 64 * 1024;
-    let end = (0..=LIMIT.min(text.len()))
-        .rev()
-        .find(|i| text.is_char_boundary(*i))
-        .unwrap_or(0);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&text.as_bytes()[..end]);
-    write!(terminal.backend_mut(), "\x1b]52;c;{encoded}\x07")?;
+    if text.is_empty() {
+        return Ok(());
+    }
+    clip::to_desktop(text);
+    write!(terminal.backend_mut(), "{}", clip::sequence(text))?;
     terminal.backend_mut().flush()?;
     Ok(())
 }
