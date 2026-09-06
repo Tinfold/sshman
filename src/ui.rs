@@ -15,6 +15,7 @@ use crate::app::{
     App, Arrangement, ConnectFocus, ConnectForm, Level, LinkState, MenuItem, Mode, Pane, Side,
 };
 use crate::config::Setting;
+use crate::icons::Icons;
 use crate::keys::Action;
 use crate::layout::{Areas, Slot};
 use crate::shell::Shell;
@@ -647,6 +648,8 @@ fn draw_files(
     let sudo = side == Side::Remote && app.sudo();
     let live = side == Side::Local || app.connected();
     let theme = app.theme;
+    // Read before the pane is borrowed, the way the theme is.
+    let icons = app.config.icon_set();
     let hovered = Hovered {
         row: app.hovered_row(slot),
         crumb: app.hovered_crumb(slot).map(str::to_string),
@@ -665,6 +668,7 @@ fn draw_files(
         hovered,
         buttons,
         theme,
+        icons,
     );
 }
 
@@ -1117,6 +1121,7 @@ fn draw_pane(
     hovered: Hovered,
     buttons: Buttons,
     theme: Theme,
+    icons: Icons,
 ) {
     let border_style = if focused {
         Style::new().fg(theme.accent).bold()
@@ -1249,7 +1254,13 @@ fn draw_pane(
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let item = ListItem::new(entry_line(e, pane.marked.contains(&e.name), cols, theme));
+            let item = ListItem::new(entry_line(
+                e,
+                pane.marked.contains(&e.name),
+                cols,
+                theme,
+                icons,
+            ));
             // Under the pointer: underlined rather than filled in, so it
             // cannot be mistaken for the cursor — which is the row the
             // keyboard is on, and stays where it is while the mouse moves.
@@ -1288,7 +1299,13 @@ impl Columns {
     }
 }
 
-fn entry_line<'a>(e: &FileEntry, marked: bool, cols: Columns, theme: Theme) -> Line<'a> {
+fn entry_line<'a>(
+    e: &FileEntry,
+    marked: bool,
+    cols: Columns,
+    theme: Theme,
+    icons: Icons,
+) -> Line<'a> {
     let mut spans = Vec::new();
     spans.push(if marked {
         Span::styled("*", Style::new().fg(theme.warn).bold())
@@ -1334,6 +1351,12 @@ fn entry_line<'a>(e: &FileEntry, marked: bool, cols: Columns, theme: Theme) -> L
             }
         }
     };
+    // The icon is coloured like the name it belongs to rather than given
+    // colours of its own: the theme owns every colour on the screen, and a
+    // palette of its own for icons would be one it never chose.
+    if let Some(icon) = icons.of(e) {
+        spans.push(Span::styled(format!("{icon} "), name_style));
+    }
     let mut name = e.name.clone();
     if e.is_dir_like() {
         name.push('/');
@@ -3124,6 +3147,15 @@ pub const HELP: &[(&str, &str)] = &[
     ("", "  named is passed on as it named it."),
     (
         "",
+        "  Icons puts a glyph in front of each name: a Nerd Font's own,",
+    ),
+    (
+        "",
+        "  or emoji for a terminal without one. None until you ask for",
+    ),
+    ("", "  them, an icon a font cannot draw being a box."),
+    (
+        "",
         "  ↵ opens the one under the cursor: a prompt for the ones you",
     ),
     (
@@ -3565,6 +3597,73 @@ mod tests {
         // And it went no further than it had to: the top of the menu is what
         // scrolled away, not the row the light is on.
         assert!(!screen.contains(" Open "), "it did not scroll: {screen}");
+    }
+
+    /// A list of two, drawn with whichever set of icons is asked for.
+    fn a_listing_with(icons: Option<&str>) -> Vec<String> {
+        let set = icons.map(String::from);
+        frame(90, 12, |app| {
+            app.config.icons = set;
+            let files = Slot::files(Side::Local);
+            app.pane_mut(files).set_entries(vec![
+                FileEntry {
+                    name: "src".into(),
+                    kind: EntryKind::Dir,
+                    size: 0,
+                    mtime: 0,
+                    perms: "drwxr-xr-x".into(),
+                    link_target: None,
+                    points_to_dir: false,
+                },
+                FileEntry {
+                    name: "main.rs".into(),
+                    kind: EntryKind::File,
+                    size: 12,
+                    mtime: 0,
+                    perms: "-rw-r--r--".into(),
+                    link_target: None,
+                    points_to_dir: false,
+                },
+            ]);
+        })
+        .1
+    }
+
+    #[test]
+    fn an_icon_is_drawn_in_front_of_the_name_when_a_set_is_chosen() {
+        let screen = a_listing_with(Some("nerd")).join("\n");
+        assert!(screen.contains("\u{f07b} src/"), "no folder: {screen}");
+        assert!(screen.contains("\u{e7a8} main.rs"), "no crab: {screen}");
+
+        // The other set says the same things in glyphs any font has. An
+        // emoji is two columns wide, so the cell after it is the empty half
+        // of the same character rather than the space we wrote — which is
+        // why these two look for the glyph and the name rather than for one
+        // string with a space in the middle.
+        let rows = a_listing_with(Some("emoji"));
+        let screen = rows.join("\n");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("📁") && row.contains("src/")),
+            "{screen}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("🦀") && row.contains("main.rs")),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_drawn_in_front_of_a_name_until_it_is_asked_for() {
+        // The default, and what sshman looked like before there were icons:
+        // the names start where they always did.
+        let screen = a_listing_with(None).join("\n");
+        assert!(screen.contains(" src/"), "{screen}");
+        assert!(
+            !screen.contains("📁") && !screen.contains("\u{f07b}"),
+            "an icon nobody asked for: {screen}"
+        );
     }
 
     #[test]

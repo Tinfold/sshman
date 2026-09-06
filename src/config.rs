@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::icons::Icons;
 use crate::theme;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -74,6 +75,13 @@ pub struct Config {
     /// changes until you ask.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch: Option<String>,
+
+    /// Which set of icons a file list draws in front of the names: `nerd` for
+    /// a Nerd Font's own glyphs, `emoji` for a terminal without one. Absent
+    /// means none, since an icon a font cannot draw is a box, and a box in
+    /// front of every name is worse than no icon at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<String>,
 
     /// Whether starting sshman with nothing to open offers the session it was
     /// in last time. Absent means it does; `off` means it does not, and
@@ -174,6 +182,13 @@ impl Config {
         )
     }
 
+    /// Which set of icons a file list draws with. Read the same forgiving
+    /// way as the rest: a word this version does not know means none, which
+    /// is also what an absent setting means.
+    pub fn icon_set(&self) -> Icons {
+        Icons::named(self.icons.as_deref().unwrap_or_default())
+    }
+
     /// Whether to ask, on the way in, about coming back to the last session.
     /// Read the same forgiving way as the rest: only a word meaning no turns
     /// it off.
@@ -236,6 +251,7 @@ pub enum Setting {
     Theme,
     Background,
     ShellColours,
+    Icons,
     Watch,
     Resume,
     Keys,
@@ -257,6 +273,7 @@ impl Setting {
         Setting::Theme,
         Setting::Background,
         Setting::ShellColours,
+        Setting::Icons,
         Setting::Watch,
         Setting::Resume,
         Setting::Keys,
@@ -270,6 +287,7 @@ impl Setting {
             Self::Theme => "Theme",
             Self::Background => "Background",
             Self::ShellColours => "Shell colours",
+            Self::Icons => "Icons",
             Self::Watch => "Keeping up",
             Self::Resume => "Coming back",
             Self::Keys => "Keys",
@@ -285,6 +303,7 @@ impl Setting {
             Self::Theme => "the colours to draw in",
             Self::Background => "the theme's own, or whatever the terminal is set to",
             Self::ShellColours => "what a shell pane's own output is coloured from",
+            Self::Icons => "a glyph in front of each name, if your font has them",
             Self::Watch => "whether a list keeps up with changes from outside",
             Self::Resume => "whether starting up offers the session before this one",
             Self::Keys => "which key asks for what",
@@ -297,6 +316,7 @@ impl Setting {
             Self::Theme
             | Self::Background
             | Self::ShellColours
+            | Self::Icons
             | Self::Watch
             | Self::Resume
             | Self::Keys => Kind::Choice,
@@ -329,6 +349,7 @@ impl Config {
                 true => "the theme's own".into(),
                 false => "the terminal's".into(),
             },
+            Setting::Icons => self.icon_set().describe().to_string(),
             Setting::Watch => match self.watching() {
                 true => "lists follow their directories".into(),
                 false => "only when you ask".into(),
@@ -362,6 +383,10 @@ impl Config {
                 false => "the default",
             },
             Setting::ShellColours => match self.shell_colours.is_some() {
+                true => "set here",
+                false => "the default",
+            },
+            Setting::Icons => match self.icons.is_some() {
                 true => "set here",
                 false => "the default",
             },
@@ -409,6 +434,7 @@ impl Config {
             Setting::Shell => self.shell.is_some(),
             Setting::Background => self.background.is_some(),
             Setting::ShellColours => self.shell_colours.is_some(),
+            Setting::Icons => self.icons.is_some(),
             Setting::Watch => self.watch.is_some(),
             Setting::Resume => self.resume.is_some(),
             Setting::Keys => !self.keys.is_empty(),

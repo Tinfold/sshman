@@ -13,6 +13,7 @@ mod docker;
 mod fileops;
 mod forward;
 mod history;
+mod icons;
 mod input;
 mod keys;
 mod layout;

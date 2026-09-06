@@ -96,7 +96,7 @@ new one. `Esc` leaves `known_hosts` untouched.
 | `P` | paste what `c` or `M` picked up into this directory |
 | `e` / `F4` | edit in `$EDITOR` |
 | `E` | edit with a program you name, just this once |
-| `,` | settings: theme, background, keys, editor, shell — what sshman remembers |
+| `,` | settings: theme, background, icons, keys, editor, shell — what sshman remembers |
 | `v` | view in `$PAGER` |
 | `:` | run a command in the remote pane's directory |
 | `!` | full-screen shell in that directory: `ssh` for a server, `exec` into a container, a login shell on this machine |
@@ -1189,6 +1189,62 @@ The settings pane (`,`) counts the themes it found and names the directory to
 put more in. A file it could not use is listed there too, with the reason — a
 colour it does not recognise, a role spelled wrong, a `base` that is not
 there — rather than quietly going missing.
+
+## Icons in the lists
+
+Off out of the box, for the boring reason: an icon your font does not have is
+a box, and a box in front of every name is worse than no icon at all. `,` →
+**Icons** turns them on, and there are two sets to turn on rather than one.
+
+| | |
+|---|---|
+| `off` | the names on their own, which is where sshman starts |
+| `nerd` | a [Nerd Font](https://www.nerdfonts.com)'s own glyphs, one column each |
+| `emoji` | emoji, for a terminal whose font is not a patched one |
+
+```
+┏ LOCAL ~/work/sshman ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ drwxr-xr-x    <DIR> 2026-09-05 11:33 📁  src/                           ┃
+┃ drwxr-xr-x    <DIR> 2026-09-05 11:33 📁  themes/                        ┃
+┃ -rw-r--r--     619B 2026-09-05 11:33 🦀  Cargo.toml                     ┃
+┃ -rw-r--r--    40.0K 2026-09-05 11:33 🦀  main.rs                        ┃
+┃ -rw-r--r--     7.9K 2026-09-05 11:33 📜  server.c                       ┃
+┃ -rwxr-xr-x     1.2K 2026-09-05 11:33 🐚  deploy.sh                      ┃
+┃ -rw-r--r--     2.2K 2026-09-05 11:33 🔧  nginx.conf                     ┃
+┃ -rw-r--r--     1.2M 2026-09-05 11:33 📦  notes.tar.gz                   ┃
+┃ -rw-------     411B 2026-09-05 11:33 🔑  id_ed25519                     ┃
+┃ -rw-r--r--     881K 2026-09-05 11:33 📷  photo.png                      ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10 items ┛
+```
+
+`←`/`→` on the row step through the three, and the list redraws as you go, so
+you can see whether your terminal has the glyphs before you settle on
+anything. Written down as `"icons": "nerd"`.
+
+**What a thing is comes before what it is called.** A directory is a folder
+whatever it is named, a symlink is a link whatever it points at, and only an
+ordinary file is looked up by name. A whole name wins over the suffix
+underneath it — `Cargo.toml` is Rust's rather than TOML's, `README.md` a book
+rather than markdown — and a long suffix wins over a short one, so `.tar.gz`
+is an archive rather than whatever `.gz` alone would be. A file nothing is
+known about gets a plain sheet, or a bolt if it can be run.
+
+The Nerd Font glyphs are taken from the ranges that did **not** move between
+Nerd Fonts v2 and v3 — Font Awesome, Devicons, Seti — so the same table draws
+the same icons whichever version you happen to have installed.
+
+The emoji set is coarser on purpose. There is no crab for C and no gopher for
+Perl, so the languages without an emoji of their own share a scroll: the set
+is there to say *what kind of thing this is* at a glance, which is most of
+what an icon is for, and a terminal with a Nerd Font has the specific one
+waiting. Both sets come from one table, a row at a time, so a language added
+to one is added to the other in the same breath — and a test measures every
+glyph in each, since one wide icon among narrow ones would leave the names
+ragged.
+
+An icon takes the colour of the name it belongs to rather than a palette of
+its own: every colour on the screen is one the theme chose, and icon colours
+would be a dozen it never did.
 
 ## Editing files
 

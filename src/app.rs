@@ -16,6 +16,7 @@ use crate::backend::{BackendKind, Target};
 use crate::config::{Config, Kind, Setting};
 use crate::forward::{Forward, Spec as ForwardSpec};
 use crate::history::History;
+use crate::icons::Icons;
 use crate::input::TextInput;
 use crate::keys::{Action, Keymap};
 pub use crate::layout::Side;
@@ -4034,9 +4035,11 @@ impl App {
             Setting::Keys => self.open_keys(),
             // There are only two answers, so opening it is the same as
             // stepping it: a list of two would be a list for its own sake.
-            Setting::Background | Setting::ShellColours | Setting::Watch | Setting::Resume => {
-                self.change_setting(setting, 1)
-            }
+            Setting::Background
+            | Setting::ShellColours
+            | Setting::Icons
+            | Setting::Watch
+            | Setting::Resume => self.change_setting(setting, 1),
             Setting::Editor | Setting::EditorOpen | Setting::Shell => self.ask_for_setting(setting),
         }
     }
@@ -4187,6 +4190,7 @@ impl App {
                 Setting::Theme => self.set_theme(self.themes.cycle(&self.theme_name, step)),
                 Setting::Background => self.toggle_background(),
                 Setting::ShellColours => self.toggle_shell_colours(),
+                Setting::Icons => self.step_icons(step),
                 Setting::Watch => self.toggle_watch(),
                 Setting::Resume => self.toggle_resume(),
                 Setting::Keys => self.open_keys(),
@@ -4220,6 +4224,7 @@ impl App {
             Setting::Theme
             | Setting::Background
             | Setting::ShellColours
+            | Setting::Icons
             | Setting::Watch
             | Setting::Resume
             | Setting::Keys => {
@@ -4241,6 +4246,10 @@ impl App {
             Setting::ShellColours => {
                 self.config.shell_colours = None;
                 self.save_config("shell colours: the theme's own again".into());
+            }
+            Setting::Icons => {
+                self.config.icons = None;
+                self.save_config("icons: none in front of the names again".into());
             }
             Setting::Watch => {
                 self.config.watch = None;
@@ -4302,6 +4311,23 @@ impl App {
     /// that wakes a spinning disk, a server you are being careful with — and
     /// for anyone who would rather a list held still while they worked in it.
     /// The reload key is unaffected either way.
+    /// Step through the sets of icons a file list can draw with. Three
+    /// answers rather than two, so this steps rather than toggles: a font
+    /// that has no Nerd Font glyphs draws boxes, and emoji are the way out
+    /// for a terminal without one.
+    fn step_icons(&mut self, step: isize) {
+        let set = self.config.icon_set().stepped(step);
+        self.config.icons = Some(set.name().to_string());
+        let done = match set {
+            Icons::Off => "icons: none — the names on their own".to_string(),
+            Icons::Nerd => {
+                "icons: a Nerd Font's own — boxes here mean your font is not one".to_string()
+            }
+            Icons::Emoji => "icons: emoji, for a terminal without a Nerd Font".to_string(),
+        };
+        self.save_config(done);
+    }
+
     fn toggle_watch(&mut self) {
         let follow = !self.config.watching();
         self.config.watch = Some(match follow {
@@ -9181,6 +9207,42 @@ mod tests {
             key(&mut app, KeyCode::Up);
         }
         assert_eq!(app.theme_sel, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_icons_step_through_their_sets_and_are_written_down() {
+        let dir = scratch("icons");
+        let mut app = app_in(&dir);
+        app.config = Config::at(dir.join("config.json"));
+
+        press(&mut app, ',');
+        while app.selected_setting() != Setting::Icons {
+            key(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.config.icon_set(), Icons::Off, "none until asked for");
+
+        // Three answers, so the arrows walk them in a ring rather than
+        // flipping between two.
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.config.icon_set(), Icons::Nerd);
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.config.icon_set(), Icons::Emoji);
+        assert!(app.config.is_set(Setting::Icons));
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.config.icon_set(), Icons::Off, "round again");
+        key(&mut app, KeyCode::Left);
+        assert_eq!(app.config.icon_set(), Icons::Emoji, "and the other way");
+
+        // In the file, not just in this session.
+        let saved = std::fs::read_to_string(dir.join("config.json")).expect("written");
+        assert!(saved.contains("emoji"), "{saved}");
+
+        // And Del puts it back to the names on their own.
+        key(&mut app, KeyCode::Delete);
+        assert!(!app.config.is_set(Setting::Icons));
+        assert_eq!(app.config.icon_set(), Icons::Off);
 
         std::fs::remove_dir_all(&dir).ok();
     }
