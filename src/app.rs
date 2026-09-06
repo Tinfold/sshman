@@ -3,7 +3,7 @@
 //! Local filesystem work happens inline (it is fast); anything touching the
 //! network is sent to the worker thread and answered asynchronously.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -112,6 +112,36 @@ pub enum Arrangement {
     TwoLists,
     Terminal,
     Editor,
+}
+
+/// The panes a rearrangement can take over rather than open again.
+///
+/// An arrangement is a shape, not a fresh start. A shell watching a build is
+/// the same shell whether it ends up beside the file list or underneath it,
+/// so the tree is rebuilt around what is already there and only what is
+/// missing is opened. That is also the only sense in which a terminal can be
+/// moved at all: a pty's process is where it is, and moving the pane is
+/// naming the same terminal somewhere else in the tree.
+#[derive(Default)]
+struct Spares {
+    /// Shells, the focused one first, then in the order they were drawn: with
+    /// more of them than the new shape has room for, the one you were looking
+    /// at is the one that stays.
+    terms: VecDeque<Slot>,
+    /// The pane files are sent to. Only ever one of these.
+    editor: Option<Slot>,
+    /// File lists other than the machine's first, which no arrangement drops.
+    trees: VecDeque<Slot>,
+}
+
+impl Spares {
+    fn term(&mut self) -> Option<Slot> {
+        self.terms.pop_front()
+    }
+
+    fn tree(&mut self) -> Option<Slot> {
+        self.trees.pop_front()
+    }
 }
 
 impl Arrangement {
@@ -6562,14 +6592,50 @@ impl App {
         }
     }
 
+    /// What the tab on screen already has that an arrangement on `host` can
+    /// keep. See [`Spares`].
+    ///
+    /// The layout is what is asked, rather than the list of terminals, because
+    /// a terminal that is not in it is one already on its way out.
+    fn spares(&self, host: Side) -> Spares {
+        let mut spares = Spares::default();
+        for slot in self.layout.slots() {
+            if slot.host() != host {
+                continue;
+            }
+            match slot {
+                Slot::Term { .. } => match self.term(slot) {
+                    Some(term) if term.is_editor() => spares.editor = Some(slot),
+                    Some(_) => spares.terms.push_back(slot),
+                    // A pane whose terminal has already gone is not one to
+                    // carry over: there is nothing left in it to keep.
+                    None => {}
+                },
+                Slot::Files { id, .. } if id != layout::MAIN => spares.trees.push_back(slot),
+                Slot::Files { .. } => {}
+            }
+        }
+        if let Some(at) = spares.terms.iter().position(|&slot| slot == self.focus) {
+            let focused = spares.terms.remove(at).expect("just found it");
+            spares.terms.push_front(focused);
+        }
+        spares
+    }
+
     /// Rearrange the tab on screen.
     ///
-    /// Terminals the new arrangement has no room for are shut, the same as if
-    /// you had closed their panes one at a time — an arrangement is what is on
-    /// screen, and nothing is kept running out of sight.
+    /// Panes the new arrangement has room for are **kept**: the shape changes
+    /// around them, so a shell you left a build running in is moved and
+    /// resized rather than shut and opened again. Only what the new shape is
+    /// still short of is started.
+    ///
+    /// Terminals it has no room for are shut, the same as if you had closed
+    /// their panes one at a time — an arrangement is what is on screen, and
+    /// nothing is kept running out of sight.
     fn arrange(&mut self, which: Arrangement) {
         let host = self.host();
         let files = Slot::files(host);
+        let mut spare = self.spares(host);
         match which {
             Arrangement::Sides => {
                 self.layout = match self.on_local_tab() {
@@ -6583,27 +6649,43 @@ impl App {
             Arrangement::TwoLists => {
                 self.layout = Layout::only(files);
                 self.focus = files;
-                if let Some(second) = self.add_tree(files) {
+                let second = match spare.tree() {
+                    Some(slot) => Some(slot),
+                    None => self.add_tree(files),
+                };
+                if let Some(second) = second {
                     self.layout.split(files, Dir::Across, second, 50);
                 }
             }
             Arrangement::Terminal => {
                 self.layout = Layout::only(files);
-                if let Some(term) = self.new_term(files, None, None) {
+                let term = match spare.term() {
+                    Some(slot) => Some(slot),
+                    None => self.new_term(files, None, None),
+                };
+                if let Some(term) = term {
                     self.layout.split(files, Dir::Across, term, 40);
                     self.focus = term;
                 }
             }
             Arrangement::Editor => {
                 self.layout = Layout::only(files);
-                let Some(editor) = self.new_editor_term(files) else {
+                let editor = match spare.editor {
+                    Some(slot) => Some(slot),
+                    None => self.new_editor_term(files),
+                };
+                let Some(editor) = editor else {
                     // Nothing was started, so nothing is arranged around it.
                     self.settle_focus();
                     self.stash_layout();
                     return;
                 };
                 self.layout.split(files, Dir::Across, editor, 30);
-                if let Some(shell) = self.new_term(files, None, None) {
+                let shell = match spare.term() {
+                    Some(slot) => Some(slot),
+                    None => self.new_term(files, None, None),
+                };
+                if let Some(shell) = shell {
                     self.layout.split(editor, Dir::Down, shell, 70);
                 }
                 // The keyboard stays in the file list: the point of this one
@@ -8463,6 +8545,114 @@ mod tests {
         app.arrange(Arrangement::Sides);
         assert_eq!(app.layout, Layout::default());
         assert!(app.local_terms.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_arrangement_moves_the_shell_you_have_rather_than_opening_another() {
+        let dir = scratch("arrange-keeps-shell");
+        let mut app = app_in(&dir);
+        let shell = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        // A pane that is watching something is the case worth protecting: the
+        // whole point of keeping it is that what it is running keeps running.
+        app.term_mut(shell).expect("just made").runs = Some("tail -f log".into());
+        app.focus = Slot::files(Side::Local);
+
+        app.arrange(Arrangement::Editor);
+
+        assert!(app.layout.contains(shell), "the same pane, somewhere new");
+        assert_eq!(
+            app.term(shell).and_then(|t| t.runs.as_deref()),
+            Some("tail -f log"),
+            "and the same terminal in it, still running what it was"
+        );
+        assert_eq!(
+            app.local_terms.len(),
+            2,
+            "the shell it had and an editor, not a third pane"
+        );
+
+        // It is where the arrangement says a shell goes: under the editor.
+        let areas = app.layout.areas(Rect::new(0, 0, 100, 30));
+        let editor = areas.of(app.editor_pane(Side::Local).unwrap()).unwrap();
+        let moved = areas.of(shell).unwrap();
+        assert_eq!(moved.x, editor.x, "underneath it, not beside it");
+        assert!(moved.y > editor.y);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_shell_you_were_in_is_the_one_a_smaller_shape_keeps() {
+        let dir = scratch("arrange-keeps-focused");
+        let mut app = app_in(&dir);
+        let first = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        let second = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        let third = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.focus = second;
+
+        // Room for one, and three to choose from.
+        app.arrange(Arrangement::Terminal);
+
+        assert!(app.layout.contains(second), "the one you were looking at");
+        assert!(!app.layout.contains(first));
+        assert!(!app.layout.contains(third));
+        assert_eq!(app.local_terms.len(), 1, "the other two are shut");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_editor_pane_you_have_is_not_opened_a_second_time() {
+        let dir = scratch("arrange-keeps-editor");
+        let mut app = app_in(&dir);
+        let editor = add_term(&mut app, Side::Local, Shell::spawn_local(&dir, 24, 80));
+        app.term_mut(editor).expect("just made").opens = Some(String::new());
+        app.focus = Slot::files(Side::Local);
+
+        app.arrange(Arrangement::Editor);
+
+        assert_eq!(
+            app.editor_pane(Side::Local),
+            Some(editor),
+            "the pane files were already going to"
+        );
+        assert_eq!(
+            app.local_terms.len(),
+            2,
+            "the editor it had, and a shell opened under it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_list_is_kept_pointed_where_it_was() {
+        let dir = scratch("arrange-keeps-list");
+        let mut app = app_in(&dir);
+        app.focus = here();
+        // What `T` does, so the list is on screen rather than only made.
+        app.split_with_tree(Dir::Across, 50);
+        let second = app.focus;
+        assert_ne!(second, here(), "a list of its own");
+
+        let elsewhere = dir.join("dst");
+        app.local
+            .iter_mut()
+            .find(|t| t.id == second.id())
+            .expect("just made")
+            .cwd = elsewhere.clone();
+
+        app.arrange(Arrangement::TwoLists);
+
+        assert!(app.layout.contains(second), "the list it already had");
+        assert_eq!(
+            app.dir_of(second),
+            elsewhere.display().to_string(),
+            "still looking where you pointed it, not back at the first list"
+        );
+        assert_eq!(app.local.len(), 2, "and no third list was made");
 
         std::fs::remove_dir_all(&dir).ok();
     }

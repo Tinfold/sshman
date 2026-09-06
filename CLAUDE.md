@@ -129,6 +129,15 @@ percentage. The opening two-pane view is not a special case, just
 dragging a border and zooming are therefore one set of operations rather than
 one per shape.
 
+`A` (`arrange()`) rebuilds the tree, but **reuses the panes already on the
+tab** rather than respawning them: `spares()` collects the existing shells,
+editor pane and secondary lists for that host, and each arrangement takes from
+those before it opens anything new. A pty cannot be moved any other way, since
+its process is where it is, so naming the same terminal at a new place in the
+tree *is* moving the pane. With more shells than the new shape has room for,
+the focused one is the one kept; the rest are shut by `drop_unused_panes` as
+before.
+
 The arrangement and the zoom belong to the tab. Local file lists and terminals
 are shared across tabs (there is only one local machine); each tab's
 arrangement decides which it shows.

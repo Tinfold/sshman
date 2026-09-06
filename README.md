@@ -87,6 +87,7 @@ The essentials:
 | `S` `\|` `_` `T` | split: shell below, shell beside, shell down, another file list |
 | `i` | editor pane beside this one |
 | `m` / `F3`, `F9`, `=` | zoom, close pane, even the borders up |
+| `A` | pick a ready-made arrangement for this tab |
 | `Alt-↑↓←→` | move between panes |
 | `C` `W`, `Ctrl-←/→` | new tab, close tab, switch tabs |
 | `D` `L` | open a container / a local-only tab |
