@@ -6407,24 +6407,33 @@ impl App {
         if leaving.host() == Side::Local && self.layout.contains(leaving) {
             return leaving;
         }
+        // The pane this tab was left on, when it is still here to come back
+        // to. A tab with a shell and an editor open has two terminals, and
+        // only this says which of them you were in.
+        let remembered = self
+            .tab()
+            .map(|t| t.focus)
+            .filter(|s| s.host() == Side::Remote && self.layout.contains(*s));
         // A terminal carries over to a tab that has one, so switching tabs
-        // zoomed into a shell does not drop you into a file list.
-        if leaving.is_term()
-            && let Some(term) = self
+        // zoomed into a shell does not drop you into a file list. The tab's
+        // own terminal first: any other is a guess, and guessing an editor
+        // when the tab was left in its shell zooms the wrong pane.
+        if leaving.is_term() {
+            if let Some(slot) = remembered.filter(|s| s.is_term()) {
+                return slot;
+            }
+            if let Some(term) = self
                 .layout
                 .find(|s| s.is_term() && s.host() == Side::Remote)
-        {
-            return term;
+            {
+                return term;
+            }
         }
         // Zoomed, the focused pane is the only one that can be seen at all,
         // so a tab left in its terminal has to come back to it. Unzoomed the
         // terminal is on screen either way, and landing in it would be a trap:
         // it swallows the Ctrl-arrows that were cycling the tabs.
-        if self.zoomed
-            && let Some(slot) = self.tab().map(|t| t.focus)
-            && slot.host() == Side::Remote
-            && self.layout.contains(slot)
-        {
+        if self.zoomed && let Some(slot) = remembered {
             return slot;
         }
         self.files_pane(Side::Remote)
@@ -7892,6 +7901,33 @@ mod tests {
         app.goto_tab(0);
         assert_eq!(app.focus, shell, "the shell we were in has to come back");
         assert!(app.zoomed, "and so does the zoom it was left in");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_tab_with_two_terminals_comes_back_to_the_one_it_was_left_in() {
+        let dir = scratch("tab-two-terms");
+        let mut app = app_in(&dir);
+        fake_tab(&mut app, "one", Some(Shell::spawn_local(&dir, 24, 80)));
+        let shell = app.layout.find(Slot::is_term).expect("the first tab's");
+        // An editor beside it, which lands ahead of the shell in the order
+        // the panes are drawn.
+        let editor = add_term(&mut app, Side::Remote, Shell::spawn_local(&dir, 24, 80));
+        app.term_mut(editor).expect("just opened").opens = Some(String::new());
+        fake_tab(&mut app, "two", Some(Shell::spawn_local(&dir, 24, 80)));
+
+        app.goto_tab(0);
+        app.focus = shell;
+        app.zoomed = true;
+
+        // Away to the other tab's shell, and back.
+        app.goto_tab(1);
+        assert!(app.in_term());
+        app.goto_tab(0);
+
+        assert_eq!(app.focus, shell, "the shell was what we left zoomed");
+        assert!(app.zoomed, "and the zoom is on it, not on the editor");
 
         std::fs::remove_dir_all(&dir).ok();
     }
