@@ -1,0 +1,18 @@
+{
+  "name": "oxocarbon",
+  "about": "Oxocarbon, from nyoom-engineering — IBM's Carbon brought to a terminal. Its own sixteen have no yellow, so what warns you here is Carbon's alert orange.",
+
+  "accent": "#78a9ff",
+  "dim": "#525252",
+  "text": "#f2f4f8",
+  "muted": "#dde1e6",
+  "good": "#42be65",
+  "warn": "#ff832b",
+  "bad": "#fa4d56",
+  "dir": "#78a9ff",
+  "link": "#be95ff",
+  "exec": "#42be65",
+  "info": "#33b1ff",
+  "bg": "#161616",
+  "on_accent": "#161616"
+}

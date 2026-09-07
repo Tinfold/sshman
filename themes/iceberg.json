@@ -1,0 +1,18 @@
+{
+  "name": "iceberg",
+  "about": "Iceberg, from cocopon — a blue so consistent it reads as one colour until you look.",
+
+  "accent": "#84a0c6",
+  "dim": "#6b7089",
+  "text": "#c6c8d1",
+  "muted": "#818596",
+  "good": "#b4be82",
+  "warn": "#e2a478",
+  "bad": "#e27878",
+  "dir": "#84a0c6",
+  "link": "#a093c7",
+  "exec": "#b4be82",
+  "info": "#89b8c2",
+  "bg": "#161821",
+  "on_accent": "#161821"
+}

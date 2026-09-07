@@ -1,0 +1,18 @@
+{
+  "name": "challengerdeep",
+  "about": "Challenger Deep, from challenger-deep-theme — indigo, and colours that do not apologise for being bright.",
+
+  "accent": "#906cff",
+  "dim": "#565575",
+  "text": "#cbe3e7",
+  "muted": "#a6b3cc",
+  "good": "#62d196",
+  "warn": "#ffb378",
+  "bad": "#ff5458",
+  "dir": "#65b2ff",
+  "link": "#c991e1",
+  "exec": "#95ffa4",
+  "info": "#65b2ff",
+  "bg": "#1e1c31",
+  "on_accent": "#100e23"
+}

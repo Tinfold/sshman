@@ -1,0 +1,18 @@
+{
+  "name": "tomorrownight",
+  "about": "Tomorrow Night, Chris Kempson's — the theme most of the others were measured against.",
+
+  "accent": "#81a2be",
+  "dim": "#969896",
+  "text": "#c5c8c6",
+  "muted": "#b4b7b4",
+  "good": "#b5bd68",
+  "warn": "#f0c674",
+  "bad": "#cc6666",
+  "dir": "#81a2be",
+  "link": "#b294bb",
+  "exec": "#b5bd68",
+  "info": "#8abeb7",
+  "bg": "#1d1f21",
+  "on_accent": "#1d1f21"
+}

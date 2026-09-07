@@ -1,0 +1,18 @@
+{
+  "name": "jellybeans",
+  "about": "Jellybeans, from nanotech — a dark grey nobody has ever mistaken for black.",
+
+  "accent": "#8fbfdc",
+  "dim": "#888888",
+  "text": "#e8e8d3",
+  "muted": "#a0a08b",
+  "good": "#99ad6a",
+  "warn": "#fad07a",
+  "bad": "#cf6a4c",
+  "dir": "#8fbfdc",
+  "link": "#c6b6ee",
+  "exec": "#99ad6a",
+  "info": "#8197bf",
+  "bg": "#151515",
+  "on_accent": "#151515"
+}

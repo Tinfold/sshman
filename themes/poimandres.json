@@ -1,0 +1,18 @@
+{
+  "name": "poimandres",
+  "about": "Poimandres, from drcmda — mint and haze, and almost no red at all.",
+
+  "accent": "#5de4c7",
+  "dim": "#767c9d",
+  "text": "#e4f0fb",
+  "muted": "#a6accd",
+  "good": "#5fb3a1",
+  "warn": "#fffac2",
+  "bad": "#d0679d",
+  "dir": "#89ddff",
+  "link": "#fae4fc",
+  "exec": "#5fb3a1",
+  "info": "#add7ff",
+  "bg": "#1b1e28",
+  "on_accent": "#1b1e28"
+}

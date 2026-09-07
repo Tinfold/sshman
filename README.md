@@ -162,7 +162,7 @@ remote polls the visible tab and stays silent when nothing changed. `,` then
 reconnects on its own, up to six tries. You come back in the same directory,
 with sudo mode restored if it was on.
 
-**Themes.** 24 built in, dark and light, plus the `terminal` theme that just
+**Themes.** 44 built in, dark and light, plus the `terminal` theme that just
 uses your own 16 colours. `,` then **Theme** previews each one across the whole
 screen as you move through the list. Themes are JSON files, so dropping one in
 `~/.config/sshman/themes/` adds it, and giving it an existing name replaces

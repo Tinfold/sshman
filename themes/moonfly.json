@@ -1,0 +1,18 @@
+{
+  "name": "moonfly",
+  "about": "Moonfly, from bluz71 — near-black, and the colours on it bright enough to read at midnight.",
+
+  "accent": "#80a0ff",
+  "dim": "#6c6c6c",
+  "text": "#c6c6c6",
+  "muted": "#949494",
+  "good": "#8cc85f",
+  "warn": "#e3c78a",
+  "bad": "#ff5454",
+  "dir": "#80a0ff",
+  "link": "#cf87e8",
+  "exec": "#8cc85f",
+  "info": "#79dac8",
+  "bg": "#080808",
+  "on_accent": "#080808"
+}

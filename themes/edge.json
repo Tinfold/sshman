@@ -1,0 +1,18 @@
+{
+  "name": "edge",
+  "about": "Edge, from sainnhe — the soft one: every colour a step back from the ground it sits on.",
+
+  "accent": "#6cb6eb",
+  "dim": "#5c6370",
+  "text": "#c5cdd9",
+  "muted": "#7e8294",
+  "good": "#a0c980",
+  "warn": "#deb974",
+  "bad": "#ec7279",
+  "dir": "#6cb6eb",
+  "link": "#d38aea",
+  "exec": "#a0c980",
+  "info": "#5dbbc1",
+  "bg": "#2b2d3a",
+  "on_accent": "#2b2d3a"
+}

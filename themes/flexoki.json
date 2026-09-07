@@ -1,0 +1,18 @@
+{
+  "name": "flexoki",
+  "about": "Flexoki, from Steph Ango — an ink-and-paper palette measured in perceptual lightness rather than picked by eye.",
+
+  "accent": "#4385be",
+  "dim": "#575653",
+  "text": "#cecdc3",
+  "muted": "#878580",
+  "good": "#879a39",
+  "warn": "#d0a215",
+  "bad": "#d14d41",
+  "dir": "#4385be",
+  "link": "#8b7ec8",
+  "exec": "#879a39",
+  "info": "#3aa99f",
+  "bg": "#100f0f",
+  "on_accent": "#100f0f"
+}

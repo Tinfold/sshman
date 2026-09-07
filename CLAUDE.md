@@ -175,7 +175,7 @@ not the reverse, so an action can have several. Only overrides are written.
 mean the same thing, which is fall back to the default. Never fail to start
 over a config file.
 
-**Themes are JSON files, not tables in the source.** The 24 in `themes/` are
+**Themes are JSON files, not tables in the source.** The 44 in `themes/` are
 built into the binary. Files in `~/.config/sshman/themes/` load beside them and
 one taking an existing name replaces it. `base` inherits, missing roles fall
 back to `terminal`. A theme that paints no background is never asked for ANSI

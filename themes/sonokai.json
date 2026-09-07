@@ -1,0 +1,18 @@
+{
+  "name": "sonokai",
+  "about": "Sonokai, from sainnhe — Monokai Pro's colours, turned up and given a softer ground.",
+
+  "accent": "#76cce0",
+  "dim": "#595f6f",
+  "text": "#e2e2e3",
+  "muted": "#7f8490",
+  "good": "#9ed072",
+  "warn": "#e7c664",
+  "bad": "#fc5d7c",
+  "dir": "#76cce0",
+  "link": "#b39df3",
+  "exec": "#9ed072",
+  "info": "#b39df3",
+  "bg": "#2c2e34",
+  "on_accent": "#2c2e34"
+}

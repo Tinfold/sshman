@@ -1,0 +1,18 @@
+{
+  "name": "palenight",
+  "about": "Palenight, the Material Theme variant everyone means when they say purple.",
+
+  "accent": "#82aaff",
+  "dim": "#676e95",
+  "text": "#a6accd",
+  "muted": "#959dcb",
+  "good": "#c3e88d",
+  "warn": "#ffcb6b",
+  "bad": "#f07178",
+  "dir": "#89ddff",
+  "link": "#c792ea",
+  "exec": "#c3e88d",
+  "info": "#89ddff",
+  "bg": "#292d3e",
+  "on_accent": "#292d3e"
+}

@@ -1,0 +1,18 @@
+{
+  "name": "synthwave",
+  "about": "SynthWave '84, from robb0wen — neon on a night drive. The one theme here that would rather glow than sit quietly.",
+
+  "accent": "#ff7edb",
+  "dim": "#495495",
+  "text": "#ffffff",
+  "muted": "#848bbd",
+  "good": "#72f1b8",
+  "warn": "#fede5d",
+  "bad": "#fe4450",
+  "dir": "#36f9f6",
+  "link": "#ff7edb",
+  "exec": "#72f1b8",
+  "info": "#36f9f6",
+  "bg": "#262335",
+  "on_accent": "#262335"
+}

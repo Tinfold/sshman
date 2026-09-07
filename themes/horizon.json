@@ -1,0 +1,18 @@
+{
+  "name": "horizon",
+  "about": "Horizon, from horizon-theme — plum and coral, and warmer than any of the other dark ones.",
+
+  "accent": "#26bbd9",
+  "dim": "#6c6f93",
+  "text": "#d5d8da",
+  "muted": "#9da0a2",
+  "good": "#29d398",
+  "warn": "#fab795",
+  "bad": "#e95678",
+  "dir": "#26bbd9",
+  "link": "#b877db",
+  "exec": "#29d398",
+  "info": "#59e1e3",
+  "bg": "#1c1e26",
+  "on_accent": "#1c1e26"
+}

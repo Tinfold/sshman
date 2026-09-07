@@ -1,0 +1,18 @@
+{
+  "name": "cobalt2",
+  "about": "Cobalt2, Wes Bos's — blue that means it, and yellow for everything that matters. The greys between the two are worked out from its own background, since it names none.",
+
+  "accent": "#ffc600",
+  "dim": "#5a7d9a",
+  "text": "#ffffff",
+  "muted": "#e1efff",
+  "good": "#3ad900",
+  "warn": "#ff9d00",
+  "bad": "#ff628c",
+  "dir": "#9effff",
+  "link": "#ff628c",
+  "exec": "#3ad900",
+  "info": "#9effff",
+  "bg": "#193549",
+  "on_accent": "#193549"
+}

@@ -1,0 +1,18 @@
+{
+  "name": "apprentice",
+  "about": "Apprentice, from romainl — low-contrast greens and greys, written for the 256-colour cube and spelled out here in hex.",
+
+  "accent": "#5f8787",
+  "dim": "#6c6c6c",
+  "text": "#bcbcbc",
+  "muted": "#a8a8a8",
+  "good": "#87af87",
+  "warn": "#ffaf00",
+  "bad": "#af5f5f",
+  "dir": "#87afd7",
+  "link": "#8787af",
+  "exec": "#87af87",
+  "info": "#87afd7",
+  "bg": "#262626",
+  "on_accent": "#262626"
+}
