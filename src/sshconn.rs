@@ -1328,7 +1328,8 @@ mod live {
         c.exec("rm -f ~/.ssh/authorized_keys").ok();
         let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIsshmantestkeysshmantestkeysshmantest                    sshman@test";
         assert!(
-            c.install_public_key(key).expect("the key would not install"),
+            c.install_public_key(key)
+                .expect("the key would not install"),
             "it said the key was already there"
         );
 
@@ -1341,7 +1342,8 @@ mod live {
             .unwrap();
         assert_eq!(count.0.trim(), "1");
         assert!(
-            !c.install_public_key(key).expect("the second install failed"),
+            !c.install_public_key(key)
+                .expect("the second install failed"),
             "a second install duplicated the entry"
         );
 

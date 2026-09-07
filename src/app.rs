@@ -6433,7 +6433,9 @@ impl App {
         // so a tab left in its terminal has to come back to it. Unzoomed the
         // terminal is on screen either way, and landing in it would be a trap:
         // it swallows the Ctrl-arrows that were cycling the tabs.
-        if self.zoomed && let Some(slot) = remembered {
+        if self.zoomed
+            && let Some(slot) = remembered
+        {
             return slot;
         }
         self.files_pane(Side::Remote)

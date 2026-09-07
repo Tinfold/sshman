@@ -169,7 +169,10 @@ fn helper() -> Option<Helper> {
         // works. Neither is worth trying without a display to talk to:
         // `xclip` with no `DISPLAY` blocks rather than failing.
         if set("WAYLAND_DISPLAY") && have("wl-copy") {
-            return Some(Helper { command: "wl-copy", args: &[] });
+            return Some(Helper {
+                command: "wl-copy",
+                args: &[],
+            });
         }
         if set("DISPLAY") && have("xclip") {
             return Some(Helper {
@@ -184,12 +187,18 @@ fn helper() -> Option<Helper> {
             });
         }
         if have("pbcopy") {
-            return Some(Helper { command: "pbcopy", args: &[] });
+            return Some(Helper {
+                command: "pbcopy",
+                args: &[],
+            });
         }
         // Windows Subsystem for Linux, where the Windows clipboard is the one
         // that matters.
         if have("clip.exe") {
-            return Some(Helper { command: "clip.exe", args: &[] });
+            return Some(Helper {
+                command: "clip.exe",
+                args: &[],
+            });
         }
         if have("termux-clipboard-set") {
             return Some(Helper {

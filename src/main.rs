@@ -804,6 +804,205 @@ fn row_at(offset: usize, len: usize, area: Rect, row: u16) -> Option<usize> {
     (index < len).then_some(index)
 }
 
+/// Where in a terminal pane's own grid the mouse is, clamped to it so a drag
+/// that has left the pane still means the edge it left by.
+fn cell_in(app: &App, slot: layout::Slot, m: &event::MouseEvent) -> Option<(u16, u16)> {
+    let (_, inner) = app.term_inner.iter().find(|(s, _)| *s == slot).copied()?;
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    let col = m.column.clamp(inner.x, inner.right() - 1) - inner.x;
+    let row = m.row.clamp(inner.y, inner.bottom() - 1) - inner.y;
+    Some((col, row))
+}
+
+/// Hand text to the terminal sshman is running in, so it reaches the system
+/// clipboard.
+///
+/// OSC 52 is the only way that works from inside a terminal that may itself be
+/// at the far end of an SSH connection: there is no display to talk to, only
+/// the terminal, and it is the terminal that owns the clipboard.
+/// Put a copy on the system clipboard, by both of the ways there are.
+///
+/// The escape sequence goes through the terminal so that it lands between
+/// frames rather than in the middle of one, and is wrapped for a multiplexer
+/// if there is one in the way. The desktop's own tool is asked as well, and
+/// is the half that works in a terminal which does not implement `OSC 52` —
+/// every VTE one, which is most of what a Linux desktop ships. See
+/// [`crate::clip`].
+fn to_clipboard(terminal: &mut Tui, text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    clip::to_desktop(text);
+    write!(terminal.backend_mut(), "{}", clip::sequence(text))?;
+    terminal.backend_mut().flush()?;
+    Ok(())
+}
+
+/// Hand the terminal back to the shell, run `f`, then take it over again.
+fn suspended<T>(terminal: &mut Tui, f: impl FnOnce() -> T) -> Result<T> {
+    disable_raw_mode()?;
+    // The program about to run gets the terminal exactly as it found it,
+    // including how keys are reported: an editor that asked for nothing
+    // unusual should not be handed sshman's settings.
+    disable_rich_keys(terminal.backend_mut());
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
+    terminal.show_cursor().ok();
+    io::stdout().flush().ok();
+
+    let out = f();
+
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        Clear(ClearType::All)
+    )?;
+    if shell::rich_keys() {
+        let _ = execute!(
+            terminal.backend_mut(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
+    terminal.hide_cursor().ok();
+    force_full_redraw(terminal);
+    Ok(out)
+}
+
+/// Make the next draw repaint every cell.
+///
+/// `Terminal::clear()` would also do this, but as of ratatui 0.30 it first asks
+/// the terminal where the cursor is and blocks waiting for the reply. Terminals
+/// that never answer turn that into an error, which would kill the session the
+/// moment the user came back from their editor. Resetting both buffers has the
+/// same effect with no round trip: `swap_buffers` wipes the back buffer and
+/// flips, so calling it twice empties both and leaves the index where it began.
+fn force_full_redraw(terminal: &mut Tui) {
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+}
+
+/// Run `program` on `path` through a shell, so `EDITOR="code -w"` and friends
+/// work as written.
+///
+/// Through `/bin/sh` rather than `$SHELL`: the line is sshman's, and the path
+/// on the end of it is quoted by [`sh_quote`], so the shell that reads it has
+/// to be the one those rules are for. See [`sshman::local::POSIX_SHELL`].
+fn run_editor(program: &str, path: &std::path::Path) -> Result<()> {
+    let line = format!("{program} {}", sh_quote(&path.to_string_lossy()));
+    let mut command = Command::new(local::POSIX_SHELL);
+    command.arg("-c").arg(&line);
+    // Start it in the file's own directory rather than wherever sshman was
+    // launched from. Editors work out what project they are in by looking
+    // around where they start, so the difference decides whether tooling
+    // finds the rest of the tree or nothing at all.
+    if let Some(parent) = path.parent() {
+        command.current_dir(parent);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("cannot run {program}"))?;
+    if !status.success() {
+        anyhow::bail!("exited with {status}");
+    }
+    Ok(())
+}
+
+/// Hand the whole terminal to the `ssh` (or `docker exec`) line sshman built.
+/// Its own line, so its own shell — see [`run_editor`].
+fn run_shell(cmd: &str) -> Result<()> {
+    Command::new(local::POSIX_SHELL)
+        .arg("-c")
+        .arg(cmd)
+        .status()
+        .context("cannot start ssh")?;
+    Ok(())
+}
+
+/// The `ssh` invocation for an interactive shell, starting in the directory
+/// the remote pane is showing.
+fn shell_command(app: &App) -> Option<String> {
+    let tab = app.tab()?;
+    // A tab on this machine needs no ssh to reach it: just a login shell,
+    // where its pane is pointed.
+    if tab.is_local() {
+        let cwd = app.remote_cwd();
+        return Some(format!(
+            "cd {} 2>/dev/null; {}",
+            sh_quote(&cwd),
+            login_shell(app)
+        ));
+    }
+    // A container is entered by running its runtime, not by dialling it. On a
+    // server that means an ssh whose payload is the `exec`, so the two nest
+    // rather than one replacing the other.
+    if let Target::Docker {
+        container, runtime, ..
+    } = &tab.target
+    {
+        let inner = docker::interactive_shell_command(runtime, container, Some(&app.remote_cwd()));
+        return Some(match tab.ssh_opts() {
+            None => inner,
+            Some(opts) => format!("{} {}", ssh_prefix(opts), sh_quote(&inner)),
+        });
+    }
+    let conn = &tab.conn;
+    let mut cmd = String::from("ssh -t");
+    if conn.port != 22 {
+        cmd.push_str(&format!(" -p {}", conn.port));
+    }
+    if let Some(key) = &app.opts.key_path {
+        cmd.push_str(&format!(" -i {}", sh_quote(&key.to_string_lossy())));
+    }
+    cmd.push_str(&format!(" {}@{}", conn.user, conn.host));
+    let cwd = app.remote_cwd();
+    if !cwd.is_empty() {
+        let inner = format!("cd {} 2>/dev/null; {}", sh_quote(&cwd), login_shell(app));
+        cmd.push(' ');
+        cmd.push_str(&sh_quote(&inner));
+    }
+    Some(cmd)
+}
+
+/// The `exec` that hands the whole terminal to a shell, as a shell line.
+///
+/// Without a setting that is `"$SHELL" -l`, which keeps the login shell and
+/// its rc files wherever the line ends up running — this machine or a server.
+/// With one, it is that shell, guarded so a server that has never heard of it
+/// falls back to the login shell rather than to nothing at all.
+fn login_shell(app: &App) -> String {
+    let fallback = "exec \"$SHELL\" -l";
+    match app.config.shell() {
+        None => fallback.to_string(),
+        Some(shell) => format!(
+            "command -v {} >/dev/null 2>&1 && exec {shell}; {fallback}",
+            sh_quote(shell.split_whitespace().next().unwrap_or(shell)),
+        ),
+    }
+}
+
+/// `ssh -t` with the details needed to reach `opts`, for a command that runs
+/// on the far end.
+fn ssh_prefix(opts: &ConnectOpts) -> String {
+    let mut cmd = String::from("ssh -t");
+    if opts.port != 22 {
+        cmd.push_str(&format!(" -p {}", opts.port));
+    }
+    if let Some(key) = &opts.key_path {
+        cmd.push_str(&format!(" -i {}", sh_quote(&key.to_string_lossy())));
+    }
+    cmd.push_str(&format!(" {}@{}", opts.user, opts.host));
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,7 +1095,11 @@ mod tests {
         let column = start + (end - start) / 2;
 
         let (app, rows) = after_mouse(90, 30, setup, at(MouseEventKind::Moved, column, row));
-        assert_eq!(app.tab_rest.map(|(index, _)| index), Some(0), "the clock never started");
+        assert_eq!(
+            app.tab_rest.map(|(index, _)| index),
+            Some(0),
+            "the clock never started"
+        );
         let screen = rows.join("\n");
         assert!(
             screen.contains(&format!("me@{long}")),
@@ -1120,203 +1323,4 @@ mod tests {
         assert_eq!(row_at(0, 20, sliver, 0), None);
         assert_eq!(row_at(0, 20, sliver, 1), None);
     }
-}
-
-/// Where in a terminal pane's own grid the mouse is, clamped to it so a drag
-/// that has left the pane still means the edge it left by.
-fn cell_in(app: &App, slot: layout::Slot, m: &event::MouseEvent) -> Option<(u16, u16)> {
-    let (_, inner) = app.term_inner.iter().find(|(s, _)| *s == slot).copied()?;
-    if inner.width == 0 || inner.height == 0 {
-        return None;
-    }
-    let col = m.column.clamp(inner.x, inner.right() - 1) - inner.x;
-    let row = m.row.clamp(inner.y, inner.bottom() - 1) - inner.y;
-    Some((col, row))
-}
-
-/// Hand text to the terminal sshman is running in, so it reaches the system
-/// clipboard.
-///
-/// OSC 52 is the only way that works from inside a terminal that may itself be
-/// at the far end of an SSH connection: there is no display to talk to, only
-/// the terminal, and it is the terminal that owns the clipboard.
-/// Put a copy on the system clipboard, by both of the ways there are.
-///
-/// The escape sequence goes through the terminal so that it lands between
-/// frames rather than in the middle of one, and is wrapped for a multiplexer
-/// if there is one in the way. The desktop's own tool is asked as well, and
-/// is the half that works in a terminal which does not implement `OSC 52` —
-/// every VTE one, which is most of what a Linux desktop ships. See
-/// [`crate::clip`].
-fn to_clipboard(terminal: &mut Tui, text: &str) -> Result<()> {
-    if text.is_empty() {
-        return Ok(());
-    }
-    clip::to_desktop(text);
-    write!(terminal.backend_mut(), "{}", clip::sequence(text))?;
-    terminal.backend_mut().flush()?;
-    Ok(())
-}
-
-/// Hand the terminal back to the shell, run `f`, then take it over again.
-fn suspended<T>(terminal: &mut Tui, f: impl FnOnce() -> T) -> Result<T> {
-    disable_raw_mode()?;
-    // The program about to run gets the terminal exactly as it found it,
-    // including how keys are reported: an editor that asked for nothing
-    // unusual should not be handed sshman's settings.
-    disable_rich_keys(terminal.backend_mut());
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    )?;
-    terminal.show_cursor().ok();
-    io::stdout().flush().ok();
-
-    let out = f();
-
-    enable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste,
-        Clear(ClearType::All)
-    )?;
-    if shell::rich_keys() {
-        let _ = execute!(
-            terminal.backend_mut(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
-    }
-    terminal.hide_cursor().ok();
-    force_full_redraw(terminal);
-    Ok(out)
-}
-
-/// Make the next draw repaint every cell.
-///
-/// `Terminal::clear()` would also do this, but as of ratatui 0.30 it first asks
-/// the terminal where the cursor is and blocks waiting for the reply. Terminals
-/// that never answer turn that into an error, which would kill the session the
-/// moment the user came back from their editor. Resetting both buffers has the
-/// same effect with no round trip: `swap_buffers` wipes the back buffer and
-/// flips, so calling it twice empties both and leaves the index where it began.
-fn force_full_redraw(terminal: &mut Tui) {
-    terminal.swap_buffers();
-    terminal.swap_buffers();
-}
-
-/// Run `program` on `path` through a shell, so `EDITOR="code -w"` and friends
-/// work as written.
-///
-/// Through `/bin/sh` rather than `$SHELL`: the line is sshman's, and the path
-/// on the end of it is quoted by [`sh_quote`], so the shell that reads it has
-/// to be the one those rules are for. See [`sshman::local::POSIX_SHELL`].
-fn run_editor(program: &str, path: &std::path::Path) -> Result<()> {
-    let line = format!("{program} {}", sh_quote(&path.to_string_lossy()));
-    let mut command = Command::new(local::POSIX_SHELL);
-    command.arg("-c").arg(&line);
-    // Start it in the file's own directory rather than wherever sshman was
-    // launched from. Editors work out what project they are in by looking
-    // around where they start, so the difference decides whether tooling
-    // finds the rest of the tree or nothing at all.
-    if let Some(parent) = path.parent() {
-        command.current_dir(parent);
-    }
-    let status = command
-        .status()
-        .with_context(|| format!("cannot run {program}"))?;
-    if !status.success() {
-        anyhow::bail!("exited with {status}");
-    }
-    Ok(())
-}
-
-/// Hand the whole terminal to the `ssh` (or `docker exec`) line sshman built.
-/// Its own line, so its own shell — see [`run_editor`].
-fn run_shell(cmd: &str) -> Result<()> {
-    Command::new(local::POSIX_SHELL)
-        .arg("-c")
-        .arg(cmd)
-        .status()
-        .context("cannot start ssh")?;
-    Ok(())
-}
-
-/// The `ssh` invocation for an interactive shell, starting in the directory
-/// the remote pane is showing.
-fn shell_command(app: &App) -> Option<String> {
-    let tab = app.tab()?;
-    // A tab on this machine needs no ssh to reach it: just a login shell,
-    // where its pane is pointed.
-    if tab.is_local() {
-        let cwd = app.remote_cwd();
-        return Some(format!(
-            "cd {} 2>/dev/null; {}",
-            sh_quote(&cwd),
-            login_shell(app)
-        ));
-    }
-    // A container is entered by running its runtime, not by dialling it. On a
-    // server that means an ssh whose payload is the `exec`, so the two nest
-    // rather than one replacing the other.
-    if let Target::Docker {
-        container, runtime, ..
-    } = &tab.target
-    {
-        let inner = docker::interactive_shell_command(runtime, container, Some(&app.remote_cwd()));
-        return Some(match tab.ssh_opts() {
-            None => inner,
-            Some(opts) => format!("{} {}", ssh_prefix(opts), sh_quote(&inner)),
-        });
-    }
-    let conn = &tab.conn;
-    let mut cmd = String::from("ssh -t");
-    if conn.port != 22 {
-        cmd.push_str(&format!(" -p {}", conn.port));
-    }
-    if let Some(key) = &app.opts.key_path {
-        cmd.push_str(&format!(" -i {}", sh_quote(&key.to_string_lossy())));
-    }
-    cmd.push_str(&format!(" {}@{}", conn.user, conn.host));
-    let cwd = app.remote_cwd();
-    if !cwd.is_empty() {
-        let inner = format!("cd {} 2>/dev/null; {}", sh_quote(&cwd), login_shell(app));
-        cmd.push(' ');
-        cmd.push_str(&sh_quote(&inner));
-    }
-    Some(cmd)
-}
-
-/// The `exec` that hands the whole terminal to a shell, as a shell line.
-///
-/// Without a setting that is `"$SHELL" -l`, which keeps the login shell and
-/// its rc files wherever the line ends up running — this machine or a server.
-/// With one, it is that shell, guarded so a server that has never heard of it
-/// falls back to the login shell rather than to nothing at all.
-fn login_shell(app: &App) -> String {
-    let fallback = "exec \"$SHELL\" -l";
-    match app.config.shell() {
-        None => fallback.to_string(),
-        Some(shell) => format!(
-            "command -v {} >/dev/null 2>&1 && exec {shell}; {fallback}",
-            sh_quote(shell.split_whitespace().next().unwrap_or(shell)),
-        ),
-    }
-}
-
-/// `ssh -t` with the details needed to reach `opts`, for a command that runs
-/// on the far end.
-fn ssh_prefix(opts: &ConnectOpts) -> String {
-    let mut cmd = String::from("ssh -t");
-    if opts.port != 22 {
-        cmd.push_str(&format!(" -p {}", opts.port));
-    }
-    if let Some(key) = &opts.key_path {
-        cmd.push_str(&format!(" -i {}", sh_quote(&key.to_string_lossy())));
-    }
-    cmd.push_str(&format!(" {}@{}", opts.user, opts.host));
-    cmd
 }
